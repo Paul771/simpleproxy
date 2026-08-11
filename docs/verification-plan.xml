@@ -1,0 +1,188 @@
+<VerificationPlan VERSION="0.2.0">
+  <GlobalPolicy>
+    <log-format>[proxy][marker] msg</log-format>
+    <deterministic-first>true</deterministic-first>
+    <module-level-focus>Быстрые детерминированные юнит-проверки чистой логики (config, allow, auth).</module-level-focus>
+    <wave-level-focus>E2E через прокси к локальному echo-серверу: CONNECT, байты, idle-timeout, keep-alive, auth.</wave-level-focus>
+    <phase-level-focus>Полный набор node --test tests/ + smoke curl -x на api.telegram.org (опционально).</phase-level-focus>
+    <autonomy-gate>Каждый модуль требует: команды, сценарии, наблюдаемые свидетельства и wave/phase follow-up перед длительной автономной работой.</autonomy-gate>
+    <redaction>Никогда не логировать токены ботов, тела запросов/ответов, Proxy-Authorization.</redaction>
+  </GlobalPolicy>
+
+  <CriticalFlows>
+    <VF-001 NAME="ConnectHappyPath" USE_CASES="UC-001, UC-006" DATA_FLOW="DF-1, DF-2" PRIORITY="high">
+      <scenario>Hermes/бот выполняет CONNECT api.telegram.org:443 и несколько HTTPS-запросов по одному туннелю.</scenario>
+      <expected-outcome>200 Connection Established; данные проходят байт-в-байт; keep-alive держит туннель между запросами; idle-таймаут не срабатывает при активности.</expected-outcome>
+      <required-signals>
+        <log-marker>[proxy][connect][DF-1]</log-marker>
+        <trace-sequence>BLOCK_HANDLE_CONNECT -> 200 -> BLOCK_PUMP -> [tunnel][close]</trace-sequence>
+      </required-signals>
+    </VF-001>
+    <VF-002 NAME="DenyNonTelegram" USE_CASES="UC-002" DATA_FLOW="DF-1" PRIORITY="high">
+      <scenario>CONNECT example.com:443 через прокси.</scenario>
+      <expected-outcome>403 Forbidden, туннель не открывается.</expected-outcome>
+      <required-signals>
+        <log-marker>[proxy][deny][DF-1]</log-marker>
+      </required-signals>
+    </VF-002>
+  </CriticalFlows>
+
+  <ModuleVerification>
+    <V-M-CONFIG MODULE="M-CONFIG" PRIORITY="high">
+      <test-files>
+        <file>tests/config.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/config.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">PORT подхватывается из env; дефолт 8080 при отсутствии.</scenario-1>
+        <scenario-2 kind="success">authUser/authPass читаются из PROXY_USER/PROXY_PASS; заданы оба → auth включена, один → выключена.</scenario-2>
+        <scenario-3 kind="failure">Некорректный PORT (не число) → throw INVALID_ENV.</scenario-3>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[config][load][env]</marker-1>
+      </required-log-markers>
+      <wave-follow-up>Используется в e2e: конфиг с кастомными правилами allowlist.</wave-follow-up>
+      <phase-follow-up>Полный набор тестов.</phase-follow-up>
+    </V-M-CONFIG>
+
+    <V-M-LOG MODULE="M-LOG" PRIORITY="high">
+      <test-files>
+        <file>проверяется через V-M-PROXY-3</file>
+      </test-files>
+      <module-checks>
+        <check-1>Строки stdout в e2e-тесте не содержат токенов/тел/Proxy-Authorization</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Все строки логов имеют префикс [proxy][marker].</scenario-1>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][*]</marker-1>
+      </required-log-markers>
+      <phase-follow-up>Sampled log review в phase-3.</phase-follow-up>
+    </V-M-LOG>
+
+    <V-M-ALLOW MODULE="M-ALLOW" PRIORITY="high">
+      <test-files>
+        <file>tests/allow.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/allow.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">normalizeTarget('api.telegram.org:443') → {host:'api.telegram.org', port:443}.</scenario-1>
+        <scenario-2 kind="success">isAllowed: api/core/updates.telegram.org:443 → true (suffix .telegram.org, exact api.telegram.org).</scenario-2>
+        <scenario-3 kind="failure">normalizeTarget: 'API.TELEGRAM.ORG:443', 'api.telegram.org.:443', 'x@y:443', 'h:443:5', 'h:80' → null или isAllowed=false.</scenario-3>
+        <scenario-4 kind="failure">example.com:443 → false.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[allow][parse][BLOCK_PARSE_TARGET]</marker-1>
+      </required-log-markers>
+      <wave-follow-up>Интеграция в DF-1 (403).</wave-follow-up>
+    </V-M-ALLOW>
+
+    <V-M-AUTH MODULE="M-AUTH" PRIORITY="medium">
+      <test-files>
+        <file>tests/auth.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/auth.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Правильный Basic-заголовок → checkAuth true.</scenario-1>
+        <scenario-2 kind="failure">Неверный/отсутствующий заголовок → false.</scenario-2>
+        <scenario-3 kind="success">creds null → checkAuth всегда true (auth выключена).</scenario-3>
+        <scenario-4 kind="failure">Мусорный заголовок (не Basic) → parseBasicAuth null.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[auth][verify][BLOCK_VERIFY]</marker-1>
+      </required-log-markers>
+      <wave-follow-up>Интеграция в DF-1 (407).</wave-follow-up>
+    </V-M-AUTH>
+
+    <V-M-TUNNEL MODULE="M-TUNNEL" PRIORITY="high">
+      <test-files>
+        <file>tests/tunnel.e2e.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/tunnel.e2e.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">E2E: CONNECT через прокси к локальному echo-серверу, данные доходят, bytes_in == bytes_out.</scenario-1>
+        <scenario-2 kind="success">Keep-alive: 2+ payload по одному туннелю без закрытия (UC-006).</scenario-2>
+        <scenario-3 kind="failure">Idle-timeout (короткий idleTimeoutMs) → destroy + лог [tunnel][idle_timeout].</scenario-3>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[tunnel][close][DF-2]</marker-1>
+        <marker-2>[tunnel][idle_timeout][DF-3]</marker-2>
+      </required-log-markers>
+      <required-trace-assertions>
+        <assertion-1>Закрытие клиентского сокета закрывает upstream (нет утечек).</assertion-1>
+      </required-trace-assertions>
+      <phase-follow-up>Полный набор тестов.</phase-follow-up>
+    </V-M-TUNNEL>
+
+    <V-M-PROXY MODULE="M-PROXY" PRIORITY="high">
+      <test-files>
+        <file>tests/tunnel.e2e.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/</check-1>
+        <check-2>PORT=8080 node src/index.js (smoke)</check-2>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">GET / → 405 (UC-004).</scenario-1>
+        <scenario-2 kind="success">CONNECT example.com → 403 (UC-002); CONNECT с неверной auth → 407 (UC-005).</scenario-2>
+        <scenario-3 kind="failure">maxTunnels+1 → 503 (UC-003).</scenario-3>
+        <scenario-4 kind="success">В stdout нет ничего кроме [proxy][...] строк (redaction).</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][connect][DF-1]</marker-1>
+        <marker-2>[proxy][deny][DF-1]</marker-2>
+        <marker-3>[proxy][auth_fail][DF-1]</marker-3>
+        <marker-4>[proxy][cap_limit][DF-4]</marker-4>
+        <marker-5>[proxy][reject_http][UC-4]</marker-5>
+        <marker-6>[server][listen][start]</marker-6>
+      </required-log-markers>
+      <phase-follow-up>Graceful shutdown по SIGTERM/SIGINT; smoke на Wispbyte с curl -x.</phase-follow-up>
+    </V-M-PROXY>
+  </ModuleVerification>
+
+  <PhaseGates>
+    <Gate-Phase-1 PHASE="Phase-1">
+      <goal>Каркас поднимается: config-тест зелёный, сервер стартует и отвечает 405 на GET.</goal>
+      <commands>
+        <command-1>node --test tests/config.test.js</command-1>
+        <command-2>node src/index.js (smoke, затем Ctrl+C)</command-2>
+      </commands>
+      <required-evidence>
+        <evidence-1>Лог [server][listen][start] при старте.</evidence-1>
+      </required-evidence>
+    </Gate-Phase-1>
+    <Gate-Phase-2 PHASE="Phase-2">
+      <goal>CONNECT работает end-to-end: 200, байты, deny 403, idle-timeout; e2e-тесты зелёные.</goal>
+      <commands>
+        <command-1>node --test tests/allow.test.js tests/tunnel.e2e.test.js</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>e2e: bytes_in == bytes_out.</evidence-1>
+      </required-evidence>
+    </Gate-Phase-2>
+    <Gate-Phase-3 PHASE="Phase-3">
+      <goal>Auth, cap, keep-alive, graceful shutdown; полный набор тестов зелёный; README и GRACE-доки финальны.</goal>
+      <commands>
+        <command-1>node --test tests/</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>Все тесты проходят; stdout-редискция подтверждена тестом.</evidence-1>
+      </required-evidence>
+    </Gate-Phase-3>
+  </PhaseGates>
+
+  <FailurePackets>
+    <packet-template>
+      <expected-fields>scenario, expected-evidence, observed-evidence, first-divergent-block, next-action</expected-fields>
+    </packet-template>
+  </FailurePackets>
+</VerificationPlan>

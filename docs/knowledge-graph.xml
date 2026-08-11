@@ -1,0 +1,77 @@
+<KnowledgeGraph>
+  <Project NAME="SimpleProxy" VERSION="0.2.0">
+    <keywords>telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel</keywords>
+    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte. TLS end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.</annotation>
+
+    <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="implemented">
+      <purpose>Чтение и валидация конфигурации из env</purpose>
+      <path>src/config.js</path>
+      <depends>none</depends>
+      <verification-ref>V-M-CONFIG</verification-ref>
+      <annotations>
+        <fn-loadConfig PURPOSE="Загрузить и валидировать конфиг из env" />
+      </annotations>
+    </M-CONFIG>
+
+    <M-LOG NAME="Log" TYPE="UTILITY" STATUS="implemented">
+      <purpose>Единственный форматтер логов [proxy][marker] с redaction</purpose>
+      <path>src/log.js</path>
+      <depends>none</depends>
+      <verification-ref>V-M-LOG</verification-ref>
+      <annotations>
+        <fn-makeLog PURPOSE="Создать функцию логирования" />
+      </annotations>
+    </M-LOG>
+
+    <M-ALLOW NAME="Allow" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Строгий парсер authority и allowlist-проверка</purpose>
+      <path>src/allow.js</path>
+      <depends>none</depends>
+      <verification-ref>V-M-ALLOW</verification-ref>
+      <annotations>
+        <fn-normalizeTarget PURPOSE="Распарсить CONNECT authority в {host, port} или null" />
+        <fn-isAllowed PURPOSE="Проверить target против правил allowlist" />
+      </annotations>
+    </M-ALLOW>
+
+    <M-AUTH NAME="Auth" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Парсинг и проверка Proxy-Authorization: Basic (timing-safe)</purpose>
+      <path>src/auth.js</path>
+      <depends>node:crypto</depends>
+      <verification-ref>V-M-AUTH</verification-ref>
+      <annotations>
+        <fn-parseBasicAuth PURPOSE="Распарсить заголовок Basic в {user, pass}" />
+        <fn-checkAuth PURPOSE="Проверить заголовок против заданных creds" />
+      </annotations>
+    </M-AUTH>
+
+    <M-TUNNEL NAME="Tunnel" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Байтовый туннель client↔upstream со счётчиками и idle-таймером</purpose>
+      <path>src/tunnel.js</path>
+      <depends>M-LOG</depends>
+      <verification-ref>V-M-TUNNEL</verification-ref>
+      <annotations>
+        <fn-openTunnel PURPOSE="Запустить двусторонний pump туннеля" />
+      </annotations>
+    </M-TUNNEL>
+
+    <M-PROXY NAME="Proxy" TYPE="ENTRY_POINT" STATUS="implemented">
+      <purpose>HTTP-сервер: CONNECT-обработка (auth→allow→cap→tunnel), отклонение plain-HTTP, graceful start</purpose>
+      <path>src/proxy.js</path>
+      <depends>M-CONFIG, M-ALLOW, M-AUTH, M-TUNNEL, M-LOG</depends>
+      <verification-ref>V-M-PROXY</verification-ref>
+      <annotations>
+        <fn-createProxy PURPOSE="Создать http.Server с обработчиками" />
+        <fn-start PURPOSE="Запустить listen и обработать SIGTERM/SIGINT" />
+      </annotations>
+    </M-PROXY>
+
+    <CrossLink from="M-PROXY" to="M-CONFIG" relation="reads config" />
+    <CrossLink from="M-PROXY" to="M-ALLOW" relation="uses allowlist" />
+    <CrossLink from="M-PROXY" to="M-AUTH" relation="checks auth" />
+    <CrossLink from="M-PROXY" to="M-TUNNEL" relation="opens tunnels" />
+    <CrossLink from="M-PROXY" to="M-LOG" relation="logs via formatter" />
+    <CrossLink from="M-TUNNEL" to="M-LOG" relation="logs via formatter" />
+
+  </Project>
+</KnowledgeGraph>

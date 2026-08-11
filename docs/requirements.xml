@@ -1,0 +1,102 @@
+<RequirementsAnalysis VERSION="0.2.0">
+  <Project>
+    <name>SimpleProxy</name>
+    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей) для обхода блокировки из РФ. Развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск). TLS end-to-end, токены ботов прокси не видит.</annotation>
+    <keywords>telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel</keywords>
+  </Project>
+
+  <Actors>
+    <actor-Bot>Telegram-бот, который обращается к api.telegram.org через прокси (настраивает HTTP_PROXY/HTTPS_PROXY или передаёт прокси в httpx/requests).</actor-Bot>
+    <actor-Hermes>Клиентский процесс Hermes, который инициализирует исходящие HTTPS-соединения к api.telegram.org через прокси; задаёт HTTP_PROXY/HTTPS_PROXY/all_proxy.</actor-Hermes>
+    <actor-Operator>Администратор, который конфигурирует и разворачивает прокси на Wispbyte; задаёт env PROXY_USER/PROXY_PASS, PORT.</actor-Operator>
+    <actor-TelegramAPI>Внешняя система api.telegram.org:443 (HTTPS), целевой endpoint проксирования.</actor-TelegramAPI>
+  </Actors>
+
+  <UseCases>
+    <UC-001>
+      <Actor>Bot</Actor>
+      <Action>Выполняет long-polling getUpdates через прокси</Action>
+      <Goal>Туннель держится при паузах до ~50 секунд без обрыва</Goal>
+      <Preconditions>Прокси запущен, allowlist разрешает api.telegram.org:443</Preconditions>
+      <AcceptanceCriteria>getUpdates получает ответ; idle-таймаут (120s) не срабатывает при активности; e2e-тест с паузой проходит</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-1, DF-2, DF-3</RelatedFlows>
+    </UC-001>
+    <UC-002>
+      <Actor>Operator</Actor>
+      <Action>Проверяет, что прокси не открытый (CONNECT на example.com)</Action>
+      <Goal>Прокси возвращает 403 и не открывает туннель на посторонний хост</Goal>
+      <Preconditions>Прокси запущен</Preconditions>
+      <AcceptanceCriteria>CONNECT example.com:443 → 403; лог [proxy][deny]</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-1</RelatedFlows>
+    </UC-002>
+    <UC-003>
+      <Actor>Operator</Actor>
+      <Action>Открывает maxTunnels+1 CONNECT-соединений</Action>
+      <Goal>Перегрузка защищена: лишние соединения получают 503</Goal>
+      <Preconditions>maxTunnels достигнут</Preconditions>
+      <AcceptanceCriteria>(maxTunnels+1)-й CONNECT → 503 Service Unavailable</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-4</RelatedFlows>
+    </UC-003>
+    <UC-004>
+      <Actor>Bot</Actor>
+      <Action>Шлёт обычный HTTP-запрос (GET /) на прокси</Action>
+      <Goal>Прокси не поддерживает plain-HTTP пересылку: вернуть 405</Goal>
+      <Preconditions>Прокси запущен</Preconditions>
+      <AcceptanceCriteria>GET / на прокси → 405 Method Not Allowed</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-1</RelatedFlows>
+    </UC-004>
+    <UC-005>
+      <Actor>Operator</Actor>
+      <Action>Включает basic auth через PROXY_USER/PROXY_PASS</Action>
+      <Goal>Доступ к прокси только с валидным Proxy-Authorization: Basic</Goal>
+      <Preconditions>PROXY_USER и PROXY_PASS заданы</Preconditions>
+      <AcceptanceCriteria>CONNECT без/с неверным заголовком → 407 + лог [proxy][auth_fail]; с верным → туннель; без creds auth выключена</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-1</RelatedFlows>
+    </UC-005>
+    <UC-006>
+      <Actor>Hermes</Actor>
+      <Action>Выполняет несколько последовательных HTTPS-запросов через один CONNECT-туннель</Action>
+      <Goal>Keep-alive: соединение не закрывается между запросами, заголовки не модифицируются</Goal>
+      <Preconditions>Туннель установлен</Preconditions>
+      <AcceptanceCriteria>2+ payload проходят по одному туннелю байт-в-байт; туннель жив между ними</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-2</RelatedFlows>
+    </UC-006>
+  </UseCases>
+
+  <NonGoals>
+    <item-1>Не проксировать MTProto (основной Telegram-протокол, core.telegram.org MTProto-трафик) — только HTTP Bot API.</item-1>
+    <item-2>Не выполнять TLS-терминацию и не выдавать HTTPS наружу (своего домена нет).</item-2>
+    <item-3>Не быть открытым прокси: allowlist только *.telegram.org:443.</item-3>
+    <item-4>Не кэшировать ответы и не модифицировать тела/заголовки.</item-4>
+    <item-5>Не поддерживать прозрачный перехват (iptables REDIRECT) — недоступно на контейнерном хостинге без root.</item-5>
+    <item-6>Не поддерживать plain-HTTP (без CONNECT) пересылку — только CONNECT-туннели.</item-6>
+  </NonGoals>
+
+  <Constraints>
+    <constraint-1>Хостинг Wispbyte free: 1 vCPU (лимит 35%), 512MB RAM, 1GB диск; рантайм Node.js; наружу выставляется один TCP-порт.</constraint-1>
+    <constraint-2>Ноль внешних npm-зависимостей: только встроенные модули Node.js (node:http, node:net, node:util; тесты — node:test, node:assert).</constraint-2>
+    <constraint-3>Allowlist: CONNECT разрешён только на *.telegram.org:443 (api/core/updates и поддомены), порт строго 443.</constraint-3>
+    <constraint-4>Прозрачность: HTTP-заголовки внутри TLS и тела запросов/ответов не модифицируются и не логируются.</constraint-4>
+    <constraint-5>Порт из env PORT (default 8080), слушать 0.0.0.0; graceful shutdown по SIGTERM/SIGINT.</constraint-5>
+    <constraint-6>Secrets (токены ботов, Proxy-Authorization) никогда не попадают в логи.</constraint-6>
+  </Constraints>
+
+  <Risks>
+    <risk-1>Лимит CPU 35%: массовый трафик (сотни ботов) упрётся в CPU/RAM; лимит одновременных туннелей (maxTunnels=32) защищает.</risk-1>
+    <risk-2>Обрыв long-polling при неверном idle-таймауте: таймер сбрасывается на любой байт, дефолт 120s > 50s.</risk-2>
+    <risk-3>Необработанные ошибки сокетов (ECONNRESET) могут крашить процесс: no-op error-handlers на обоих сокетах.</risk-3>
+    <risk-4>Обход allowlist (uppercase, trailing-dot, @, лишние :) — строгий парсер target + табличные тесты.</risk-4>
+    <risk-5>Публичный порт: любой может использовать прокси как «дыру до telegram.org»; рекомендуется включить basic auth.</risk-5>
+  </Risks>
+
+  <OpenQuestions>
+    <question-1>Имя переменной порта в панели Wispbyte (PORT или фиксированный) — проверить при деплое.</question-1>
+    <question-2>Версия Node.js на хостинге: нужна 18+ для node:test; код продакшена работает на любой версии.</question-2>
+  </OpenQuestions>
+</RequirementsAnalysis>

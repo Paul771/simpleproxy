@@ -1,0 +1,267 @@
+<DevelopmentPlan VERSION="0.2.0">
+  <ArchitectureNotes>
+    <objective>Минимальный forward CONNECT-прокси под жёсткие лимиты Wispbyte: ноль внешних зависимостей, байтовые туннели без TLS-терминации, строгий allowlist.</objective>
+    <non-goal>Не добавлять TLS-терминацию, HTTP/2-upstream, кэш, plain-HTTP пересылку, прозрачный перехват.</non-goal>
+    <risk-1>Обработка 'connect' должна закрывать сокеты парой при любой ошибке, иначе утечка соединений на лимитированном хосте.</risk-1>
+  </ArchitectureNotes>
+
+  <Modules>
+    <M-CONFIG NAME="Config" TYPE="UTILITY" LAYER="0" ORDER="1" STATUS="implemented">
+      <contract>
+        <purpose>Читает env и возвращает валидный конфиг прокси</purpose>
+        <inputs>
+          <param name="env" type="Record<string, string|undefined>" />
+        </inputs>
+        <outputs>
+          <param name="Config" type="{ port, host, maxTunnels, idleTimeoutMs, authUser?, authPass?, rules }" />
+        </outputs>
+        <errors>
+          <error code="INVALID_ENV" />
+        </errors>
+      </contract>
+      <interface>
+        <export-loadConfig PURPOSE="Загрузить и валидировать конфиг из env" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>src/config.js</source>
+        <tests>tests/config.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[config]</log-prefix>
+        <critical-block>BLOCK_VALIDATE_ENV</critical-block>
+      </observability>
+      <verification-ref>V-M-CONFIG</verification-ref>
+      <notes>
+        <note-1>Порт из env PORT (default 8080), host 0.0.0.0, maxTunnels 32, idleTimeoutMs 120_000; authUser/authPass из PROXY_USER/PROXY_PASS (оба заданы — auth включена).</note-1>
+      </notes>
+    </M-CONFIG>
+
+    <M-LOG NAME="Log" TYPE="UTILITY" LAYER="0" ORDER="2" STATUS="implemented">
+      <contract>
+        <purpose>Единственный форматтер логов [proxy][marker] msg → stdout; гарантирует redaction</purpose>
+        <inputs>
+          <param name="none" type="void" />
+        </inputs>
+        <outputs>
+          <param name="Log" type="(marker: string, ...args: unknown[]) => void" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-makeLog PURPOSE="Создать функцию логирования" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>src/log.js</source>
+        <tests>none (проверяется в V-M-PROXY-3 / V-M-LOG-1)</tests>
+      </target>
+      <observability>
+        <log-prefix>[proxy]</log-prefix>
+        <critical-block>BLOCK_FORMAT</critical-block>
+      </observability>
+      <verification-ref>V-M-LOG</verification-ref>
+      <notes>
+        <note-1>Данные туннеля и Proxy-Authorization никогда не передаются в эту функцию.</note-1>
+      </notes>
+    </M-LOG>
+
+    <M-ALLOW NAME="Allow" TYPE="CORE_LOGIC" LAYER="1" ORDER="1" STATUS="implemented">
+      <contract>
+        <purpose>Строгий парсер authority и проверка allowlist (чистая логика без IO)</purpose>
+        <inputs>
+          <param name="raw" type="string" />
+          <param name="target" type="Target" />
+          <param name="rules" type="Rule[]" />
+        </inputs>
+        <outputs>
+          <param name="Target | null" type="{ host: string, port: number } | null" />
+          <param name="boolean" type="Разрешён ли target по правилам" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-normalizeTarget PURPOSE="Распарсить CONNECT authority в {host, port} или null" />
+        <export-isAllowed PURPOSE="Проверить target против правил allowlist" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>src/allow.js</source>
+        <tests>tests/allow.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[allow]</log-prefix>
+        <critical-block>BLOCK_PARSE_TARGET</critical-block>
+      </observability>
+      <verification-ref>V-M-ALLOW</verification-ref>
+      <notes>
+        <note-1>Допустимы только [a-z0-9.-], lowercase, срез trailing-dot; отказ от @, лишних :, IPv6-скобок; порт строго 443; правило suffix '.telegram.org' и exact 'api.telegram.org'.</note-1>
+      </notes>
+    </M-ALLOW>
+
+    <M-AUTH NAME="Auth" TYPE="CORE_LOGIC" LAYER="1" ORDER="2" STATUS="implemented">
+      <contract>
+        <purpose>Парсинг и проверка Proxy-Authorization: Basic (чистая логика, timing-safe)</purpose>
+        <inputs>
+          <param name="header" type="string | undefined" />
+          <param name="creds" type="{ user: string, pass: string } | null" />
+        </inputs>
+        <outputs>
+          <param name="{ user, pass } | null" type="Распарсенные creds" />
+          <param name="boolean" type="Валидны ли creds" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-parseBasicAuth PURPOSE="Распарсить заголовок Basic в {user, pass}" />
+        <export-checkAuth PURPOSE="Проверить заголовок против заданных creds (или true, если auth выключена)" />
+      </interface>
+      <depends>node:crypto</depends>
+      <target>
+        <source>src/auth.js</source>
+        <tests>tests/auth.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[auth]</log-prefix>
+        <critical-block>BLOCK_VERIFY</critical-block>
+      </observability>
+      <verification-ref>V-M-AUTH</verification-ref>
+      <notes>
+        <note-1>Если creds null — checkAuth всегда true (auth выключена). Сравнение через timingSafeEqual.</note-1>
+      </notes>
+    </M-AUTH>
+
+    <M-TUNNEL NAME="Tunnel" TYPE="CORE_LOGIC" LAYER="1" ORDER="3" STATUS="implemented">
+      <contract>
+        <purpose>Устанавливает байтовый туннель между клиентским и upstream-сокетом со счётчиками и idle-таймером</purpose>
+        <inputs>
+          <param name="opts" type="{ clientSocket: net.Socket, upstream: net.Socket, target: Target, cfg: Config, log: Log }" />
+        </inputs>
+        <outputs>
+          <param name="void" type="none" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-openTunnel PURPOSE="Запустить двусторонний pump туннеля" />
+      </interface>
+      <depends>M-LOG</depends>
+      <target>
+        <source>src/tunnel.js</source>
+        <tests>tests/tunnel.e2e.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[tunnel]</log-prefix>
+        <critical-block>BLOCK_PUMP</critical-block>
+      </observability>
+      <verification-ref>V-M-TUNNEL</verification-ref>
+      <notes>
+        <note-1>Idle-таймер сбрасывается на любой байт с любой стороны; по истечении destroy обеих. Закрытие любого конца закрывает другой. No-op error-handlers.</note-1>
+      </notes>
+    </M-TUNNEL>
+
+    <M-PROXY NAME="Proxy" TYPE="ENTRY_POINT" LAYER="2" ORDER="1" STATUS="implemented">
+      <contract>
+        <purpose>HTTP-сервер: обработка CONNECT (auth → allow → cap → туннель), отклонение plain-HTTP, graceful start</purpose>
+        <inputs>
+          <param name="cfg" type="Config" />
+          <param name="allow" type="(t: Target) => boolean" />
+          <param name="auth" type="(h?: string) => boolean" />
+          <param name="log" type="Log" />
+        </inputs>
+        <outputs>
+          <param name="http.Server" type="Настроенный сервер" />
+          <param name="Promise<void>" type="start(): listen + graceful shutdown" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-createProxy PURPOSE="Создать http.Server с обработчиками" />
+        <export-start PURPOSE="Запустить listen и обработать SIGTERM/SIGINT" />
+      </interface>
+      <depends>M-CONFIG, M-ALLOW, M-AUTH, M-TUNNEL, M-LOG</depends>
+      <target>
+        <source>src/proxy.js</source>
+        <tests>tests/tunnel.e2e.test.js (через реальный сервер)</tests>
+      </target>
+      <observability>
+        <log-prefix>[proxy]</log-prefix>
+        <critical-block>BLOCK_HANDLE_CONNECT</critical-block>
+      </observability>
+      <verification-ref>V-M-PROXY</verification-ref>
+      <notes>
+        <note-1>Счётчик activeTunnels: инкремент на входе CONNECT, декремент при закрытии; предел → 503. 'request' → 405.</note-1>
+      </notes>
+    </M-PROXY>
+  </Modules>
+
+  <DataFlow>
+    <DF-1 NAME="CONNECTHandshake" TRIGGER="Клиент шлёт CONNECT api.telegram.org:443">
+      <step-1>http.Server получает 'connect' (req.url = authority)</step-1>
+      <step-2>auth-проверка: checkAuth(req.headers['proxy-authorization']) → fail: 407 + лог [proxy][auth_fail]</step-2>
+      <step-3>normalizeTarget(authority) → null: 400 + destroy</step-3>
+      <step-4>isAllowed(target, rules) → false: 403 + destroy + лог [proxy][deny]</step-4>
+      <step-5>activeTunnels >= maxTunnels → 503 + destroy + лог [proxy][cap_limit]</step-5>
+      <step-6>net.connect({host, port}) → 200 Connection Established + openTunnel</step-6>
+      <evidence>[proxy][connect], [proxy][deny], [proxy][auth_fail], [proxy][cap_limit]</evidence>
+    </DF-1>
+    <DF-2 NAME="TunnelData" TRIGGER="200 отправлен, туннель открыт">
+      <step-1>pump: clientSocket.pipe(upstream), upstream.pipe(clientSocket)</step-1>
+      <step-2>счётчики bytes_in/bytes_out на 'data'</step-2>
+      <step-3>закрытие/ошибка любого конца → destroy обоих</step-3>
+      <step-4>лог закрытия [tunnel][close] с байтами и длительностью</step-4>
+      <evidence>[tunnel][close] ... bytes_in bytes_out duration_ms; e2e: echo-данные байт-в-байт</evidence>
+    </DF-2>
+    <DF-3 NAME="IdleLifecycle" TRIGGER="Туннель открыт, активность отсутствует">
+      <step-1>таймер arm при открытии (cfg.idleTimeoutMs)</step-1>
+      <step-2>reset на любой 'data' с любой стороны</step-2>
+      <step-3>expiry → destroy обеих + лог [tunnel][idle_timeout]</step-3>
+      <evidence>[tunnel][idle_timeout]; e2e с коротким таймаутом</evidence>
+    </DF-3>
+    <DF-4 NAME="Capacity" TRIGGER="Каждый CONNECT">
+      <step-1>activeTunnels++ на входе, -- при закрытии</step-1>
+      <step-2>>= maxTunnels → 503</step-2>
+      <evidence>[proxy][cap_limit]</evidence>
+    </DF-4>
+  </DataFlow>
+
+  <ImplementationOrder>
+    <Phase-1 name="Foundation" status="done">
+      <goal>Каркас: config, log, proxy с 'request'→405 и start(), тест config, smoke-запуск</goal>
+      <step-1 module="M-CONFIG" status="done" verification="V-M-CONFIG">src/config.js + tests/config.test.js</step-1>
+      <step-2 module="M-LOG" status="done" verification="V-M-LOG">src/log.js</step-2>
+      <step-3 module="M-PROXY" status="done" verification="V-M-PROXY">src/proxy.js (request→405, start), src/index.js, package.json</step-3>
+    </Phase-1>
+    <Phase-2 name="ConnectTunnel" status="done">
+      <goal>Allowlist + CONNECT-обработка + туннель (403, байты, idle-timeout), e2e-тест, ручной smoke</goal>
+      <step-1 module="M-ALLOW" status="done" verification="V-M-ALLOW">src/allow.js + tests/allow.test.js</step-1>
+      <step-2 module="M-TUNNEL" status="done" verification="V-M-TUNNEL">src/tunnel.js + tests/tunnel.e2e.test.js</step-2>
+      <step-3 module="M-PROXY" status="done" verification="V-M-PROXY">connect-обработчик в src/proxy.js</step-3>
+    </Phase-2>
+    <Phase-3 name="AuthAndHardening" status="done">
+      <goal>Basic auth (407), cap (503), keep-alive тест, graceful shutdown, README, финальные GRACE-доки</goal>
+      <step-1 module="M-AUTH" status="done" verification="V-M-AUTH">src/auth.js + tests/auth.test.js</step-1>
+      <step-2 module="M-PROXY" status="done" verification="V-M-PROXY">cap-счётчик, auth-проверка, keep-alive e2e</step-2>
+      <step-3 module="M-PROXY" status="done" verification="V-M-PROXY">README.md, финальные правки docs/*.xml, knowledge-graph</step-3>
+    </Phase-3>
+  </ImplementationOrder>
+
+  <ExecutionPolicy>
+    <default-profile>balanced</default-profile>
+    <controller-owns>docs/development-plan.xml, docs/knowledge-graph.xml, docs/verification-plan.xml</controller-owns>
+    <worker-owns>Только исходники модулей и module-local тесты в пределах src/ и tests/</worker-owns>
+    <max-fix-attempts-per-step>2</max-fix-attempts-per-step>
+    <replan-trigger>Неизвестная версия Node, другое имя env-переменной порта, запрет исходящих соединений контейнером.</replan-trigger>
+    <checkpoint-requirement>Каждый шаг оставляет: предположения, команды, свидетельства, следующее действие.</checkpoint-requirement>
+  </ExecutionPolicy>
+</DevelopmentPlan>

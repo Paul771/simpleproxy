@@ -1,0 +1,65 @@
+<TechnologyStack VERSION="0.2.0">
+  <Runtime>Node.js 18+ (проверить версию в панели Wispbyte)</Runtime>
+  <Language>JavaScript (ESM)</Language>
+  <Framework>none (vanilla Node.js)</Framework>
+
+  <Dependencies>
+    <dep name="node:http" version="builtin" purpose="HTTP-сервер и обработка CONNECT-метода" />
+    <dep name="node:net" version="builtin" purpose="TCP-соединения: клиентские сокеты и исходящие туннели" />
+    <dep name="node:util" version="builtin" purpose="Утилиты (timing-safe сравнение для auth)" />
+    <dep name="node:crypto" version="builtin" purpose="timingSafeEqual для проверки basic auth" />
+    <dep name="node:test" version="builtin" purpose="Тестовый раннер" />
+    <dep name="node:assert" version="builtin" purpose="Ассерты в тестах" />
+  </Dependencies>
+
+  <VersionConstraints>
+    <constraint lib="node" min="18.0.0" max="latest" reason="node:test доступен с Node 18; продакшен-код совместим с любым Node, но тесты требуют 18+" />
+  </VersionConstraints>
+
+  <Tooling>
+    <tool name="runtime" value="node" version="18+" />
+    <tool name="test-runner" value="node:test" version="builtin" />
+    <tool name="linter" value="none" version="" />
+    <tool name="formatter" value="none" version="" />
+  </Tooling>
+
+  <PreferredAgentStack>
+    <preferred-runtime-library>node:http, node:net, node:util, node:crypto (builtins only)</preferred-runtime-library>
+    <preferred-test-library>node:test</preferred-test-library>
+    <discouraged-surface reason="На хостинге нет гарантированного доступа к npm; диск 1GB; ноль зависимостей ускоряет старт.">любые внешние npm-пакеты (express, http-proxy, pino и т.п.)</discouraged-surface>
+  </PreferredAgentStack>
+
+  <Testing>
+    <module-level>
+      <command>node --test tests/config.test.js tests/allow.test.js tests/auth.test.js</command>
+      <focus>Быстрые детерминированные юнит-проверки чистой логики (парсинг, allowlist, auth)</focus>
+    </module-level>
+    <wave-level>
+      <command>node --test tests/tunnel.e2e.test.js</command>
+      <focus>E2E через прокси к локальному echo-серверу (CONNECT, байты, idle-timeout, keep-alive, auth)</focus>
+    </wave-level>
+    <phase-level>
+      <command>node --test tests/</command>
+      <focus>Полный набор тестов + smoke curl -x на api.telegram.org (опционально)</focus>
+    </phase-level>
+    <mocking-policy>Никаких моков: локальный реальный TCP echo-сервер как fake-цель; конфиг и allowlist инжектятся параметрами.</mocking-policy>
+  </Testing>
+
+  <Observability>
+    <logger>stdout console, собственный форматтер makeLog()</logger>
+    <log-format>[proxy][marker] msg</log-format>
+    <required-fields>marker, src, host, port, bytes_in, bytes_out</required-fields>
+    <redaction>Никогда не логировать токены ботов, тела запросов/ответов, Proxy-Authorization.</redaction>
+  </Observability>
+
+  <AutonomyPolicy>
+    <default-execution-profile>balanced</default-execution-profile>
+    <max-fix-attempts-per-step>2</max-fix-attempts-per-step>
+    <replan-trigger>Неизвестная версия Node на хостинге, другое имя env-переменной порта, невозможность исходящих соединений из контейнера.</replan-trigger>
+    <checkpoint-requirement>Каждый завершённый шаг оставляет: предположения, выполненные команды, свидетельства, следующее действие.</checkpoint-requirement>
+  </AutonomyPolicy>
+
+  <DeliveryShape>
+    <shape>Один процесс Node.js (src/index.js), слушающий один TCP-порт на 0.0.0.0; байтовые CONNECT-туннели к api.telegram.org:443; без внешнего хранилища и без background-воркеров.</shape>
+  </DeliveryShape>
+</TechnologyStack>
