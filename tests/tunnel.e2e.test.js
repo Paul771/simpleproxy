@@ -13,7 +13,8 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import http from "node:http";
-import { createProxy } from "../src/proxy.js";
+import { createConnectHandler } from "../src/proxy.js";
+import { createMuxServer } from "../src/mux.js";
 import { makeLog } from "../src/log.js";
 import { isAllowed, normalizeTarget } from "../src/allow.js";
 import { checkAuth } from "../src/auth.js";
@@ -53,7 +54,13 @@ function startProxy(cfgOverrides = {}, allowImpl, authImpl) {
   const log = makeLog();
   const allow = allowImpl || (() => true);
   const auth = authImpl || ((h) => checkAuth(h, cfg.creds || null));
-  const server = createProxy(cfg, allow, auth, log);
+  const httpHandlers = createConnectHandler(cfg, allow, auth, log);
+  const handlers = {
+    "http-connect": httpHandlers["http-connect"],
+    "http-other": httpHandlers["http-other"],
+    "mtproto": null,
+  };
+  const server = createMuxServer(handlers);
   return new Promise((resolve) => {
     server.listen(cfg.port, cfg.host, () => {
       resolve({ server, addr: server.address() });

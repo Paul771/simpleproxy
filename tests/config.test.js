@@ -62,6 +62,40 @@ test("invalid PORT throws INVALID_ENV", () => {
   assert.throws(() => loadConfig({ PORT: "80.5" }), /INVALID_ENV/);
 });
 
+test("MTProto: MTPROTO_SECRET parses into lowercase hex secrets; unset disables", () => {
+  const disabled = loadConfig({});
+  assert.deepEqual(disabled.mtprotoSecrets, []);
+  assert.equal(disabled.mtprotoPort, 0);
+  assert.equal(disabled.mtprotoMaxConnections, 64);
+
+  const cfg = loadConfig({
+    MTPROTO_SECRET: "ABCDEF0123456789ABCDEF0123456789,00112233445566778899aabbccddeeff",
+    MTPROTO_PORT: "9443",
+    MTPROTO_MAX_CONNECTIONS: "8",
+  });
+  assert.deepEqual(cfg.mtprotoSecrets, [
+    "abcdef0123456789abcdef0123456789",
+    "00112233445566778899aabbccddeeff",
+  ]);
+  assert.equal(cfg.mtprotoPort, 9443);
+  assert.equal(cfg.mtprotoMaxConnections, 8);
+});
+
+test("MTProto: invalid MTPROTO_SECRET entries throw INVALID_ENV", () => {
+  assert.throws(() => loadConfig({ MTPROTO_SECRET: "zz" }), /INVALID_ENV/);
+  assert.throws(() => loadConfig({ MTPROTO_SECRET: "abcdef" }), /INVALID_ENV/); // too short
+});
+
+test("MTProto: whitespace and empties in MTPROTO_SECRET are trimmed away", () => {
+  const cfg = loadConfig({
+    MTPROTO_SECRET: " 00112233445566778899aabbccddeeff , , abcdef0123456789abcdef0123456789 ",
+  });
+  assert.deepEqual(cfg.mtprotoSecrets, [
+    "00112233445566778899aabbccddeeff",
+    "abcdef0123456789abcdef0123456789",
+  ]);
+});
+
 test("invalid MAX_TUNNELS throws INVALID_ENV", () => {
   assert.throws(() => loadConfig({ MAX_TUNNELS: "x" }), /INVALID_ENV/);
 });

@@ -147,6 +147,51 @@
       </required-log-markers>
       <phase-follow-up>Graceful shutdown по SIGTERM/SIGINT; smoke на Wispbyte с curl -x.</phase-follow-up>
     </V-M-PROXY>
+
+    <V-M-MUX MODULE="M-MUX" PRIORITY="high">
+      <test-files>
+        <file>tests/mux.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/mux.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">classifyProtocol: 'CONNECT …' → http-connect; 'GET …' → http-other; прочие байты → mtproto.</scenario-1>
+        <scenario-2 kind="success">Mux-маршрутизация: CONNECT-байты → http-connect handler; GET → http-other; MTProto-байты → mtproto handler.</scenario-2>
+        <scenario-3 kind="success">head (первые прочитанные байты) передаётся обработчику целиком.</scenario-3>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>нет логов mux — маршрутизация без побочных эффектов</marker-1>
+      </required-log-markers>
+      <wave-follow-up>Интеграция в e2e (tunnel + mtproto через один порт).</wave-follow-up>
+    </V-M-MUX>
+
+    <V-M-MTPROTO MODULE="M-MTPROTO" PRIORITY="high">
+      <test-files>
+        <file>tests/mtproto.test.js</file>
+        <file>tests/mtproto.e2e.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/mtproto.test.js tests/mtproto.e2e.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">parseClientHandshake: round-trip с эмулированным клиентом (все 3 proto-тега), неверный secret → null.</scenario-1>
+        <scenario-2 kind="success">buildUpstreamHandshake: зеркалирование ключей клиента, protoTag переживает до TG; relay round-trip.</scenario-2>
+        <scenario-3 kind="success">getDcAddress: dc_idx 1..5 → правильные IP; 0/6/-99 → null.</scenario-3>
+        <scenario-4 kind="success">E2E (fake-DC): полный handshake клиент→прокси→DC, данные round-trip; неверный secret → закрытие; bad DC → закрытие.</scenario-4>
+        <scenario-5 kind="success">Лог [proxy][mtproto_link] с tg://proxy-ссылками при старте (smoke).</scenario-5>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][mtproto_connect][DF-1]</marker-1>
+        <marker-2>[proxy][mtproto_auth_fail][DF-1]</marker-2>
+        <marker-3>[proxy][mtproto_close][DF-2]</marker-3>
+        <marker-4>[proxy][mtproto_link][start]</marker-4>
+      </required-log-markers>
+      <required-trace-assertions>
+        <assertion-1>Данные DC→клиент идут байт-в-байт (FAST_MODE); клиент→DC — перекодировка через decryptor/encryptorUp.</assertion-1>
+      </required-trace-assertions>
+      <phase-follow-up>Полный набор тестов; smoke на Wispbyte через tg://proxy в Telegram.</phase-follow-up>
+    </V-M-MTPROTO>
   </ModuleVerification>
 
   <PhaseGates>
@@ -178,6 +223,17 @@
         <evidence-1>Все тесты проходят; stdout-редискция подтверждена тестом.</evidence-1>
       </required-evidence>
     </Gate-Phase-3>
+    <Gate-Phase-4 PHASE="Phase-4">
+      <goal>MTProto: handshake round-trip, mux-маршрутизация, e2e через fake-DC, ссылки tg://proxy; все тесты зелёные.</goal>
+      <commands>
+        <command-1>node --test</command-1>
+        <command-2>MTPROTO_SECRET=... PORT=8080 node src/index.js (smoke: лог mtproto_link)</command-2>
+      </commands>
+      <required-evidence>
+        <evidence-1>46 тестов проходят (включая mtproto/mux).</evidence-1>
+        <evidence-2>В логе старта есть tg://proxy-ссылки (simple + dd).</evidence-2>
+      </required-evidence>
+    </Gate-Phase-4>
   </PhaseGates>
 
   <FailurePackets>

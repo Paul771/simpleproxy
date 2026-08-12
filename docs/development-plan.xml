@@ -170,15 +170,15 @@
 
     <M-PROXY NAME="Proxy" TYPE="ENTRY_POINT" LAYER="2" ORDER="1" STATUS="implemented">
       <contract>
-        <purpose>HTTP-сервер: обработка CONNECT (auth → allow → cap → туннель), отклонение plain-HTTP, graceful start</purpose>
+        <purpose>CONNECT-парсер на raw-socket: auth → allow → cap → туннель, отклонение plain-HTTP, graceful start</purpose>
         <inputs>
           <param name="cfg" type="Config" />
-          <param name="allow" type="(t: Target) => boolean" />
+          <param name="allow" type="(raw: string) => boolean" />
           <param name="auth" type="(h?: string) => boolean" />
           <param name="log" type="Log" />
         </inputs>
         <outputs>
-          <param name="http.Server" type="Настроенный сервер" />
+          <param name="handlers" type="{ http-connect, http-other }" />
           <param name="Promise<void>" type="start(): listen + graceful shutdown" />
         </outputs>
         <errors>
@@ -186,13 +186,13 @@
         </errors>
       </contract>
       <interface>
-        <export-createProxy PURPOSE="Создать http.Server с обработчиками" />
+        <export-createConnectHandler PURPOSE="Создать http-connect/http-other обработчики для mux" />
         <export-start PURPOSE="Запустить listen и обработать SIGTERM/SIGINT" />
       </interface>
       <depends>M-CONFIG, M-ALLOW, M-AUTH, M-TUNNEL, M-LOG</depends>
       <target>
         <source>src/proxy.js</source>
-        <tests>tests/tunnel.e2e.test.js (через реальный сервер)</tests>
+        <tests>tests/tunnel.e2e.test.js (через mux-сервер)</tests>
       </target>
       <observability>
         <log-prefix>[proxy]</log-prefix>
@@ -200,9 +200,113 @@
       </observability>
       <verification-ref>V-M-PROXY</verification-ref>
       <notes>
-        <note-1>Счётчик activeTunnels: инкремент на входе CONNECT, декремент при закрытии; предел → 503. 'request' → 405.</note-1>
+        <note-1>Счётчик activeTunnels: инкремент на входе CONNECT, декремент при закрытии; предел → 503. plain-HTTP → 405.</note-1>
       </notes>
     </M-PROXY>
+
+    <M-MUX NAME="Mux" TYPE="ENTRY_POINT" LAYER="2" ORDER="2" STATUS="implemented">
+      <contract>
+        <purpose>Протокольный мультиплексор на одном порту: HTTP CONNECT vs MTProto по первым байтам</purpose>
+        <inputs>
+          <param name="handlers" type="{ http-connect, http-other, mtproto }" />
+        </inputs>
+        <outputs>
+          <param name="net.Server" type="Сервер с маршрутизацией" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-createMuxServer PURPOSE="net.Server: peek первых байт, маршрутизация" />
+        <export-classifyProtocol PURPOSE="Определить протокол по head" />
+      </interface>
+      <depends>none (handlers injected)</depends>
+      <target>
+        <source>src/mux.js</source>
+        <tests>tests/mux.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[mux]</log-prefix>
+        <critical-block>BLOCK_PEEK</critical-block>
+      </observability>
+      <verification-ref>V-M-MUX</verification-ref>
+      <notes>
+        <note-1>Пик 8 байт; 'CONNECT ' → http-connect, HTTP-методы → http-other, иначе mtproto. Head передаётся обработчику.</note-1>
+      </notes>
+    </M-MUX>
+
+    <M-MTPROTO NAME="MTProto" TYPE="CORE_LOGIC" LAYER="1" ORDER="4" STATUS="implemented">
+      <contract>
+        <purpose>Obfuscated2 handshake parse/build и DC mapping (чистая логика, ноль IO)</purpose>
+        <inputs>
+          <param name="handshake" type="Buffer(64)" />
+          <param name="secrets" type="Buffer[]" />
+          <param name="parsed" type="ParsedHandshake" />
+          <param name="dcIdx" type="number" />
+        </inputs>
+        <outputs>
+          <param name="ParsedHandshake | null" type="{ secret, protoTag, dcIdx, encKey, encIv, decryptor }" />
+          <param name="{ rndEnc, encryptorUp, decryptorUp }" type="Upstream handshake + stateful шифры" />
+          <param name="{ host, port } | null" type="Адрес DC" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-parseClientHandshake PURPOSE="Валидировать handshake по секретам" />
+        <export-buildUpstreamHandshake PURPOSE="Построить upstream handshake (FAST_MODE зеркалирование)" />
+        <export-getDcAddress PURPOSE="dc_idx → адрес DC" />
+        <export-createAesCtr PURPOSE="Stateful AES-256-CTR" />
+      </interface>
+      <depends>node:crypto</depends>
+      <target>
+        <source>src/mtproto.js</source>
+        <tests>tests/mtproto.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[mtproto]</log-prefix>
+        <critical-block>BLOCK_PARSE_HANDSHAKE</critical-block>
+      </observability>
+      <verification-ref>V-M-MTPROTO</verification-ref>
+      <notes>
+        <note-1>Константы и layout по референсу alexbers/mtprotoproxy (SKIP_LEN=8, PROTO_TAG_POS=56, DC_IDX_POS=60).</note-1>
+      </notes>
+    </M-MTPROTO>
+
+    <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" LAYER="2" ORDER="3" STATUS="implemented">
+      <contract>
+        <purpose>MTProto-обработчик соединений: handshake → подключение к DC → relay (FAST_MODE)</purpose>
+        <inputs>
+          <param name="cfg" type="Config" />
+          <param name="log" type="Log" />
+          <param name="resolveDc" type="(dcIdx) => { host, port } | null" />
+        </inputs>
+        <outputs>
+          <param name="(socket, head) => void" type="Обработчик для mux" />
+        </outputs>
+        <errors>
+          <error code="none" />
+        </errors>
+      </contract>
+      <interface>
+        <export-createMtprotoHandler PURPOSE="Создать mtproto-обработчик для mux" />
+      </interface>
+      <depends>M-MTPROTO, M-LOG</depends>
+      <target>
+        <source>src/mtproto-server.js</source>
+        <tests>tests/mtproto.e2e.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[mtproto]</log-prefix>
+        <critical-block>BLOCK_MT_RELAY</critical-block>
+      </observability>
+      <verification-ref>V-M-MTPROTO</verification-ref>
+      <notes>
+        <note-1>FAST_MODE: клиент→DC перешифровка (decrypt клиента → encrypt upstream); DC→клиент байт-в-байт.</note-1>
+      </notes>
+    </M-MTPROTO-SERVER>
   </Modules>
 
   <DataFlow>
@@ -254,6 +358,14 @@
       <step-2 module="M-PROXY" status="done" verification="V-M-PROXY">cap-счётчик, auth-проверка, keep-alive e2e</step-2>
       <step-3 module="M-PROXY" status="done" verification="V-M-PROXY">README.md, финальные правки docs/*.xml, knowledge-graph</step-3>
     </Phase-3>
+    <Phase-4 name="MTProto" status="done">
+      <goal>MTProto proxy: config, handshake-логика, мультиплексор, e2e через fake-DC, ссылки tg://proxy</goal>
+      <step-1 module="M-CONFIG" status="done" verification="V-M-CONFIG">MTPROTO_SECRET/PORT/MAX_CONNECTIONS в config.js</step-1>
+      <step-2 module="M-MTPROTO" status="done" verification="V-M-MTPROTO">src/mtproto.js + tests/mtproto.test.js (round-trip handshake)</step-2>
+      <step-3 module="M-MUX" status="done" verification="V-M-MUX">src/mux.js + tests/mux.test.js; M-PROXY → raw-socket CONNECT-парсер</step-3>
+      <step-4 module="M-MTPROTO-SERVER" status="done" verification="V-M-MTPROTO">src/mtproto-server.js + tests/mtproto.e2e.test.js (fake-DC)</step-4>
+      <step-5 module="M-MTPROTO-SERVER" status="done" verification="V-M-MTPROTO">ссылки tg://proxy в логе, README, финальные GRACE-доки</step-5>
+    </Phase-4>
   </ImplementationOrder>
 
   <ExecutionPolicy>

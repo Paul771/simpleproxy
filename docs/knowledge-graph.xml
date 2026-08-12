@@ -56,22 +56,60 @@
     </M-TUNNEL>
 
     <M-PROXY NAME="Proxy" TYPE="ENTRY_POINT" STATUS="implemented">
-      <purpose>HTTP-сервер: CONNECT-обработка (auth→allow→cap→tunnel), отклонение plain-HTTP, graceful start</purpose>
+      <purpose>CONNECT-парсер на raw-socket: auth→allow→cap→tunnel, отклонение plain-HTTP, graceful start</purpose>
       <path>src/proxy.js</path>
       <depends>M-CONFIG, M-ALLOW, M-AUTH, M-TUNNEL, M-LOG</depends>
       <verification-ref>V-M-PROXY</verification-ref>
       <annotations>
-        <fn-createProxy PURPOSE="Создать http.Server с обработчиками" />
+        <fn-createConnectHandler PURPOSE="Создать http-connect/http-other обработчики для mux" />
         <fn-start PURPOSE="Запустить listen и обработать SIGTERM/SIGINT" />
       </annotations>
     </M-PROXY>
 
+    <M-MUX NAME="Mux" TYPE="ENTRY_POINT" STATUS="implemented">
+      <purpose>Протокольный мультиплексор: определение HTTP CONNECT vs MTProto по первым байтам, маршрутизация</purpose>
+      <path>src/mux.js</path>
+      <depends>none (handlers injected)</depends>
+      <verification-ref>V-M-MUX</verification-ref>
+      <annotations>
+        <fn-createMuxServer PURPOSE="net.Server, читающий первые байты и маршрутизирующий" />
+        <fn-classifyProtocol PURPOSE="Определить протокол по head" />
+      </annotations>
+    </M-MUX>
+
+    <M-MTPROTO NAME="MTProto" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Obfuscated2 handshake parse/build и DC mapping (чистая логика)</purpose>
+      <path>src/mtproto.js</path>
+      <depends>node:crypto</depends>
+      <verification-ref>V-M-MTPROTO</verification-ref>
+      <annotations>
+        <fn-parseClientHandshake PURPOSE="Валидировать 64-байтный handshake клиента по секретам" />
+        <fn-buildUpstreamHandshake PURPOSE="Построить handshake к DC (FAST_MODE зеркалирование ключей)" />
+        <fn-getDcAddress PURPOSE="Разрешить dc_idx в адрес датацентра Telegram" />
+        <fn-createAesCtr PURPOSE="Stateful AES-256-CTR шифр" />
+      </annotations>
+    </M-MTPROTO>
+
+    <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>MTProto-обработчик соединений: handshake → подключение к DC → relay (FAST_MODE)</purpose>
+      <path>src/mtproto-server.js</path>
+      <depends>M-MTPROTO, M-LOG</depends>
+      <verification-ref>V-M-MTPROTO</verification-ref>
+      <annotations>
+        <fn-createMtprotoHandler PURPOSE="Создать mtproto-обработчик для mux" />
+      </annotations>
+    </M-MTPROTO-SERVER>
+
+    <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
+    <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic" />
     <CrossLink from="M-PROXY" to="M-CONFIG" relation="reads config" />
     <CrossLink from="M-PROXY" to="M-ALLOW" relation="uses allowlist" />
     <CrossLink from="M-PROXY" to="M-AUTH" relation="checks auth" />
     <CrossLink from="M-PROXY" to="M-TUNNEL" relation="opens tunnels" />
     <CrossLink from="M-PROXY" to="M-LOG" relation="logs via formatter" />
     <CrossLink from="M-TUNNEL" to="M-LOG" relation="logs via formatter" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-LOG" relation="logs via formatter" />
 
   </Project>
 </KnowledgeGraph>

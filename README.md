@@ -72,37 +72,78 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `IDLE_TIMEOUT_MS` | `120000` | Idle-таймаут туннеля; сброс на любой байт |
 | `PROXY_USER` | — | Включает basic auth (нужны оба: `PROXY_USER` + `PROXY_PASS`) |
 | `PROXY_PASS` | — | Пароль basic auth |
+| `MTPROTO_SECRET` | — | MTProto-секрет, 32 hex (16 байт); несколько через запятую. **Не задан → MTProto выключен** |
+| `MTPROTO_PORT` | `0` | Отдельный порт для MTProto; `0` = мультиплексировать с HTTP на `PORT` |
+| `MTPROTO_MAX_CONNECTIONS` | `64` | Лимит одновременных MTProto-соединений |
 
-## Развёртывание на Wispbyte
+## MTProto proxy (официальные клиенты Telegram)
+
+Прокси умеет принимать и MTProto-трафик (obfuscated2): официальные приложения Telegram
+(мобильные/десктоп) подключаются по ссылке `tg://proxy`. TLS/обфускация end-to-end,
+прокси видит только handshake. Поддерживаются **simple** (16 байт) и **dd** (фиксация DC)
+секреты; fake-TLS (ee) не поддерживается.
+
+Генерация секрета:
+
+```bash
+# 32 случайных hex-символа (16 байт)
+node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
+```
+
+При старте сервер печатает ссылки для каждого секрета:
+
+```
+[proxy][mtproto_link] simple:  tg://proxy?server=YOUR_HOST_OR_IP&port=8080&secret=<hex>
+[proxy][mtproto_link] dd:      tg://proxy?server=YOUR_HOST_OR_IP&port=8080&secret=dd<hex>
+```
+
+Подставьте адрес и порт вашего сервера Wispbyte, откройте ссылку в Telegram
+(Настройки → Прокси → «Добавить прокси» или просто перейдите по `tg://`-ссылке)
+и проверьте статус «Готово к использованию».
+
+**Пример ссылки (после подстановки хоста):**
+
+```
+tg://proxy?server=example.wispbyte.com&port=8080&secret=00112233445566778899aabbccddeeff
+```
+
+### Развёртывание на Wispbyte
 
 1. Создайте сервер в панели Wispbyte: **Server Type** = Free Plan, **Runtime** = Node.js.
 2. Загрузите файлы проекта (`package.json`, `src/`). `node_modules` не нужен.
 3. Убедитесь, что стартовая команда — `node src/index.js` (см. `"start"` в `package.json`).
-4. Задайте env-переменные в панели: `PORT` (если панель его не выдаёт автоматически) и, при необходимости, `PROXY_USER`/`PROXY_PASS`.
-5. Проверьте снаружи:
+4. Задайте env-переменные в панели: `PORT` (если панель его не выдаёт автоматически),
+   `MTPROTO_SECRET`, при необходимости `PROXY_USER`/`PROXY_PASS`.
+5. Проверьте HTTP-часть снаружи:
 
 ```bash
 curl -x http://<адрес-и-порт-от-wispbyte> https://api.telegram.org
 ```
 
+6. Откройте `tg://proxy`-ссылку (см. лог старта) в Telegram — статус «Готово к использованию».
+
 ## Ограничения
 
 - Только HTTPS-трафик через `CONNECT` (plain-HTTP не пересылается — `405`).
-- Только домены `*.telegram.org:443`; остальное — `403`.
-- Масштаб: десятки параллельных ботов комфортно; сотни упрутся в лимит CPU 35% Wispbyte.
+- HTTP: только домены `*.telegram.org:443`; остальное — `403`.
+- MTProto: только `*.telegram.org` DC-IP, порт 443; секреты simple/dd, без fake-TLS.
+- Масштаб: десятки параллельных ботов + сотни MTProto-клиентов комфортно; тысячи упрутся в лимит CPU 35% Wispbyte.
 
 ## Структура
 
 ```
-src/index.js     — точка входа: wiring config → log → allow → auth → proxy
-src/config.js    — M-CONFIG: env → конфиг
-src/log.js       — M-LOG: форматтер [proxy][marker], redaction
-src/allow.js     — M-ALLOW: парсер authority + allowlist
-src/auth.js      — M-AUTH: basic auth (timing-safe)
-src/tunnel.js    — M-TUNNEL: байтовый туннель, idle-таймер, счётчики
-src/proxy.js     — M-PROXY: http.Server (connect/request), cap, graceful start
-tests/           — node:test (юнит + e2e)
-docs/            — GRACE-документы проекта
+src/index.js           — точка входа: wiring config → log → allow → auth → mux → start
+src/config.js          — M-CONFIG: env → конфиг (вкл. MTPROTO_*)
+src/log.js             — M-LOG: форматтер [proxy][marker], redaction
+src/allow.js           — M-ALLOW: парсер authority + allowlist
+src/auth.js            — M-AUTH: basic auth (timing-safe)
+src/tunnel.js          — M-TUNNEL: байтовый туннель, idle-таймер, счётчики
+src/proxy.js           — M-PROXY: парсер CONNECT, auth→allow→cap→tunnel
+src/mux.js             — M-MUX: определение протокола по первым байтам, маршрутизация
+src/mtproto.js         — M-MTPROTO: obfuscated2 handshake (parse/build), DC mapping
+src/mtproto-server.js  — MTProto-обработчик соединений (handshake → DC → relay)
+tests/                 — node:test (юнит + e2e)
+docs/                  — GRACE-документы проекта
 ```
 
 Подробности архитектуры и методология — в `docs/` и `AGENTS.md`.

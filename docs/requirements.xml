@@ -67,10 +67,19 @@
       <Priority>high</Priority>
       <RelatedFlows>DF-2</RelatedFlows>
     </UC-006>
+    <UC-007>
+      <Actor>TelegramClient</Actor>
+      <Action>Официальный клиент Telegram подключается по ссылке tg://proxy?server=...&port=...&secret=...</Action>
+      <Goal>MTProto obfuscated2 handshake валидируется, трафик релеится к DC Telegram; simple и dd секреты работают</Goal>
+      <Preconditions>MTPROTO_SECRET задан; клиент использует валидный secret</Preconditions>
+      <AcceptanceCriteria>handshake с верным секретом → соединение к DC → данные проходят; неверный секрет → закрытие; dc_idx → правильный DC</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-1, DF-2, DF-3</RelatedFlows>
+    </UC-007>
   </UseCases>
 
   <NonGoals>
-    <item-1>Не проксировать MTProto (основной Telegram-протокол, core.telegram.org MTProto-трафик) — только HTTP Bot API.</item-1>
+    <item-1>Не поддерживать fake-TLS (ee-секрет) MTProto: только simple (16 байт) и dd (17 байт, фиксация DC).</item-1>
     <item-2>Не выполнять TLS-терминацию и не выдавать HTTPS наружу (своего домена нет).</item-2>
     <item-3>Не быть открытым прокси: allowlist только *.telegram.org:443.</item-3>
     <item-4>Не кэшировать ответы и не модифицировать тела/заголовки.</item-4>
