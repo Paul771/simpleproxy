@@ -15,6 +15,8 @@
 //   createTlsRecordReader - stateful TLS record parser (strips framing, yields app data)
 //   wrapTlsRecord - wrap app data in a TLS 1.3 application-data record
 //   genX25519PublicKey - generate a plausible x25519 public key (square mod P)
+//   extractSni - parse the SNI hostname from a TLS ClientHello (null if absent)
+//   buildTlsAlert - build a TLS alert record (used for reject_handshake mode)
 // END_MODULE_MAP
 
 import { createHmac, randomBytes } from "node:crypto";
@@ -113,18 +115,21 @@ export function validateClientHello(handshake, secrets) {
 
 // START_CONTRACT: buildServerHello
 //   PURPOSE: Build the fake ServerHello + ChangeCipherSpec + ApplicationData response
-//   INPUTS: { secret: Buffer(16), clientDigest: Buffer(32), sessionId: Buffer }
+//   INPUTS: { secret: Buffer(16), clientDigest: Buffer(32), sessionId: Buffer, alpn?: string - negotiated ALPN protocol }
 //   OUTPUTS: { Buffer - full response packet }
 //   SIDE_EFFECTS: none
 //   LINKS: M-FAKETLS
 // END_CONTRACT: buildServerHello
-export function buildServerHello(secret, clientDigest, sessionId) {
+export function buildServerHello(secret, clientDigest, sessionId, alpn = null) {
   // START_BLOCK_BUILD
   const x25519 = genX25519PublicKey();
   const tlsExtensions = Buffer.concat([
     Buffer.from([0x00, 0x2e, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]),
     x25519,
     Buffer.from([0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]),
+    // ALPN extension (0x00 0x10): advertises the negotiated protocol, mirroring a real
+    // TLS 1.3 server flight. Omitted entirely when no ALPN is configured (backward compatible).
+    ...(alpn ? [buildAlpnExtension([alpn])] : []),
   ]);
   const srvHello = Buffer.concat([
     TLS_VERS,
@@ -230,4 +235,105 @@ export function wrapTlsRecord(data) {
   }
   return Buffer.concat(parts);
   // END_BLOCK_WRAP
+}
+
+// START_CONTRACT: buildAlpnExtension
+//   PURPOSE: Build a TLS ALPN extension (type 0x00 0x10) advertising the given protocols
+//   INPUTS: { protocols: string[] - ordered list of ALPN protocol names }
+//   OUTPUTS: { Buffer - extension bytes: type(2) + extLen(2) + listLen(2) + per-proto entries }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS
+// END_CONTRACT: buildAlpnExtension
+export function buildAlpnExtension(protocols) {
+  // START_BLOCK_ALPN
+  const listEntries = [];
+  for (const p of protocols) {
+    const name = Buffer.from(p, "latin1");
+    listEntries.push(Buffer.from([name.length]), name);
+  }
+  const list = Buffer.concat(listEntries);
+  const listLen = Buffer.alloc(2);
+  listLen.writeUInt16BE(list.length, 0);
+  const body = Buffer.concat([listLen, list]);
+  const ext = Buffer.alloc(4);
+  ext.writeUInt16BE(0x0010, 0); // extension type: ALPN
+  ext.writeUInt16BE(body.length, 2);
+  return Buffer.concat([ext, body]);
+  // END_BLOCK_ALPN
+}
+
+// START_CONTRACT: extractSni
+//   PURPOSE: Parse the SNI hostname from a TLS ClientHello record (server_name extension)
+//   INPUTS: { handshake: Buffer - full ClientHello from 0x16 onward }
+//   OUTPUTS: { string | null - lowercased SNI hostname, or null if absent/unparseable }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS
+// END_CONTRACT: extractSni
+export function extractSni(handshake) {
+  // START_BLOCK_SNI
+  try {
+    if (handshake.length < 5 || handshake[0] !== 0x16) return null;
+    let off = 5; // skip 0x16 0x03 0x01 + record length(2)
+    if (handshake[off] !== 0x01) return null; // not a ClientHello
+    off += 1;
+    if (off + 3 > handshake.length) return null;
+    const hsLen = handshake.readUIntBE(off, 3);
+    off += 3;
+    const hsEnd = off + hsLen;
+    if (hsEnd > handshake.length) return null;
+    off += 2; // client version
+    off += 32; // random
+    if (off >= hsEnd) return null;
+    off += 1 + handshake[off]; // session id (len byte + bytes)
+    if (off + 2 > hsEnd) return null;
+    off += 2 + handshake.readUInt16BE(off); // cipher suites (len + bytes)
+    if (off + 1 > hsEnd) return null;
+    off += 1 + handshake[off]; // compression methods (len byte + bytes)
+    if (off + 2 > hsEnd) return null;
+    const extLen = handshake.readUInt16BE(off);
+    off += 2;
+    const extEnd = off + extLen;
+    if (extEnd > hsEnd) return null;
+    while (off + 4 <= extEnd) {
+      const extType = handshake.readUInt16BE(off);
+      const eLen = handshake.readUInt16BE(off + 2);
+      off += 4;
+      if (extType === 0x0000) {
+        // server_name extension
+        if (off + 2 > extEnd) return null;
+        const snListLen = handshake.readUInt16BE(off);
+        let p = off + 2;
+        const snListEnd = off + 2 + snListLen; // list bytes start after the 2-byte listLen field
+        if (snListEnd > extEnd) return null;
+        while (p + 3 <= snListEnd) {
+          const nameType = handshake[p];
+          const nameLen = handshake.readUInt16BE(p + 1);
+          p += 3;
+          if (nameType === 0x00 && p + nameLen <= snListEnd) {
+            return handshake.subarray(p, p + nameLen).toString("latin1").toLowerCase();
+          }
+          p += nameLen;
+        }
+        return null;
+      }
+      off += eLen;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+  // END_BLOCK_SNI
+}
+
+// START_CONTRACT: buildTlsAlert
+//   PURPOSE: Build a fatal TLS alert record (used for reject_handshake mode)
+//   INPUTS: { description: number - TLS alert description code (e.g. 112 = unrecognized_name) }
+//   OUTPUTS: { Buffer - 0x15 0x03 0x03 00 02 02 <description> }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS
+// END_CONTRACT: buildTlsAlert
+export function buildTlsAlert(description) {
+  // START_BLOCK_ALERT
+  return Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, description & 0xff]);
+  // END_BLOCK_ALERT
 }

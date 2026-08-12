@@ -3,7 +3,7 @@
 // START_MODULE_CONTRACT
 //   PURPOSE: Entry point: loadConfig -> makeLog -> mux(connect + mtproto) -> start
 //   SCOPE: process bootstrap, dependency wiring, tg://proxy link generation
-//   DEPENDS: M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO
+//   DEPENDS: M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO, M-FAKETLS, M-MASK, M-REPLAY
 //   LINKS: M-PROXY
 //   ROLE: ENTRY_POINT
 //   MAP_MODE: LOCALS
@@ -16,6 +16,7 @@ import { checkAuth } from "./auth.js";
 import { createConnectHandler, start } from "./proxy.js";
 import { createMtprotoHandler } from "./mtproto-server.js";
 import { createMuxServer } from "./mux.js";
+import { createReplayGuard } from "./replay-guard.js";
 
 // START_BLOCK_BOOT
 let cfg;
@@ -31,10 +32,18 @@ const allow = (raw) => isAllowed(normalizeTarget(raw), cfg.rules);
 const auth = (header) => checkAuth(header, cfg.creds);
 
 const httpHandlers = createConnectHandler(cfg, allow, auth, log);
+// Replay guard is created only when MTProto is enabled and the window is non-zero.
+const replayGuard = cfg.mtprotoSecrets.length > 0 && cfg.mtprotoReplayWindow > 0
+  ? createReplayGuard({
+      maxSize: cfg.mtprotoReplayWindow,
+      ttlMs: cfg.mtprotoReplayTtlMs,
+      freshnessMs: cfg.mtprotoDigestFreshnessMs,
+    })
+  : null;
 const handlers = {
   "http-connect": httpHandlers["http-connect"],
   "http-other": httpHandlers["http-other"],
-  "mtproto": cfg.mtprotoSecrets.length > 0 ? createMtprotoHandler(cfg, log) : null,
+  "mtproto": cfg.mtprotoSecrets.length > 0 ? createMtprotoHandler(cfg, log, undefined, replayGuard) : null,
 };
 
 const server = createMuxServer(handlers);
@@ -42,6 +51,13 @@ const server = createMuxServer(handlers);
 server.on("listening", () => {
   // START_BLOCK_PRINT_LINKS
   if (cfg.mtprotoSecrets.length > 0) {
+    log("mask_config", "start", {
+      action: cfg.mtprotoUnknownSniAction,
+      mask_host: `${cfg.mtprotoMaskHost}:${cfg.mtprotoMaskPort}`,
+      alpn: (cfg.mtprotoTlsAlpn || []).join(","),
+      replay: replayGuard ? cfg.mtprotoReplayWindow : 0,
+      ipv6: cfg.mtprotoPreferIpv6 ? 1 : 0,
+    });
     const host = cfg.mtprotoHost;
     const port = cfg.mtprotoPort > 0 ? cfg.mtprotoPort : cfg.port;
     for (const secret of cfg.mtprotoSecrets) {

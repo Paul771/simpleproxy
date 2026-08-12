@@ -24,22 +24,47 @@ import {
   buildServerHello,
   createTlsRecordReader,
   wrapTlsRecord,
+  buildTlsAlert,
+  extractSni,
 } from "./faketls.js";
+import { maskConnection } from "./mask.js";
 
 const HANDSHAKE_LEN = 64;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 const TLS_START = [0x16, 0x03, 0x01];
+const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 
 // START_CONTRACT: createMtprotoHandler
 //   PURPOSE: Create the mtproto mux handler; validates handshake, connects to DC, relays
-//   INPUTS: { cfg: Config, log: Log, resolveDc?: (dcIdx: number) => { host, port } | null }
+//   INPUTS: { cfg: Config, log: Log, resolveDc?: (dcIdx, opts) => { host, port } | null,
+//             replayGuard?: { admit: (key: Buffer) => boolean } | null,
+//             maskImpl?: (opts) => void - mask splice function (injectable for tests) }
 //   OUTPUTS: { (socket, head) => void }
 //   SIDE_EFFECTS: none
 //   LINKS: M-MTPROTO
 // END_CONTRACT: createMtprotoHandler
-export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
+export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayGuard = null, maskImpl = maskConnection) {
   let activeConnections = 0;
+
+  // START_BLOCK_ROUTE_UNKNOWN
+  // Behaviour on unknown SNI / failed fake-TLS auth (telemt-inspired anti-DPI).
+  // cfg.mtprotoUnknownSniAction: "mask" (splice to mask_host) | "reject" (TLS alert+close) | "drop".
+  // Falls back to "drop" when unset so manually-built test configs keep legacy behaviour.
+  const routeUnknown = (socket, head) => {
+    const action = cfg.mtprotoUnknownSniAction || "drop";
+    if (action === "mask") {
+      maskImpl({ clientSocket: socket, head, cfg, log });
+      return;
+    }
+    if (action === "reject") {
+      socket.write(buildTlsAlert(TLS_ALERT_UNRECOGNIZED_NAME));
+      socket.destroy();
+      return;
+    }
+    socket.destroy();
+  };
+  // END_BLOCK_ROUTE_UNKNOWN
 
   const handle = (socket, head) => {
     // START_BLOCK_MT_HANDSHAKE
@@ -67,7 +92,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
         socket.destroy();
         return;
       }
-      const dc = resolveDc(parsed.dcIdx);
+      const dc = resolveDc(parsed.dcIdx, { preferIpv6: cfg.mtprotoPreferIpv6 });
       if (!dc) {
         log("mtproto_bad_dc", "DF-1", socket.remoteAddress, parsed.dcIdx);
         socket.destroy();
@@ -203,11 +228,30 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
         buf = buf.subarray(5 + recordLen);
         const validated = validateClientHello(clientHello, secrets);
         if (!validated) {
+          // Non-keyed client (crawler / wrong secret): mask or reject instead of a bare RST,
+          // so port 443 is wire-indistinguishable from a real web server.
           log("faketls_auth_fail", "DF-1", socket.remoteAddress);
-          socket.destroy();
+          routeUnknown(socket, clientHello);
           return;
         }
-        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId);
+        // SNI gate: a present SNI that does not match the configured front domain is treated as
+        // unknown. Absent SNI stays lenient (legacy clients / test emulators without SNI).
+        const sni = extractSni(clientHello);
+        if (sni !== null && sni !== cfg.mtprotoTlsDomain.toLowerCase()) {
+          log("faketls_unknown_sni", "DF-MASK", socket.remoteAddress, { sni });
+          routeUnknown(socket, clientHello);
+          return;
+        }
+        // Replay protection: admit each client digest at most once within the guard window.
+        if (replayGuard && !replayGuard.admit(validated.digest)) {
+          log("faketls_replay", "DF-MASK", socket.remoteAddress);
+          routeUnknown(socket, clientHello);
+          return;
+        }
+        const alpn = Array.isArray(cfg.mtprotoTlsAlpn) && cfg.mtprotoTlsAlpn.length > 0
+          ? cfg.mtprotoTlsAlpn[0]
+          : null;
+        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn);
         socket.write(response);
         tlsReader = createTlsRecordReader();
         phase = "tls-app";

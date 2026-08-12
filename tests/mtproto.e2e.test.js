@@ -25,6 +25,8 @@ import {
   wrapTlsRecord,
 } from "../src/faketls.js";
 import { createHmac } from "node:crypto";
+import { createReplayGuard } from "../src/replay-guard.js";
+import { maskConnection } from "../src/mask.js";
 
 const PROTO_TAG_ABRIDGED = Buffer.from([0xef, 0xef, 0xef, 0xef]);
 
@@ -395,5 +397,125 @@ test("e2e: fake-TLS with wrong secret is rejected, connection closed", async () 
     fakeDc.closeAllConnections?.();
     server.close();
     fakeDc.close();
+  }
+});
+
+// --- Anti-DPI: replay protection + traffic masking (telemt-inspired) ---
+
+// A tiny mask upstream that replies with a real, plain HTTP-ish line so the masked client
+// sees a legitimate-looking response (and DPI sees a real server, not a RST).
+function startMaskServer() {
+  const server = net.createServer((socket) => {
+    socket.on("data", () => {});
+    socket.write("MASK-OK\n");
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
+}
+
+test("e2e: replayed fake-TLS ClientHello is masked instead of reaching the DC twice", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const mask = await startMaskServer();
+  const maskAddr = mask.address();
+  const log = makeLog();
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 5_000,
+    rules: [],
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoTlsDomain: "www.google.com",
+    mtprotoMaskHost: "127.0.0.1",
+    mtprotoMaskPort: maskAddr.port,
+    mtprotoUnknownSniAction: "mask",
+  };
+  const replayGuard = createReplayGuard({ maxSize: 8, ttlMs: 60_000, freshnessMs: 0 });
+  const handlers = {
+    "http-connect": createConnectHandler(cfg, () => true, () => true, log)["http-connect"],
+    "http-other": createConnectHandler(cfg, () => true, () => true, log)["http-other"],
+    "mtproto": createMtprotoHandler(cfg, log, () => ({ host: "127.0.0.1", port: dcAddr.port }), replayGuard, maskConnection),
+  };
+  const server = createMuxServer(handlers);
+  await new Promise((resolve) => server.listen(cfg.port, cfg.host, resolve));
+  const addr = server.address();
+
+  try {
+    // One shared ClientHello -> identical digest on both connections.
+    const { hello: tlsHello } = buildFakeTlsClientHello(secret, Buffer.alloc(64));
+
+    // First connection: valid digest -> admitted -> MTProto path -> fake DC echo.
+    const { handshake: obfsHandshake, stream, encKey, encIv } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const payload = "replay-first";
+    const sent = stream.encrypt(Buffer.from(payload));
+    const clientDec = createAesCtr(encKey, encIv);
+    const first = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(Buffer.concat([tlsHello, wrapTlsRecord(obfsHandshake), wrapTlsRecord(sent)]));
+      });
+      let rawBuf = Buffer.alloc(0);
+      let phase = "consume-response";
+      let tlsIn = null;
+      let appBuf = Buffer.alloc(0);
+      const timer = setTimeout(() => reject(new Error(`first timeout phase=${phase}`)), 3000);
+      socket.on("data", (d) => {
+        rawBuf = Buffer.concat([rawBuf, d]);
+        if (phase === "consume-response") {
+          while (rawBuf.length >= 5) {
+            const recLen = rawBuf.readUInt16BE(3);
+            if (rawBuf.length < 5 + recLen) break;
+            const recType = rawBuf[0];
+            rawBuf = rawBuf.subarray(5 + recLen);
+            if (recType === 0x17) {
+              phase = "app-data";
+              tlsIn = createTlsRecordReader();
+              break;
+            }
+          }
+        }
+        if (phase === "app-data" && rawBuf.length > 0) {
+          for (const appData of tlsIn.feed(rawBuf)) {
+            appBuf = Buffer.concat([appBuf, appData]);
+            if (appBuf.length >= payload.length) {
+              clearTimeout(timer);
+              socket.destroy();
+              resolve(clientDec.decrypt(appBuf).toString());
+              return;
+            }
+          }
+          rawBuf = Buffer.alloc(0);
+        }
+      });
+      socket.on("error", reject);
+    });
+    assert.equal(first, payload, "first connection must complete the MTProto round-trip");
+
+    // Second connection: SAME digest -> replay guard rejects -> routed to mask server.
+    const second = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(tlsHello));
+      let buf = Buffer.alloc(0);
+      const timer = setTimeout(() => reject(new Error(`mask timeout got: ${buf.toString("latin1")}`)), 3000);
+      socket.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (buf.includes("MASK-OK")) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(buf.toString("latin1"));
+        }
+      });
+      socket.on("error", reject);
+    });
+    assert.ok(second.includes("MASK-OK"), "replayed ClientHello must be masked, not reach the DC");
+  } finally {
+    replayGuard.stop();
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    mask.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+    mask.close();
   }
 });

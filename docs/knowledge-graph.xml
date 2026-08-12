@@ -4,7 +4,7 @@
     <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte. TLS end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.</annotation>
 
     <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="implemented">
-      <purpose>Чтение и валидация конфигурации из env</purpose>
+      <purpose>Чтение и валидация конфигурации из env (HTTP + MTProto + anti-DPI: mask/replay/ALPN/IPv6)</purpose>
       <path>src/config.js</path>
       <depends>none</depends>
       <verification-ref>V-M-CONFIG</verification-ref>
@@ -78,14 +78,14 @@
     </M-MUX>
 
     <M-MTPROTO NAME="MTProto" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Obfuscated2 handshake parse/build и DC mapping (чистая логика)</purpose>
+      <purpose>Obfuscated2 handshake parse/build и DC mapping (IPv4+IPv6, preferIpv6) (чистая логика)</purpose>
       <path>src/mtproto.js</path>
       <depends>node:crypto</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
       <annotations>
         <fn-parseClientHandshake PURPOSE="Валидировать 64-байтный handshake клиента по секретам" />
         <fn-buildUpstreamHandshake PURPOSE="Построить handshake к DC (FAST_MODE зеркалирование ключей)" />
-        <fn-getDcAddress PURPOSE="Разрешить dc_idx в адрес датацентра Telegram" />
+        <fn-getDcAddress PURPOSE="Разрешить dc_idx в адрес DC (IPv4/IPv6 по opts.preferIpv6)" />
         <fn-createAesCtr PURPOSE="Stateful AES-256-CTR шифр" />
       </annotations>
     </M-MTPROTO>
@@ -101,22 +101,48 @@
     </M-MTPROTO-SERVER>
 
     <M-FAKETLS NAME="FakeTLS" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello, TLS-record framing</purpose>
+      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN, TLS-record framing, SNI-парсинг, TLS-alert</purpose>
       <path>src/faketls.js</path>
       <depends>node:crypto</depends>
       <verification-ref>V-M-FAKETLS</verification-ref>
       <annotations>
         <fn-validateClientHello PURPOSE="Валидировать ClientHello по HMAC(secret, msg)" />
-        <fn-buildServerHello PURPOSE="Построить фейковый ServerHello + CCS + app-data" />
+        <fn-buildServerHello PURPOSE="Построить фейковый ServerHello (+ALPN) + CCS + app-data" />
         <fn-createTlsRecordReader PURPOSE="Stateful парсер TLS-записей (app-data)" />
         <fn-wrapTlsRecord PURPOSE="Обернуть данные в TLS 1.3 app-data запись" />
+        <fn-extractSni PURPOSE="Распарсить SNI hostname из ClientHello (null если нет)" />
+        <fn-buildTlsAlert PURPOSE="Построить fatal TLS alert (reject_handshake)" />
+        <fn-buildAlpnExtension PURPOSE="Построить ALPN-расширение для ServerHello" />
       </annotations>
     </M-FAKETLS>
+
+    <M-MASK NAME="Mask" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Traffic masking: прозрачный TCP-splice non-keyed/unknown-SNI клиентов к mask_host (анти-DPI)</purpose>
+      <path>src/mask.js</path>
+      <depends>M-LOG, M-FAKETLS (extractSni)</depends>
+      <verification-ref>V-M-MASK</verification-ref>
+      <annotations>
+        <fn-maskConnection PURPOSE="Splice клиентского сокета (+ буферизованный head) к mask_host:mask_port" />
+      </annotations>
+    </M-MASK>
+
+    <M-REPLAY NAME="ReplayGuard" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Replay-защита: LRU+TTL по digest ClientHello + проверка свежести timestamp</purpose>
+      <path>src/replay-guard.js</path>
+      <depends>none</depends>
+      <verification-ref>V-M-REPLAY</verification-ref>
+      <annotations>
+        <fn-createReplayGuard PURPOSE="Создать stateful admit/reject guard по digest" />
+      </annotations>
+    </M-REPLAY>
 
     <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
     <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-FAKETLS" relation="uses fake-TLS for ee-secrets" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-MASK" relation="routes unknown-SNI/auth-fail (mask)" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-REPLAY" relation="admits fresh digests" />
+    <CrossLink from="M-MASK" to="M-FAKETLS" relation="re-exports extractSni" />
     <CrossLink from="M-PROXY" to="M-CONFIG" relation="reads config" />
     <CrossLink from="M-PROXY" to="M-ALLOW" relation="uses allowlist" />
     <CrossLink from="M-PROXY" to="M-AUTH" relation="checks auth" />

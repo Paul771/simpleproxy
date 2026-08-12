@@ -77,6 +77,14 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_MAX_CONNECTIONS` | `64` | Лимит одновременных MTProto-соединений |
 | `MTPROTO_HOST` | `YOUR_HOST_OR_IP` | Публичный адрес сервера для подстановки в `tg://proxy`-ссылки (домен или IP) |
 | `MTPROTO_TLS_DOMAIN` | `www.google.com` | Домен для fake-TLS (ee) маскировки; подставляется в ee-ссылку как SNI |
+| `MTPROTO_MASK_HOST` | = `MTPROTO_TLS_DOMAIN` | Реальный upstream для traffic-masking при unknown SNI / неверном секрете |
+| `MTPROTO_MASK_PORT` | `443` | Порт mask-host |
+| `MTPROTO_UNKNOWN_SNI_ACTION` | `mask` | Поведение при unknown SNI / неверном fake-TLS секрете: `mask` (splice к mask_host) \| `reject` (TLS alert) \| `drop` (destroy) |
+| `MTPROTO_REPLAY_WINDOW` | `1024` | Размер LRU для replay-защиты (0 = выключена) |
+| `MTPROTO_REPLAY_TTL_MS` | `30000` | TTL записей LRU replay-защиты, мс |
+| `MTPROTO_DIGEST_FRESHNESS_MS` | `0` | Макс. отклонение timestamp в digest (0 = не проверять) |
+| `MTPROTO_TLS_ALPN` | `h2,http/1.1` | ALPN-список fake ServerHello; первый = выбранный протокол |
+| `MTPROTO_PREFER_IPV6` | `false` | Использовать IPv6-адреса DC Telegram (`1`/`true`/`yes`/`on`) |
 
 ## MTProto proxy (официальные клиенты Telegram)
 
@@ -115,6 +123,36 @@ node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
 tg://proxy?server=example.wispbyte.com&port=8080&secret=00112233445566778899aabbccddeeff
 ```
 
+### Anti-DPI: маскирование порта 443 (по мотивам telemt)
+
+По умолчанию (`MTPROTO_UNKNOWN_SNI_ACTION=mask`) прокси ведёт себя как настоящий веб-сервер на порту 443:
+любое соединение без валидного fake-TLS секрета или с неизвестным SNI прозрачно splice'ится
+к `MTPROTO_MASK_HOST` (по умолчанию = `MTPROTO_TLS_DOMAIN`). DPI и краулеры видят легитимный HTTPS
+к этому домену с настоящим сертификатом, а не RST/обрыв — порт неотличим от реального веб-сервера.
+
+- **`mask`** (default) — non-keyed клиент/краулер получает реальный HTTPS-ответ от mask_host.
+  Telegram-клиент с верным секретом проходит MTProto-путь; с неверным — маскируется.
+- **`reject`** — прокси выдаёт TLS-alert `unrecognized_name` и закрывает соединение
+  (как `nginx ssl_reject_handshake on;`) — порт неотличим от stock web-сервера без запрошенного vhost.
+- **`drop`** — немедленный `destroy` (legacy-поведение до anti-DPI).
+
+Дополнительно включена **replay-защита** (`MTPROTO_REPLAY_WINDOW=1024`): повторно перехваченный
+fake-TLS ClientHello (тот же digest) отклоняется и маскируется, не доходя до DC Telegram.
+Свежесть timestamp digest можно ограничить через `MTPROTO_DIGEST_FRESHNESS_MS`.
+
+В fake ServerHello добавлено **ALPN**-расширение (`MTPROTO_TLS_ALPN`, default `h2,http/1.1`)
+для снижения синтетичности fingerprint. Для IPv6-only сетей доступен `MTPROTO_PREFER_IPV6=true`.
+
+При старте прокси логирует anti-DPI-конфиг:
+
+```
+[proxy][mask_config] start {"action":"mask","mask_host":"www.cloudflare.com:443","alpn":"h2,http/1.1","replay":1024,"ipv6":0}
+```
+
+> Выбирайте `MTPROTO_TLS_DOMAIN` / `MTPROTO_MASK_HOST` как домен, правдоподобный для IP вашего сервера
+> (напр., CDN, который реально отвечает TLS-рукопожатием). Masking — чистый TCP-splice, прокси не
+> расшифровывает TLS и не видит содержимое.
+
 ### Развёртывание на Wispbyte
 
 1. Создайте сервер в панели Wispbyte: **Server Type** = Free Plan, **Runtime** = Node.js.
@@ -135,23 +173,26 @@ curl -x http://<адрес-и-порт-от-wispbyte> https://api.telegram.org
 - Только HTTPS-трафик через `CONNECT` (plain-HTTP не пересылается — `405`).
 - HTTP: только домены `*.telegram.org:443`; остальное — `403`.
 - MTProto: только `*.telegram.org` DC-IP, порт 443; секреты simple/dd/ee (fake-TLS).
+- Anti-DPI masking — TCP-splice к mask_host без TLS-терминации; TLS profile capture & replay и Middle-End Pool не реализуются (вне скоупа).
 - Масштаб: десятки параллельных ботов + сотни MTProto-клиентов комфортно; тысячи упрутся в лимит CPU 35% Wispbyte.
 
 ## Структура
 
 ```
-src/index.js           — точка входа: wiring config → log → allow → auth → mux → start
-src/config.js          — M-CONFIG: env → конфиг (вкл. MTPROTO_*)
+src/index.js           — точка входа: wiring config → log → allow → auth → mux → start (replay-guard, mask-config лог)
+src/config.js          — M-CONFIG: env → конфиг (вкл. MTPROTO_* + anti-DPI)
 src/log.js             — M-LOG: форматтер [proxy][marker], redaction
 src/allow.js           — M-ALLOW: парсер authority + allowlist
 src/auth.js            — M-AUTH: basic auth (timing-safe)
 src/tunnel.js          — M-TUNNEL: байтовый туннель, idle-таймер, счётчики
 src/proxy.js           — M-PROXY: парсер CONNECT, auth→allow→cap→tunnel
 src/mux.js             — M-MUX: определение протокола по первым байтам, маршрутизация
-src/mtproto.js         — M-MTPROTO: obfuscated2 handshake (parse/build), DC mapping
-src/faketls.js         — M-FAKETLS: fake-TLS (ee) handshake, TLS record framing
-src/mtproto-server.js  — MTProto-обработчик соединений (plain + fake-TLS → DC → relay)
-tests/                 — node:test (юнит + e2e)
+src/mtproto.js         — M-MTPROTO: obfuscated2 handshake (parse/build), DC mapping (IPv4+IPv6)
+src/faketls.js         — M-FAKETLS: fake-TLS (ee) handshake, ServerHello+ALPN, SNI-парсинг, TLS alert
+src/mtproto-server.js  — MTProto-обработчик: plain + fake-TLS → DC → relay; routeUnknown (mask/reject/drop) + replay
+src/mask.js            — M-MASK: traffic-masking (TCP-splice к mask_host)
+src/replay-guard.js    — M-REPLAY: LRU+TTL replay-защита по digest
+tests/                 — node:test (юнит + e2e, 77 тестов)
 docs/                  — GRACE-документы проекта
 ```
 

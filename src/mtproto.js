@@ -50,6 +50,15 @@ const TG_DATACENTERS_V4 = [
   "149.154.167.91",
   "149.154.171.5",
 ];
+// Telegram datacenter IPv6 addresses (port 443), same DC index order as V4.
+// Used only when the operator opts in via MTPROTO_PREFER_IPV6.
+const TG_DATACENTERS_V6 = [
+  "2001:b28:f23d:f001::a",
+  "2001:b28:f23f:f002::a",
+  "2001:b28:f23d:f003::a",
+  "2001:b28:f23f:f004::a",
+  "2001:b28:f23f:f005::a",
+];
 const TG_DATACENTER_PORT = 443;
 
 // START_CONTRACT: createAesCtr
@@ -167,13 +176,14 @@ export function buildUpstreamHandshake(parsed) {
 
 // START_CONTRACT: getDcAddress
 //   PURPOSE: Resolve a handshake dc_idx to a Telegram datacenter address
-//   INPUTS: { dcIdx: number - signed little-endian from handshake }
+//   INPUTS: { dcIdx: number - signed little-endian from handshake, opts?: { preferIpv6: boolean } }
 //   OUTPUTS: { { host: string, port: number } | null }
 //   SIDE_EFFECTS: none
 //   LINKS: M-MTPROTO
 // END_CONTRACT: getDcAddress
-export function getDcAddress(dcIdx) {
+export function getDcAddress(dcIdx, { preferIpv6 = false } = {}) {
   const idx = Math.abs(dcIdx) - 1;
-  if (!Number.isInteger(idx) || idx < 0 || idx >= TG_DATACENTERS_V4.length) return null;
-  return { host: TG_DATACENTERS_V4[idx], port: TG_DATACENTER_PORT };
+  const table = preferIpv6 ? TG_DATACENTERS_V6 : TG_DATACENTERS_V4;
+  if (!Number.isInteger(idx) || idx < 0 || idx >= table.length) return null;
+  return { host: table[idx], port: TG_DATACENTER_PORT };
 }

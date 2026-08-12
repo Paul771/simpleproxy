@@ -165,3 +165,14 @@ test("getDcAddress: maps dc_idx to datacenter", () => {
   assert.equal(getDcAddress(6), null);
   assert.equal(getDcAddress(-99), null);
 });
+
+test("getDcAddress: preferIpv6 returns IPv6 DC addresses (same index order as IPv4)", () => {
+  assert.deepEqual(getDcAddress(1, { preferIpv6: true }), { host: "2001:b28:f23d:f001::a", port: 443 });
+  assert.deepEqual(getDcAddress(-1, { preferIpv6: true }), { host: "2001:b28:f23d:f001::a", port: 443 });
+  assert.deepEqual(getDcAddress(5, { preferIpv6: true }), { host: "2001:b28:f23f:f005::a", port: 443 });
+  // Out-of-range stays null regardless of family.
+  assert.equal(getDcAddress(0, { preferIpv6: true }), null);
+  assert.equal(getDcAddress(6, { preferIpv6: true }), null);
+  // Default (no opts) keeps IPv4 -> backward compatible.
+  assert.deepEqual(getDcAddress(1, {}), { host: "149.154.175.50", port: 443 });
+});

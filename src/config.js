@@ -34,7 +34,10 @@ function parseIntEnv(value, fallback, name) {
 //   PURPOSE: Read env and return validated config
 //   INPUTS: { env: Record<string, string | undefined> - environment (default process.env) }
 //   OUTPUTS: { Config - { port, host, maxTunnels, idleTimeoutMs, authUser, authPass, creds, rules,
-//                          mtprotoSecrets, mtprotoPort, mtprotoMaxConnections } }
+//                          mtprotoSecrets, mtprotoPort, mtprotoMaxConnections, mtprotoHost,
+//                          mtprotoTlsDomain, mtprotoTlsAlpn, mtprotoMaskHost, mtprotoMaskPort,
+//                          mtprotoUnknownSniAction, mtprotoReplayWindow, mtprotoReplayTtlMs,
+//                          mtprotoDigestFreshnessMs, mtprotoPreferIpv6 } }
 //   SIDE_EFFECTS: none
 //   LINKS: M-CONFIG
 // END_CONTRACT: loadConfig
@@ -77,6 +80,35 @@ export function loadConfig(env = process.env) {
       ? env.MTPROTO_TLS_DOMAIN.trim()
       : "www.google.com";
 
+  // --- Anti-DPI settings (see docs/Architecture, telemt-inspired) ---
+  // ALPN advertised in the fake ServerHello. First entry = negotiated protocol.
+  const mtprotoTlsAlpn =
+    env.MTPROTO_TLS_ALPN && env.MTPROTO_TLS_ALPN.trim() !== ""
+      ? env.MTPROTO_TLS_ALPN.split(",")
+          .map((s) => s.trim())
+          .filter((s) => s !== "")
+      : ["h2", "http/1.1"];
+  // Real upstream a non-keyed / unknown-SNI client is transparently spliced to (traffic masking).
+  const mtprotoMaskHost =
+    env.MTPROTO_MASK_HOST && env.MTPROTO_MASK_HOST.trim() !== ""
+      ? env.MTPROTO_MASK_HOST.trim()
+      : mtprotoTlsDomain;
+  const mtprotoMaskPort = parseIntEnv(env.MTPROTO_MASK_PORT, 443, "MTPROTO_MASK_PORT");
+  // Behaviour on unknown SNI / failed fake-TLS auth: "mask" (splice to mask_host, default),
+  // "reject" (emit TLS unrecognized_name alert + close), "drop" (destroy, legacy behaviour).
+  const mtprotoUnknownSniAction = parseActionEnv(env.MTPROTO_UNKNOWN_SNI_ACTION, "mask");
+  // Replay protection: LRU capacity (0 = disabled) and TTL of seen digests.
+  const mtprotoReplayWindow = parseIntEnv(env.MTPROTO_REPLAY_WINDOW, 1024, "MTPROTO_REPLAY_WINDOW");
+  const mtprotoReplayTtlMs = parseIntEnv(env.MTPROTO_REPLAY_TTL_MS, 30_000, "MTPROTO_REPLAY_TTL_MS");
+  // Max skew between now and the digest-embedded timestamp (0 = lenient, accept any).
+  const mtprotoDigestFreshnessMs = parseIntEnv(
+    env.MTPROTO_DIGEST_FRESHNESS_MS,
+    0,
+    "MTPROTO_DIGEST_FRESHNESS_MS"
+  );
+  // Prefer IPv6 Telegram DC addresses when resolving dc_idx.
+  const mtprotoPreferIpv6 = parseBoolEnv(env.MTPROTO_PREFER_IPV6, false);
+
   return {
     port,
     host: "0.0.0.0",
@@ -91,5 +123,28 @@ export function loadConfig(env = process.env) {
     mtprotoMaxConnections,
     mtprotoHost,
     mtprotoTlsDomain,
+    mtprotoTlsAlpn,
+    mtprotoMaskHost,
+    mtprotoMaskPort,
+    mtprotoUnknownSniAction,
+    mtprotoReplayWindow,
+    mtprotoReplayTtlMs,
+    mtprotoDigestFreshnessMs,
+    mtprotoPreferIpv6,
   };
+}
+
+function parseActionEnv(value, fallback) {
+  if (value === undefined || value === "") return fallback;
+  const v = value.trim().toLowerCase();
+  if (v !== "mask" && v !== "reject" && v !== "drop") {
+    throw new Error(`INVALID_ENV: MTPROTO_UNKNOWN_SNI_ACTION must be mask|reject|drop, got "${value}"`);
+  }
+  return v;
+}
+
+function parseBoolEnv(value, fallback) {
+  if (value === undefined || value === "") return fallback;
+  const v = value.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
 }

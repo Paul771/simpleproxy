@@ -1,8 +1,8 @@
 <RequirementsAnalysis VERSION="0.2.0">
   <Project>
     <name>SimpleProxy</name>
-    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей) для обхода блокировки из РФ. Развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск). TLS end-to-end, токены ботов прокси не видит.</annotation>
-    <keywords>telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel</keywords>
+    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей) для обхода блокировки из РФ. Fake-TLS усилен anti-DPI: traffic-masking (passthrough на mask_host), reject_handshake, replay-защита, ALPN, IPv6 DC. Развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск). TLS end-to-end, токены ботов прокси не видит.</annotation>
+    <keywords>telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel, mtproto, faketls, anti-dpi, masking</keywords>
   </Project>
 
   <Actors>
@@ -70,21 +70,49 @@
     <UC-007>
       <Actor>TelegramClient</Actor>
       <Action>Официальный клиент Telegram подключается по ссылке tg://proxy?server=...&port=...&secret=...</Action>
-      <Goal>MTProto obfuscated2 handshake валидируется, трафик релеится к DC Telegram; simple и dd секреты работают</Goal>
+      <Goal>MTProto obfuscated2 handshake валидируется, трафик релеится к DC Telegram; simple, dd и ee (fake-TLS) секреты работают</Goal>
       <Preconditions>MTPROTO_SECRET задан; клиент использует валидный secret</Preconditions>
-      <AcceptanceCriteria>handshake с верным секретом → соединение к DC → данные проходят; неверный секрет → закрытие; dc_idx → правильный DC</AcceptanceCriteria>
+      <AcceptanceCriteria>handshake с верным секретом → соединение к DC → данные проходят; неверный секрет → маскирование/закрытие; dc_idx → правильный DC; ee (fake-TLS) round-trip</AcceptanceCriteria>
       <Priority>high</Priority>
       <RelatedFlows>DF-1, DF-2, DF-3</RelatedFlows>
     </UC-007>
+    <UC-008>
+      <Actor>NonKeyedClient</Actor>
+      <Action>Краулер/браузер/клиент без валидного секрета подключается к прокси-порту (TLS с unknown SNI или неверным fake-TLS digest)</Action>
+      <Goal>Traffic masking: соединение прозрачно splice'ится к mask_host — порт 443 неотличим от настоящего веб-сервера для DPI/краулера</Goal>
+      <Preconditions>MTPROTO_UNKNOWN_SNI_ACTION=mask (default); MTPROTO_MASK_HOST задан</Preconditions>
+      <AcceptanceCriteria>non-keyed ClientHello → splice к mask_host, клиент получает реальный HTTPS-ответ; нет RST/destroy; лог [proxy][mask_connect]</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-MASK</RelatedFlows>
+    </UC-008>
+    <UC-009>
+      <Actor>Attacker</Actor>
+      <Action>Повторяет (replay) ранее перехваченный fake-TLS ClientHello с тем же digest</Action>
+      <Goal>Replay-защита: повторный digest отклоняется и маскируется, не доходит до DC</Goal>
+      <Preconditions>MTPROTO_REPLAY_WINDOW &gt; 0</Preconditions>
+      <AcceptanceCriteria>первый digest → MTProto путь; повторный → routeUnknown (mask/reject/drop); лог [proxy][faketls_replay]</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-MASK</RelatedFlows>
+    </UC-009>
+    <UC-010>
+      <Actor>Operator</Actor>
+      <Action>Включает режим reject_handshake (MTPROTO_UNKNOWN_SNI_ACTION=reject) для unknown SNI</Action>
+      <Goal>Прокси ведёт себя как nginx ssl_reject_handshake: emit TLS unrecognized_name alert + close</Goal>
+      <Preconditions>MTPROTO_UNKNOWN_SNI_ACTION=reject</Preconditions>
+      <AcceptanceCriteria>unknown SNI → клиент получает TLS alert (0x15 0x03 0x03 00 02 02 70); соединение закрыто</AcceptanceCriteria>
+      <Priority>low</Priority>
+      <RelatedFlows>DF-MASK</RelatedFlows>
+    </UC-010>
   </UseCases>
 
   <NonGoals>
-    <item-1>Не поддерживать fake-TLS (ee-секрет) MTProto: только simple (16 байт) и dd (17 байт, фиксация DC).</item-1>
-    <item-2>Не выполнять TLS-терминацию и не выдавать HTTPS наружу (своего домена нет).</item-2>
-    <item-3>Не быть открытым прокси: allowlist только *.telegram.org:443.</item-3>
-    <item-4>Не кэшировать ответы и не модифицировать тела/заголовки.</item-4>
-    <item-5>Не поддерживать прозрачный перехват (iptables REDIRECT) — недоступно на контейнерном хостинге без root.</item-5>
-    <item-6>Не поддерживать plain-HTTP (без CONNECT) пересылку — только CONNECT-туннели.</item-6>
+    <item-1>Не выполнять TLS-терминацию для своего домена и не выдавать HTTPS от своего имени (masking — чистый TCP-splice к чужому веб-серверу).</item-1>
+    <item-2>Не быть открытым прокси: allowlist только *.telegram.org:443.</item-2>
+    <item-3>Не кэшировать ответы и не модифицировать тела/заголовки.</item-3>
+    <item-4>Не поддерживать прозрачный перехват (iptables REDIRECT) — недоступно на контейнерном хостинге без root.</item-4>
+    <item-5>Не поддерживать plain-HTTP (без CONNECT) пересылку — только CONNECT-туннели.</item-5>
+    <item-6>Не захватывать и не replay'ить реальный TLS-профиль fronted-домена (TLS profile capture &amp; replay) — отдельная фаза.</item-6>
+    <item-7>Не поддерживать Middle-End Pool / SOCKS5/Shadowsocks upstream — вне anti-DPI-скоупа.</item-7>
   </NonGoals>
 
   <Constraints>

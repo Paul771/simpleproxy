@@ -18,6 +18,9 @@ import {
   createTlsRecordReader,
   wrapTlsRecord,
   genX25519PublicKey,
+  extractSni,
+  buildTlsAlert,
+  buildAlpnExtension,
 } from "../src/faketls.js";
 
 const DIGEST_POS = 11;
@@ -162,4 +165,88 @@ test("genX25519PublicKey: returns 32 bytes, high bit cleared", () => {
   const k = genX25519PublicKey();
   assert.equal(k.length, 32);
   assert.ok((k[31] & 0x80) === 0, "high bit must be clear for a valid x25519 key");
+});
+
+test("buildServerHello: omits ALPN extension when no alpn is given (backward compatible)", () => {
+  const secret = randomBytes(16);
+  const sessionId = randomBytes(16);
+  const response = buildServerHello(secret, randomBytes(32), sessionId);
+  // Scan the ServerHello record for the ALPN extension type 0x0010 -> must be absent.
+  const hasAlpn = response.subarray(0, 100).includes(Buffer.from([0x00, 0x10]));
+  assert.equal(hasAlpn, false, "no ALPN extension when alpn is null");
+});
+
+test("buildServerHello: includes ALPN extension with the negotiated protocol when alpn is set", () => {
+  const secret = randomBytes(16);
+  const sessionId = randomBytes(16);
+  const response = buildServerHello(secret, randomBytes(32), sessionId, "h2");
+  // The ServerHello must carry the ALPN extension (type 0x00 0x10) advertising "h2".
+  const alpnExt = buildAlpnExtension(["h2"]);
+  assert.ok(response.includes(alpnExt), "ALPN extension must be present in the response packet");
+});
+
+test("buildTlsAlert: unrecognized_name alert (112) has the expected wire bytes", () => {
+  assert.deepEqual(Array.from(buildTlsAlert(112)), [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70]);
+});
+
+test("extractSni: parses hostname from a synthetic ClientHello carrying SNI", () => {
+  const sessionId = randomBytes(16);
+  const cipherSuites = Buffer.from([0x00, 0x02, 0x13, 0x01]);
+  const compression = Buffer.from([0x01, 0x00]);
+  // SNI extension for "www.example.com"
+  const name = Buffer.from("www.example.com", "latin1");
+  const snEntry = Buffer.concat([Buffer.from([0x00]), Buffer.from([name.length & 0xff, (name.length >> 8) & 0xff].reverse()), name]);
+  const snList = Buffer.concat([Buffer.from([snEntry.length & 0xff, (snEntry.length >> 8) & 0xff].reverse()), snEntry]);
+  const sniExt = Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x00]), snList]);
+  sniExt.writeUInt16BE(snList.length, 2);
+  const padLen = 40;
+  const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(padLen)]);
+  padExt.writeUInt16BE(padLen, 2);
+  const extTotal = Buffer.alloc(2);
+  extTotal.writeUInt16BE(Buffer.concat([sniExt, padExt]).length, 0);
+  const extensions = Buffer.concat([extTotal, sniExt, padExt]);
+  const inner = Buffer.concat([
+    Buffer.from([0x03, 0x03]),
+    randomBytes(32),
+    Buffer.from([sessionId.length]),
+    sessionId,
+    cipherSuites,
+    compression,
+    extensions,
+  ]);
+  const hsLenBuf = Buffer.alloc(3);
+  hsLenBuf.writeUIntBE(inner.length, 0, 3);
+  const handshakeMsg = Buffer.concat([Buffer.from([0x01]), hsLenBuf, inner]);
+  const recordLenBuf = Buffer.alloc(2);
+  recordLenBuf.writeUInt16BE(handshakeMsg.length, 0);
+  const hello = Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), recordLenBuf, handshakeMsg]);
+  assert.equal(extractSni(hello), "www.example.com");
+});
+
+test("extractSni: returns null for a ClientHello without SNI", () => {
+  const sessionId = randomBytes(16);
+  const cipherSuites = Buffer.from([0x00, 0x02, 0x13, 0x01]);
+  const compression = Buffer.from([0x01, 0x00]);
+  const padLen = 40;
+  const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(padLen)]);
+  padExt.writeUInt16BE(padLen, 2);
+  const extTotal = Buffer.alloc(2);
+  extTotal.writeUInt16BE(padExt.length, 0);
+  const extensions = Buffer.concat([extTotal, padExt]);
+  const inner = Buffer.concat([
+    Buffer.from([0x03, 0x03]),
+    randomBytes(32),
+    Buffer.from([sessionId.length]),
+    sessionId,
+    cipherSuites,
+    compression,
+    extensions,
+  ]);
+  const hsLenBuf = Buffer.alloc(3);
+  hsLenBuf.writeUIntBE(inner.length, 0, 3);
+  const handshakeMsg = Buffer.concat([Buffer.from([0x01]), hsLenBuf, inner]);
+  const recordLenBuf = Buffer.alloc(2);
+  recordLenBuf.writeUInt16BE(handshakeMsg.length, 0);
+  const hello = Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), recordLenBuf, handshakeMsg]);
+  assert.equal(extractSni(hello), null);
 });

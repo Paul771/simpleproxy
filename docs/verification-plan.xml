@@ -177,7 +177,7 @@
       <scenarios>
         <scenario-1 kind="success">parseClientHandshake: round-trip с эмулированным клиентом (все 3 proto-тега), неверный secret → null.</scenario-1>
         <scenario-2 kind="success">buildUpstreamHandshake: зеркалирование ключей клиента, protoTag переживает до TG; relay round-trip.</scenario-2>
-        <scenario-3 kind="success">getDcAddress: dc_idx 1..5 → правильные IP; 0/6/-99 → null.</scenario-3>
+        <scenario-3 kind="success">getDcAddress: dc_idx 1..5 → правильные IPv4; 0/6/-99 → null; preferIpv6 → IPv6 (тот же индекс-порядок).</scenario-3>
         <scenario-4 kind="success">E2E (fake-DC): полный handshake клиент→прокси→DC, данные round-trip; неверный secret → закрытие; bad DC → закрытие.</scenario-4>
         <scenario-5 kind="success">Лог [proxy][mtproto_link] с tg://proxy-ссылками при старте (smoke).</scenario-5>
       </scenarios>
@@ -203,16 +203,59 @@
       </module-checks>
       <scenarios>
         <scenario-1 kind="success">validateClientHello: round-trip с эмулированным ClientHello (HMAC), неверный secret → null.</scenario-1>
-        <scenario-2 kind="success">buildServerHello: response digest = HMAC(secret, clientDigest+helloPkt), структура 0x16/0x14/0x17.</scenario-2>
+        <scenario-2 kind="success">buildServerHello: response digest = HMAC(secret, clientDigest+helloPkt), структура 0x16/0x14/0x17; ALPN-расширение присутствует при alpn, отсутствует при null (обр. совместимость).</scenario-2>
         <scenario-3 kind="success">createTlsRecordReader + wrapTlsRecord round-trip; 0x14 ChangeCipherSpec пропускается.</scenario-3>
-        <scenario-4 kind="success">E2E fake-TLS: клиент → прокси → fake-DC, данные round-trip; неверный secret → закрытие.</scenario-4>
+        <scenario-4 kind="success">E2E fake-TLS: клиент → прокси → fake-DC, данные round-trip; неверный secret → маскирование/закрытие.</scenario-4>
+        <scenario-5 kind="success">extractSni: парсит SNI из ClientHello с расширением server_name; null без SNI.</scenario-5>
+        <scenario-6 kind="success">buildTlsAlert(112) == 15 03 03 00 02 02 70 (unrecognized_name для reject_handshake).</scenario-6>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][faketls_auth_fail][DF-1]</marker-1>
         <marker-2>[proxy][mtproto_connect][DF-1] tls=1</marker-2>
+        <marker-3>[proxy][faketls_unknown_sni][DF-MASK]</marker-3>
+        <marker-4>[proxy][faketls_replay][DF-MASK]</marker-4>
       </required-log-markers>
       <wave-follow-up>ee-ссылка tg://proxy с MTPROTO_TLS_DOMAIN в логе старта.</wave-follow-up>
     </V-M-FAKETLS>
+
+    <V-M-MASK MODULE="M-MASK" PRIORITY="high">
+      <test-files>
+        <file>tests/mask.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/mask.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">mask: failed fake-TLS auth (action=mask) → splice к локальному mask-серверу, клиент получает реальный ответ (MASK-OK).</scenario-1>
+        <scenario-2 kind="success">mask: unknown SNI (SNI ≠ MTPROTO_TLS_DOMAIN) → splice к mask-серверу.</scenario-2>
+        <scenario-3 kind="success">reject: action=reject → клиент получает TLS alert 0x15 … 0x70 (unrecognized_name).</scenario-3>
+        <scenario-4 kind="success">drop: action=drop → socket.destroy без записи байт (legacy-поведение).</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][mask_connect][DF-MASK]</marker-1>
+        <marker-2>[proxy][mask_close][DF-MASK]</marker-2>
+      </required-log-markers>
+      <phase-follow-up>smoke: curl к прокси-порту с unknown SNI → реальный HTTP-ответ mask_host.</phase-follow-up>
+    </V-M-MASK>
+
+    <V-M-REPLAY MODULE="M-REPLAY" PRIORITY="medium">
+      <test-files>
+        <file>tests/replay-guard.test.js</file>
+        <file>tests/mtproto.e2e.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/replay-guard.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">admit: новый digest → true; повторный → false.</scenario-1>
+        <scenario-2 kind="success">freshness: протухший/будущий timestamp → false при freshnessMs&gt;0.</scenario-2>
+        <scenario-3 kind="success">FIFO-вытеснение при переполнении maxSize; TTL (lazy) снова делает digest новым.</scenario-3>
+        <scenario-4 kind="success">E2E: повторный fake-TLS ClientHello (тот же digest) → маскирование, DC не дёргается дважды.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][faketls_replay][DF-MASK]</marker-1>
+      </required-log-markers>
+    </V-M-REPLAY>
   </ModuleVerification>
 
   <PhaseGates>
@@ -255,6 +298,18 @@
         <evidence-2>В логе старта есть tg://proxy-ссылки (simple + dd).</evidence-2>
       </required-evidence>
     </Gate-Phase-4>
+    <Gate-Phase-5 PHASE="Phase-5">
+      <goal>Anti-DPI (fake-TLS): traffic-masking, reject_handshake, replay-защита, ALPN, IPv6; все тесты зелёные.</goal>
+      <commands>
+        <command-1>node --test</command-1>
+        <command-2>MTPROTO_SECRET=... MTPROTO_UNKNOWN_SNI_ACTION=mask MTPROTO_MASK_HOST=127.0.0.1 PORT=8080 node src/index.js (smoke: лог mask_config)</command-2>
+      </commands>
+      <required-evidence>
+        <evidence-1>77 тестов проходят (включая mask/replay-guard/IPv6/ALPN/extractSni).</evidence-1>
+        <evidence-2>Лог [proxy][mask_config] с action/alpn/replay при старте.</evidence-2>
+        <evidence-3>reject-режим: openssl s_client получает unrecognized_name alert.</evidence-3>
+      </required-evidence>
+    </Gate-Phase-5>
   </PhaseGates>
 
   <FailurePackets>

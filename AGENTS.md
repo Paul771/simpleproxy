@@ -1,10 +1,10 @@
 # GRACE Framework - Project Engineering Protocol
 
 ## Keywords
-telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel
+telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel, mtproto, faketls, anti-dpi, masking
 
 ## Annotation
-Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск) для обхода блокировки api.telegram.org из РФ. TLS идёт end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.
+Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск) для обхода блокировки api.telegram.org из РФ. Fake-TLS усилен anti-DPI по мотивам telemt: traffic-masking (passthrough на mask_host при unknown SNI/неверном секрете), reject_handshake (TLS alert), replay-защита (LRU+TTL по digest), ALPN в ServerHello, IPv6 DC. TLS идёт end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.
 
 ## Core Principles
 
