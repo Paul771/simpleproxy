@@ -71,6 +71,11 @@ export function loadConfig(env = process.env) {
   // Public host shown in tg://proxy links. Falls back to the listen port's hint.
   const mtprotoHost =
     env.MTPROTO_HOST && env.MTPROTO_HOST.trim() !== "" ? env.MTPROTO_HOST.trim() : "YOUR_HOST_OR_IP";
+  // Domain used for fake-TLS (ee-secret) SNI masking. Picked to look plausible from the host IP.
+  const mtprotoTlsDomain =
+    env.MTPROTO_TLS_DOMAIN && env.MTPROTO_TLS_DOMAIN.trim() !== ""
+      ? env.MTPROTO_TLS_DOMAIN.trim()
+      : "www.google.com";
 
   return {
     port,
@@ -85,5 +90,6 @@ export function loadConfig(env = process.env) {
     mtprotoPort,
     mtprotoMaxConnections,
     mtprotoHost,
+    mtprotoTlsDomain,
   };
 }

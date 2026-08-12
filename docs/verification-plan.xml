@@ -192,6 +192,27 @@
       </required-trace-assertions>
       <phase-follow-up>Полный набор тестов; smoke на Wispbyte через tg://proxy в Telegram.</phase-follow-up>
     </V-M-MTPROTO>
+
+    <V-M-FAKETLS MODULE="M-FAKETLS" PRIORITY="high">
+      <test-files>
+        <file>tests/faketls.test.js</file>
+        <file>tests/mtproto.e2e.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/faketls.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">validateClientHello: round-trip с эмулированным ClientHello (HMAC), неверный secret → null.</scenario-1>
+        <scenario-2 kind="success">buildServerHello: response digest = HMAC(secret, clientDigest+helloPkt), структура 0x16/0x14/0x17.</scenario-2>
+        <scenario-3 kind="success">createTlsRecordReader + wrapTlsRecord round-trip; 0x14 ChangeCipherSpec пропускается.</scenario-3>
+        <scenario-4 kind="success">E2E fake-TLS: клиент → прокси → fake-DC, данные round-trip; неверный secret → закрытие.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][faketls_auth_fail][DF-1]</marker-1>
+        <marker-2>[proxy][mtproto_connect][DF-1] tls=1</marker-2>
+      </required-log-markers>
+      <wave-follow-up>ee-ссылка tg://proxy с MTPROTO_TLS_DOMAIN в логе старта.</wave-follow-up>
+    </V-M-FAKETLS>
   </ModuleVerification>
 
   <PhaseGates>

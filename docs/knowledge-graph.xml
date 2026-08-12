@@ -91,18 +91,32 @@
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: handshake → подключение к DC → relay (FAST_MODE)</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC → relay (FAST_MODE)</purpose>
       <path>src/mtproto-server.js</path>
-      <depends>M-MTPROTO, M-LOG</depends>
+      <depends>M-MTPROTO, M-FAKETLS, M-LOG</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
       <annotations>
         <fn-createMtprotoHandler PURPOSE="Создать mtproto-обработчик для mux" />
       </annotations>
     </M-MTPROTO-SERVER>
 
+    <M-FAKETLS NAME="FakeTLS" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello, TLS-record framing</purpose>
+      <path>src/faketls.js</path>
+      <depends>node:crypto</depends>
+      <verification-ref>V-M-FAKETLS</verification-ref>
+      <annotations>
+        <fn-validateClientHello PURPOSE="Валидировать ClientHello по HMAC(secret, msg)" />
+        <fn-buildServerHello PURPOSE="Построить фейковый ServerHello + CCS + app-data" />
+        <fn-createTlsRecordReader PURPOSE="Stateful парсер TLS-записей (app-data)" />
+        <fn-wrapTlsRecord PURPOSE="Обернуть данные в TLS 1.3 app-data запись" />
+      </annotations>
+    </M-FAKETLS>
+
     <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
     <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-FAKETLS" relation="uses fake-TLS for ee-secrets" />
     <CrossLink from="M-PROXY" to="M-CONFIG" relation="reads config" />
     <CrossLink from="M-PROXY" to="M-ALLOW" relation="uses allowlist" />
     <CrossLink from="M-PROXY" to="M-AUTH" relation="checks auth" />

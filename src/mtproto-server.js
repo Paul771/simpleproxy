@@ -1,9 +1,9 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
-//   PURPOSE: MTProto connection handler: parse client handshake, connect to DC, relay with FAST_MODE
-//   SCOPE: per-connection handshake validation, DC upstream connection, bidirectional relay
-//   DEPENDS: M-MTPROTO, M-TUNNEL-style relay, M-LOG
+//   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
+//   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
+//   DEPENDS: M-MTPROTO, M-FAKETLS, M-LOG
 //   LINKS: M-MTPROTO
 //   ROLE: RUNTIME
 //   MAP_MODE: EXPORTS
@@ -19,10 +19,17 @@ import {
   buildUpstreamHandshake,
   getDcAddress,
 } from "./mtproto.js";
+import {
+  validateClientHello,
+  buildServerHello,
+  createTlsRecordReader,
+  wrapTlsRecord,
+} from "./faketls.js";
 
 const HANDSHAKE_LEN = 64;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+const TLS_START = [0x16, 0x03, 0x01];
 
 // START_CONTRACT: createMtprotoHandler
 //   PURPOSE: Create the mtproto mux handler; validates handshake, connects to DC, relays
@@ -42,31 +49,30 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
       return;
     }
 
+    const secrets = cfg.mtprotoSecrets.map((s) => Buffer.from(s, "hex"));
+    const isTls =
+      head.length >= 3 && head[0] === TLS_START[0] && head[1] === TLS_START[1] && head[2] === TLS_START[2];
+
     let buf = head;
+    let phase = isTls ? "tls-hello" : "plain"; // tls-hello -> tls-app -> relay
     let completed = false;
+    let tlsReader = null;
+    let obfsHandshake = Buffer.alloc(0);
+    let extraAppData = Buffer.alloc(0); // app bytes received beyond the 64-byte obfs handshake
 
-    const processBuffer = (data) => {
-      buf = data;
-      if (buf.length < HANDSHAKE_LEN) return;
-      completed = true;
-      socket.removeListener("data", onData);
-      clearTimeout(timer);
-
-      const secrets = cfg.mtprotoSecrets.map((s) => Buffer.from(s, "hex"));
-      const parsed = parseClientHandshake(buf.subarray(0, HANDSHAKE_LEN), secrets);
+    const finishHandshakeAndRelay = () => {
+      const parsed = parseClientHandshake(obfsHandshake.subarray(0, HANDSHAKE_LEN), secrets);
       if (!parsed) {
         log("mtproto_auth_fail", "DF-1", socket.remoteAddress);
         socket.destroy();
         return;
       }
-
       const dc = resolveDc(parsed.dcIdx);
       if (!dc) {
         log("mtproto_bad_dc", "DF-1", socket.remoteAddress, parsed.dcIdx);
         socket.destroy();
         return;
       }
-
       const up = buildUpstreamHandshake(parsed);
 
       // START_BLOCK_MT_RELAY
@@ -80,11 +86,12 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
         activeConnections += 1;
         log("mtproto_connect", "DF-1", socket.remoteAddress, `${dc.host}:${dc.port}`, {
           dc: parsed.dcIdx,
+          tls: isTls ? 1 : 0,
         });
         upstream.write(up.rndEnc);
 
-        let bytesIn = 0; // client -> DC
-        let bytesOut = 0; // DC -> client
+        let bytesIn = 0;
+        let bytesOut = 0;
         const startedAt = Date.now();
         let idleTimer = null;
         let tornDown = false;
@@ -113,28 +120,41 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
           upstream.destroy();
         };
 
-        // FAST_MODE: client -> DC is re-encrypted (decrypt client, encrypt upstream);
-        // DC -> client flows byte-for-byte (mirrored keys match what the client expects).
-        const relayClientChunk = (chunk) => {
-          bytesIn += chunk.length;
+        // client -> DC: decrypt client obfuscated2, re-encrypt upstream.
+        const pushAppDataToDc = (appData) => {
+          bytesIn += appData.length;
           armIdle();
-          const plain = parsed.decryptor.decrypt(chunk);
+          const plain = parsed.decryptor.decrypt(appData);
           upstream.write(up.encryptorUp.encrypt(plain));
         };
 
-        socket.on("data", relayClientChunk);
-
-        // Forward any client bytes that arrived together with the handshake.
-        const rest = buf.subarray(HANDSHAKE_LEN);
-        if (rest.length > 0) {
-          relayClientChunk(rest);
+        if (isTls) {
+          // Feed leftover app bytes that arrived with the handshake.
+          if (extraAppData.length > 0) {
+            pushAppDataToDc(extraAppData);
+            extraAppData = Buffer.alloc(0);
+          }
+          socket.on("data", (chunk) => {
+            for (const appData of tlsReader.feed(chunk)) pushAppDataToDc(appData);
+          });
+          // DC -> client: wrap in fake-TLS application-data records.
+          upstream.on("data", (chunk) => {
+            bytesOut += chunk.length;
+            armIdle();
+            socket.write(wrapTlsRecord(chunk));
+          });
+        } else {
+          socket.on("data", pushAppDataToDc);
+          upstream.on("data", (chunk) => {
+            bytesOut += chunk.length;
+            armIdle();
+            socket.write(chunk);
+          });
+          if (extraAppData.length > 0) {
+            pushAppDataToDc(extraAppData);
+            extraAppData = Buffer.alloc(0);
+          }
         }
-
-        upstream.on("data", (chunk) => {
-          bytesOut += chunk.length;
-          armIdle();
-          socket.write(chunk);
-        });
 
         socket.on("error", () => {});
         upstream.on("error", () => {});
@@ -148,16 +168,73 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
         log("mtproto_upstream_error", "DF-1", `${dc.host}:${dc.port}`, err.code || err.message);
         socket.destroy();
       });
-
-      socket.once("error", () => {
-        upstream.destroy();
-      });
+      socket.once("error", () => upstream.destroy());
     };
 
-    const onData = (chunk) => {
+    const complete = () => {
+      completed = true;
+      socket.removeListener("data", onData);
+      clearTimeout(timer);
+      finishHandshakeAndRelay();
+    };
+
+    const processBuffer = (data) => {
+      buf = data;
       if (completed) return;
-      processBuffer(Buffer.concat([buf, chunk]));
+
+      if (phase === "plain") {
+        if (buf.length < HANDSHAKE_LEN) return;
+        obfsHandshake = buf.subarray(0, HANDSHAKE_LEN);
+        extraAppData = buf.subarray(HANDSHAKE_LEN);
+        complete();
+        return;
+      }
+
+      if (phase === "tls-hello") {
+        if (buf.length < 5) return;
+        const recordLen = buf.readUInt16BE(3);
+        if (recordLen < 512) {
+          log("faketls_reject", "DF-1", socket.remoteAddress, { recordLen });
+          socket.destroy();
+          return;
+        }
+        if (buf.length < 5 + recordLen) return;
+        const clientHello = buf.subarray(0, 5 + recordLen);
+        buf = buf.subarray(5 + recordLen);
+        const validated = validateClientHello(clientHello, secrets);
+        if (!validated) {
+          log("faketls_auth_fail", "DF-1", socket.remoteAddress);
+          socket.destroy();
+          return;
+        }
+        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId);
+        socket.write(response);
+        tlsReader = createTlsRecordReader();
+        phase = "tls-app";
+        // Fall through: feed remaining bytes to the TLS reader.
+        const appDatas = tlsReader.feed(buf);
+        obfsHandshake = Buffer.concat(appDatas);
+        if (obfsHandshake.length >= HANDSHAKE_LEN) {
+          extraAppData = obfsHandshake.subarray(HANDSHAKE_LEN);
+          obfsHandshake = obfsHandshake.subarray(0, HANDSHAKE_LEN);
+          complete();
+        }
+        return;
+      }
+
+      if (phase === "tls-app") {
+        const appDatas = tlsReader.feed(buf);
+        obfsHandshake = Buffer.concat([obfsHandshake, ...appDatas]);
+        if (obfsHandshake.length >= HANDSHAKE_LEN) {
+          extraAppData = obfsHandshake.subarray(HANDSHAKE_LEN);
+          obfsHandshake = obfsHandshake.subarray(0, HANDSHAKE_LEN);
+          complete();
+        }
+        return;
+      }
     };
+
+    const onData = (chunk) => processBuffer(Buffer.concat([buf, chunk]));
 
     const timer = setTimeout(() => {
       socket.removeListener("data", onData);
@@ -167,7 +244,6 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress) {
 
     socket.on("data", onData);
     socket.on("error", () => socket.destroy());
-    // The mux already buffered the head; process it synchronously if complete.
     processBuffer(buf);
     // END_BLOCK_MT_HANDSHAKE
   };

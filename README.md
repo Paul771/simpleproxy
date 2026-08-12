@@ -76,13 +76,14 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_PORT` | `0` | Отдельный порт для MTProto; `0` = мультиплексировать с HTTP на `PORT` |
 | `MTPROTO_MAX_CONNECTIONS` | `64` | Лимит одновременных MTProto-соединений |
 | `MTPROTO_HOST` | `YOUR_HOST_OR_IP` | Публичный адрес сервера для подстановки в `tg://proxy`-ссылки (домен или IP) |
+| `MTPROTO_TLS_DOMAIN` | `www.google.com` | Домен для fake-TLS (ee) маскировки; подставляется в ee-ссылку как SNI |
 
 ## MTProto proxy (официальные клиенты Telegram)
 
 Прокси умеет принимать и MTProto-трафик (obfuscated2): официальные приложения Telegram
 (мобильные/десктоп) подключаются по ссылке `tg://proxy`. TLS/обфускация end-to-end,
-прокси видит только handshake. Поддерживаются **simple** (16 байт) и **dd** (фиксация DC)
-секреты; fake-TLS (ee) не поддерживается.
+прокси видит только handshake. Поддерживаются **simple** (16 байт), **dd** (фиксация DC)
+и **ee** (fake-TLS, маскировка под HTTPS для обхода DPI) секреты.
 
 Генерация секрета:
 
@@ -96,7 +97,13 @@ node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
 ```
 [proxy][mtproto_link] simple:  tg://proxy?server=YOUR_HOST_OR_IP&port=8080&secret=<hex>
 [proxy][mtproto_link] dd:      tg://proxy?server=YOUR_HOST_OR_IP&port=8080&secret=dd<hex>
+[proxy][mtproto_link] ee:      tg://proxy?server=YOUR_HOST_OR_IP&port=8080&secret=ee<hex><domain-hex>
 ```
+
+- **simple** — обычный obfuscated2.
+- **dd** — фиксирует конкретный датацентр Telegram (полезно при роуминге).
+- **ee** — fake-TLS: соединение выглядит как обычный HTTPS к домену из `MTPROTO_TLS_DOMAIN`,
+  маскирует трафик от DPI. Выбирайте домен, правдоподобный для IP вашего сервера.
 
 Подставьте адрес и порт вашего сервера Wispbyte, откройте ссылку в Telegram
 (Настройки → Прокси → «Добавить прокси» или просто перейдите по `tg://`-ссылке)
@@ -127,7 +134,7 @@ curl -x http://<адрес-и-порт-от-wispbyte> https://api.telegram.org
 
 - Только HTTPS-трафик через `CONNECT` (plain-HTTP не пересылается — `405`).
 - HTTP: только домены `*.telegram.org:443`; остальное — `403`.
-- MTProto: только `*.telegram.org` DC-IP, порт 443; секреты simple/dd, без fake-TLS.
+- MTProto: только `*.telegram.org` DC-IP, порт 443; секреты simple/dd/ee (fake-TLS).
 - Масштаб: десятки параллельных ботов + сотни MTProto-клиентов комфортно; тысячи упрутся в лимит CPU 35% Wispbyte.
 
 ## Структура
@@ -142,7 +149,8 @@ src/tunnel.js          — M-TUNNEL: байтовый туннель, idle-та�
 src/proxy.js           — M-PROXY: парсер CONNECT, auth→allow→cap→tunnel
 src/mux.js             — M-MUX: определение протокола по первым байтам, маршрутизация
 src/mtproto.js         — M-MTPROTO: obfuscated2 handshake (parse/build), DC mapping
-src/mtproto-server.js  — MTProto-обработчик соединений (handshake → DC → relay)
+src/faketls.js         — M-FAKETLS: fake-TLS (ee) handshake, TLS record framing
+src/mtproto-server.js  — MTProto-обработчик соединений (plain + fake-TLS → DC → relay)
 tests/                 — node:test (юнит + e2e)
 docs/                  — GRACE-документы проекта
 ```

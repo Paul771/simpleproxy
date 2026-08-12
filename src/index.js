@@ -47,6 +47,12 @@ server.on("listening", () => {
     for (const secret of cfg.mtprotoSecrets) {
       log("mtproto_link", "start", `simple:  tg://proxy?server=${host}&port=${port}&secret=${secret}`);
       log("mtproto_link", "start", `dd:     tg://proxy?server=${host}&port=${port}&secret=dd${secret}`);
+      const tlsSecret = "ee" + secret + Buffer.from(cfg.mtprotoTlsDomain, "utf8").toString("hex");
+      log(
+        "mtproto_link",
+        "start",
+        `ee:     tg://proxy?server=${host}&port=${port}&secret=${tlsSecret}`
+      );
     }
   }
   // END_BLOCK_PRINT_LINKS
