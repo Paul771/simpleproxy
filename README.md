@@ -75,6 +75,7 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_SECRET` | — | MTProto-секрет, 32 hex (16 байт); несколько через запятую. **Не задан → MTProto выключен** |
 | `MTPROTO_PORT` | `0` | Отдельный порт для MTProto; `0` = мультиплексировать с HTTP на `PORT` |
 | `MTPROTO_MAX_CONNECTIONS` | `64` | Лимит одновременных MTProto-соединений |
+| `MTPROTO_HOST` | `YOUR_HOST_OR_IP` | Публичный адрес сервера для подстановки в `tg://proxy`-ссылки (домен или IP) |
 
 ## MTProto proxy (официальные клиенты Telegram)
 

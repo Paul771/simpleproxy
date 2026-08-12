@@ -42,7 +42,7 @@ const server = createMuxServer(handlers);
 server.on("listening", () => {
   // START_BLOCK_PRINT_LINKS
   if (cfg.mtprotoSecrets.length > 0) {
-    const host = "YOUR_HOST_OR_IP";
+    const host = cfg.mtprotoHost;
     const port = cfg.mtprotoPort > 0 ? cfg.mtprotoPort : cfg.port;
     for (const secret of cfg.mtprotoSecrets) {
       log("mtproto_link", "start", `simple:  tg://proxy?server=${host}&port=${port}&secret=${secret}`);

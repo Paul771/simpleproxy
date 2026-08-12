@@ -68,6 +68,9 @@ export function loadConfig(env = process.env) {
     64,
     "MTPROTO_MAX_CONNECTIONS"
   );
+  // Public host shown in tg://proxy links. Falls back to the listen port's hint.
+  const mtprotoHost =
+    env.MTPROTO_HOST && env.MTPROTO_HOST.trim() !== "" ? env.MTPROTO_HOST.trim() : "YOUR_HOST_OR_IP";
 
   return {
     port,
@@ -81,5 +84,6 @@ export function loadConfig(env = process.env) {
     mtprotoSecrets,
     mtprotoPort,
     mtprotoMaxConnections,
+    mtprotoHost,
   };
 }

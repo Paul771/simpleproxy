@@ -79,6 +79,13 @@ test("MTProto: MTPROTO_SECRET parses into lowercase hex secrets; unset disables"
   ]);
   assert.equal(cfg.mtprotoPort, 9443);
   assert.equal(cfg.mtprotoMaxConnections, 8);
+  assert.equal(cfg.mtprotoHost, "YOUR_HOST_OR_IP");
+
+  const withHost = loadConfig({
+    MTPROTO_SECRET: "abcdef0123456789abcdef0123456789",
+    MTPROTO_HOST: "  example.wispbyte.com  ",
+  });
+  assert.equal(withHost.mtprotoHost, "example.wispbyte.com");
 });
 
 test("MTProto: invalid MTPROTO_SECRET entries throw INVALID_ENV", () => {
