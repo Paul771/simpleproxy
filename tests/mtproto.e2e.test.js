@@ -114,6 +114,7 @@ function startProxy(cfgOverrides = {}, resolveDc) {
     mtprotoSecrets: [],
     mtprotoPort: 0,
     mtprotoMaxConnections: 64,
+    mtprotoPendingMax: 256,
     ...cfgOverrides,
   };
   const log = makeLog();
@@ -653,5 +654,44 @@ test("e2e: profiled fake-TLS (TLS profile capture & replay) round-trips through 
     server.close();
     fakeDc.close();
     origin.close();
+  }
+});
+
+test("e2e: pending-handshake cap rejects slowloris connections", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const { server, addr } = await startProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoPendingMax: 1 },
+    () => ({ host: "127.0.0.1", port: dcAddr.port })
+  );
+
+  try {
+    // First connection: send only 8 bytes (no full handshake) -> holds the single pending slot.
+    const holder = net.connect(addr.port, "127.0.0.1", () => {
+      holder.write(Buffer.alloc(8, 0xab)); // not enough for a 64-byte handshake
+    });
+    await new Promise((r) => holder.once("connect", r));
+
+    // Give the proxy a moment to register the pending socket.
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Second connection: must be rejected (pending cap reached) before completing handshake.
+    const closed = await new Promise((resolve) => {
+      const s = net.connect(addr.port, "127.0.0.1", () => {
+        s.write(Buffer.alloc(8, 0xcd));
+      });
+      s.on("close", () => resolve(true));
+      s.on("error", () => resolve(true));
+      setTimeout(() => resolve(false), 1500);
+    });
+    assert.equal(closed, true, "pending-cap must drop the slowloris connection");
+
+    holder.destroy();
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
   }
 });

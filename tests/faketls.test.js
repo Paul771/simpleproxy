@@ -21,6 +21,7 @@ import {
   extractSni,
   buildTlsAlert,
   buildAlpnExtension,
+  splitTlsRecords,
 } from "../src/faketls.js";
 
 const DIGEST_POS = 11;
@@ -249,4 +250,20 @@ test("extractSni: returns null for a ClientHello without SNI", () => {
   recordLenBuf.writeUInt16BE(handshakeMsg.length, 0);
   const hello = Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), recordLenBuf, handshakeMsg]);
   assert.equal(extractSni(hello), null);
+});
+
+test("splitTlsRecords: splits concatenated records into individual record buffers", () => {
+  const secret = randomBytes(16);
+  const { hello, sessionId, digest } = buildClientHello(secret);
+  const result = validateClientHello(hello, [secret]);
+  const response = buildServerHello(secret, result.digest, result.sessionId, null, null);
+
+  const records = splitTlsRecords(response);
+  // Synthetic flight: 0x16 ServerHello, 0x14 CCS, 0x17 app-data = 3 records.
+  assert.equal(records.length, 3);
+  assert.equal(records[0][0], 0x16);
+  assert.equal(records[1][0], 0x14);
+  assert.equal(records[2][0], 0x17);
+  // Concatenating the records back must reproduce the original bytes exactly.
+  assert.ok(Buffer.concat(records).equals(response));
 });

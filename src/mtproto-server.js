@@ -26,6 +26,7 @@ import {
   wrapTlsRecord,
   buildTlsAlert,
   extractSni,
+  splitTlsRecords,
 } from "./faketls.js";
 import { maskConnection } from "./mask.js";
 
@@ -47,6 +48,7 @@ const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 // END_CONTRACT: createMtprotoHandler
 export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayGuard = null, maskImpl = maskConnection, profileManager = null) {
   let activeConnections = 0;
+  let pendingHandshakes = 0; // sockets in handshake phase, before relay is established
 
   // START_BLOCK_ROUTE_UNKNOWN
   // Behaviour on unknown SNI / failed fake-TLS auth (telemt-inspired anti-DPI).
@@ -74,6 +76,13 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
       socket.destroy();
       return;
     }
+    // Slowloris guard: cap the number of sockets still in the handshake phase.
+    if (pendingHandshakes >= cfg.mtprotoPendingMax) {
+      log("mtproto_pending_cap", "DF-4", socket.remoteAddress, { pending: pendingHandshakes });
+      socket.destroy();
+      return;
+    }
+    pendingHandshakes += 1;
 
     const secrets = cfg.mtprotoSecrets.map((s) => Buffer.from(s, "hex"));
     const isTls =
@@ -109,6 +118,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
 
       upstream.once("connect", () => {
         upstream.setTimeout(0);
+        pendingHandshakes -= 1; // left handshake phase
         activeConnections += 1;
         log("mtproto_connect", "DF-1", socket.remoteAddress, `${dc.host}:${dc.port}`, {
           dc: parsed.dcIdx,
@@ -254,7 +264,29 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
           : null;
         const profile = profileManager ? profileManager.get() : null;
         const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile);
-        socket.write(response);
+
+        // Doppelganger: replay captured inter-arrival delays so the flight is timed like the
+        // real origin, not bursty-instant. Only the handshake flight is shaped; steady-state
+        // relay stays untouched. Falls back to a single write when disabled / no profile.
+        if (cfg.mtprotoDoppelganger && profile && Array.isArray(profile.recordDelays) && profile.recordDelays.length > 0) {
+          const records = splitTlsRecords(response);
+          const delays = profile.recordDelays;
+          let sent = 0;
+          const sendNext = (idx) => {
+            if (idx >= records.length || socket.destroyed) return;
+            socket.write(records[idx]);
+            const d = delays[Math.min(idx, delays.length - 1)];
+            setTimeout(() => sendNext(idx + 1), Math.min(d, cfg.mtprotoDoppelgangerMaxDelayMs)).unref?.();
+          };
+          log("doppelganger", "DF-DOPPELGANGER", socket.remoteAddress, {
+            records: records.length,
+            delays: delays.length,
+          });
+          sendNext(0);
+        } else {
+          socket.write(response);
+        }
+
         tlsReader = createTlsRecordReader();
         phase = "tls-app";
         // Fall through: feed remaining bytes to the TLS reader.
@@ -290,6 +322,10 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
 
     socket.on("data", onData);
     socket.on("error", () => socket.destroy());
+    // Release the pending slot if the socket dies before entering relay.
+    socket.once("close", () => {
+      if (!completed) pendingHandshakes -= 1;
+    });
     processBuffer(buf);
     // END_BLOCK_MT_HANDSHAKE
   };

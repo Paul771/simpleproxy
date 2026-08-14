@@ -88,6 +88,9 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_TLS_PROFILE_CAPTURE` | `false` | Захват структуры TLS server-flight у `MTPROTO_TLS_DOMAIN` и replay в fake ServerHello (anti-DPI) |
 | `MTPROTO_TLS_PROFILE_REFRESH_MS` | `600000` | Интервал refresh TLS-профиля, мс (10 мин) |
 | `MTPROTO_TLS_PROFILE_TIMEOUT_MS` | `5000` | Таймаут захвата TLS-профиля, мс |
+| `MTPROTO_DOPPELGANGER` | `false` | Replay inter-arrival delays server-flight при отправке fake ServerHello (требует TLS-профиль) |
+| `MTPROTO_DOPPELGANGER_MAX_DELAY_MS` | `500` | Верхняя граница задержки в doppelganger-режиме, мс |
+| `MTPROTO_PENDING_MAX` | `256` | Лимит сокетов в фазе MTProto-handshake (slowloris-защита) |
 
 ## MTProto proxy (официальные клиенты Telegram)
 
@@ -152,6 +155,11 @@ fake-TLS ClientHello (тот же digest) отклоняется и маскир
 record-size fingerprint (JA3/JA4 server-side). Захват — сырой `net.connect` + чтение первого
 flight, профиль ~1 КБ, refresh каждые `MTPROTO_TLS_PROFILE_REFRESH_MS`. При неудаче — fallback
 на синтетический ServerHello (обратная совместимость).
+
+**Doppelganger** (`MTPROTO_DOPPELGANGER=true`, требует TLS-профиль): помимо структуры replay'ятся
+и inter-arrival задержки между записями первого flight — тайминги рукопожатия становятся близки
+к реальному origin (стеady-state relay не затрагивается, задержка ограничена
+`MTPROTO_DOPPELGANGER_MAX_DELAY_MS`).
 
 При старте прокси логирует anti-DPI-конфиг:
 

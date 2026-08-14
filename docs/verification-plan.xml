@@ -274,9 +274,26 @@
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][tls_profile][DF-TLS-PROFILE]</marker-1>
+        <marker-2>[proxy][doppelganger][DF-DOPPELGANGER]</marker-2>
       </required-log-markers>
       <wave-follow-up>smoke: MTPROTO_TLS_PROFILE_CAPTURE=true + реальный домен → лог captured; invalid.invalid → failed + fallback.</wave-follow-up>
     </V-M-TLS-PROFILE>
+
+    <V-M-HARDEN MODULE="M-MTPROTO-SERVER" PRIORITY="medium">
+      <test-files>
+        <file>tests/mtproto.e2e.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/mtproto.e2e.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">pending-cap: MTPROTO_PENDING_MAX=1 → медленный (slowloris) сокет в handshake удерживает слот, следующий → destroy + лог [proxy][mtproto_pending_cap].</scenario-1>
+        <scenario-2 kind="success">pending-слот освобождается при входе в relay и при закрытии сокета до relay.</scenario-2>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][mtproto_pending_cap][DF-4]</marker-1>
+      </required-log-markers>
+    </V-M-HARDEN>
   </ModuleVerification>
 
   <PhaseGates>

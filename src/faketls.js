@@ -17,6 +17,7 @@
 //   genX25519PublicKey - generate a plausible x25519 public key (square mod P)
 //   extractSni - parse the SNI hostname from a TLS ClientHello (null if absent)
 //   buildTlsAlert - build a TLS alert record (used for reject_handshake mode)
+//   splitTlsRecords - split a byte stream into individual TLS records (doppelganger timing replay)
 // END_MODULE_MAP
 
 import { createHmac, randomBytes } from "node:crypto";
@@ -336,6 +337,27 @@ export function extractSni(handshake) {
     return null;
   }
   // END_BLOCK_SNI
+}
+
+// START_CONTRACT: splitTlsRecords
+//   PURPOSE: Split a byte stream of concatenated TLS records into individual record buffers
+//   INPUTS: { buf: Buffer - one or more TLS records back-to-back }
+//   OUTPUTS: { Buffer[] - each element is exactly one TLS record (5-byte header + payload) }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS
+// END_CONTRACT: splitTlsRecords
+export function splitTlsRecords(buf) {
+  // START_BLOCK_SPLIT
+  const out = [];
+  let off = 0;
+  while (off + 5 <= buf.length) {
+    const len = buf.readUInt16BE(off + 3);
+    if (off + 5 + len > buf.length) break;
+    out.push(buf.subarray(off, off + 5 + len));
+    off += 5 + len;
+  }
+  return out;
+  // END_BLOCK_SPLIT
 }
 
 // START_CONTRACT: buildTlsAlert

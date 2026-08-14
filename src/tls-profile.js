@@ -228,7 +228,7 @@ export async function captureTlsProfile(host, port, { timeoutMs = 5000, log } = 
 
     socket.on("data", (chunk) => {
       for (const rec of observer.feed(chunk)) {
-        records.push(rec);
+        records.push({ ...rec, ts: Date.now() });
         lastRecordAt = Date.now();
         if (rec.type === TYPE_HANDSHAKE && serverHelloParsed === null) {
           // record body starts after the 5-byte record header; the observer gives us length only,
@@ -277,6 +277,11 @@ function buildProfile(host, serverHelloParsed, records) {
   const certLen = appDataSizes.reduce((a, b) => (b > a ? b : a), 0);
   // Trailing 0x17 records after the bulk are likely NewSessionTicket(s).
   const ticketSizes = appDataSizes.slice(-1)[0] < certLen / 2 ? appDataSizes.slice(-1) : [];
+  // Inter-arrival delays between consecutive records in the first flight (ms), for doppelganger.
+  const recordDelays = [];
+  for (let i = 1; i < records.length; i++) {
+    recordDelays.push(records[i].ts - records[i - 1].ts);
+  }
   return {
     host,
     capturedAt: Date.now(),
@@ -286,6 +291,7 @@ function buildProfile(host, serverHelloParsed, records) {
     appDataSizes,
     ticketSizes,
     certLen,
+    recordDelays,
   };
 }
 

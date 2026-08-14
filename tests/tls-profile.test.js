@@ -119,6 +119,13 @@ test("captureTlsProfile: captures cipher, ALPN, ccsCount and app-data sizes from
     assert.equal(profile.alpn, "h2");
     assert.equal(profile.ccsCount, 1);
     assert.deepEqual(profile.appDataSizes, [150, 300, 80]);
+    // recordDelays: one entry per gap between consecutive records
+    // (ServerHello + CCS + 3 app-data = 5 records -> 4 gaps).
+    assert.ok(Array.isArray(profile.recordDelays), "recordDelays must be captured");
+    assert.equal(profile.recordDelays.length, 4, "5 records -> 4 gaps");
+    for (const d of profile.recordDelays) {
+      assert.ok(Number.isFinite(d) && d >= 0, "delay must be a non-negative finite number");
+    }
   } finally {
     origin.closeAllConnections?.();
     origin.close();

@@ -91,7 +91,7 @@
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC → relay (FAST_MODE)</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC → relay (FAST_MODE); doppelganger-тайминги, pending-handshake cap</purpose>
       <path>src/mtproto-server.js</path>
       <depends>M-MTPROTO, M-FAKETLS, M-LOG</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
@@ -143,7 +143,7 @@
       <verification-ref>V-M-TLS-PROFILE</verification-ref>
       <annotations>
         <fn-buildCaptureClientHello PURPOSE="Построить TLS 1.3 ClientHello для probe origin" />
-        <fn-captureTlsProfile PURPOSE="Сырой TCP-capture структуры server-flight (cipher/ALPN/CCS/размеры 0x17)" />
+        <fn-captureTlsProfile PURPOSE="Сырой TCP-capture структуры server-flight (cipher/ALPN/CCS/размеры 0x17/inter-arrival delays)" />
         <fn-createProfileManager PURPOSE="Кэш профиля с periodic refresh" />
         <fn-createTlsRecordObserver PURPOSE="Stateful наблюдатель TLS-записей (type+size)" />
       </annotations>

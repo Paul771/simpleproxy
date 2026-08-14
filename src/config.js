@@ -72,6 +72,12 @@ export function loadConfig(env = process.env) {
     64,
     "MTPROTO_MAX_CONNECTIONS"
   );
+  // Slowloris guard: cap sockets still in the MTProto handshake phase (before relay).
+  const mtprotoPendingMax = parseIntEnv(
+    env.MTPROTO_PENDING_MAX,
+    256,
+    "MTPROTO_PENDING_MAX"
+  );
   // Public host shown in tg://proxy links. Falls back to the listen port's hint.
   const mtprotoHost =
     env.MTPROTO_HOST && env.MTPROTO_HOST.trim() !== "" ? env.MTPROTO_HOST.trim() : "YOUR_HOST_OR_IP";
@@ -123,6 +129,14 @@ export function loadConfig(env = process.env) {
     5000,
     "MTPROTO_TLS_PROFILE_TIMEOUT_MS"
   );
+  // Doppelganger: replay captured inter-arrival delays of the server flight when sending the
+  // fake ServerHello (statistical indistinguishability). Requires a captured profile.
+  const mtprotoDoppelganger = parseBoolEnv(env.MTPROTO_DOPPELGANGER, false);
+  const mtprotoDoppelgangerMaxDelayMs = parseIntEnv(
+    env.MTPROTO_DOPPELGANGER_MAX_DELAY_MS,
+    500,
+    "MTPROTO_DOPPELGANGER_MAX_DELAY_MS"
+  );
 
   return {
     port,
@@ -136,6 +150,7 @@ export function loadConfig(env = process.env) {
     mtprotoSecrets,
     mtprotoPort,
     mtprotoMaxConnections,
+    mtprotoPendingMax,
     mtprotoHost,
     mtprotoTlsDomain,
     mtprotoTlsAlpn,
@@ -149,6 +164,8 @@ export function loadConfig(env = process.env) {
     mtprotoTlsProfileCapture,
     mtprotoTlsProfileRefreshMs,
     mtprotoTlsProfileTimeoutMs,
+    mtprotoDoppelganger,
+    mtprotoDoppelgangerMaxDelayMs,
   };
 }
 

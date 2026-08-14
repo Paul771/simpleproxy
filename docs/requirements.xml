@@ -105,13 +105,22 @@
     </UC-010>
     <UC-011>
       <Actor>Operator</Actor>
-      <Action>Включает TLS profile capture (MTPROTO_TLS_PROFILE_CAPTURE=true)</Action>
-      <Goal>Fake ServerHello структурно близок к fronted-домену: replay cipher/ALPN/CCS/размеры 0x17-записей вместо синтетики</Goal>
+      <Action>Включает TLS profile capture (MTPROTO_TLS_PROFILE_CAPTURE=true) и опц. doppelganger (MTPROTO_DOPPELGANGER=true)</Action>
+      <Goal>Fake ServerHello структурно близок к fronted-домену: replay cipher/ALPN/CCS/размеры 0x17-записей (и inter-arrival delays при doppelganger) вместо синтетики</Goal>
       <Preconditions>MTPROTO_TLS_PROFILE_CAPTURE=true; MTPROTO_TLS_DOMAIN задан; исходящий к домену доступен</Preconditions>
-      <AcceptanceCriteria>профиль захвачен (cipher/ALPN/ccsCount/appDataSizes); ServerHello replay'ит структуру; failure → синтетический fallback; лог [proxy][tls_profile]</AcceptanceCriteria>
+      <AcceptanceCriteria>профиль захвачен (cipher/ALPN/ccsCount/appDataSizes/recordDelays); ServerHello replay'ит структуру; failure → синтетический fallback; лог [proxy][tls_profile] / [proxy][doppelganger]</AcceptanceCriteria>
       <Priority>medium</Priority>
-      <RelatedFlows>DF-TLS-PROFILE</RelatedFlows>
+      <RelatedFlows>DF-TLS-PROFILE, DF-DOPPELGANGER</RelatedFlows>
     </UC-011>
+    <UC-012>
+      <Actor>Attacker</Actor>
+      <Action>Открывает много полуоткрытых (slowloris) соединений, не завершая MTProto-handshake</Action>
+      <Goal>Pending-handshake cap ограничивает число сокетов до входа в relay, защищая 512MB от исчерпания</Goal>
+      <Preconditions>MTPROTO_PENDING_MAX задан (default 256)</Preconditions>
+      <AcceptanceCriteria>превышение лимита → destroy + лог [proxy][mtproto_pending_cap]; слот освобождается при закрытии/входе в relay</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-4</RelatedFlows>
+    </UC-012>
   </UseCases>
 
   <NonGoals>
