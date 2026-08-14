@@ -12,3 +12,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Agent workspace (planning scaffolding, local tool deps)
+.mimocode/

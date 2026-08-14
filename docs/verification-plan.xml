@@ -256,6 +256,27 @@
         <marker-1>[proxy][faketls_replay][DF-MASK]</marker-1>
       </required-log-markers>
     </V-M-REPLAY>
+
+    <V-M-TLS-PROFILE MODULE="M-TLS-PROFILE" PRIORITY="medium">
+      <test-files>
+        <file>tests/tls-profile.test.js</file>
+        <file>tests/faketls.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/tls-profile.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">buildCaptureClientHello: TLS 1.3 ClientHello record, длина &gt;= 512.</scenario-1>
+        <scenario-2 kind="success">captureTlsProfile против script-сервера: cipher, ALPN, ccsCount, appDataSizes извлекаются; пустой origin → null.</scenario-2>
+        <scenario-3 kind="success">buildServerHello с profile: replay cipher/ALPN/ccsCount/размер app-data, digest остаётся валидным.</scenario-3>
+        <scenario-4 kind="success">profile=null → синтетика (один CCS + один app-data) — обратная совместимость.</scenario-4>
+        <scenario-5 kind="success">createProfileManager: start → capture → get(); stop чистит таймер.</scenario-5>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][tls_profile][DF-TLS-PROFILE]</marker-1>
+      </required-log-markers>
+      <wave-follow-up>smoke: MTPROTO_TLS_PROFILE_CAPTURE=true + реальный домен → лог captured; invalid.invalid → failed + fallback.</wave-follow-up>
+    </V-M-TLS-PROFILE>
   </ModuleVerification>
 
   <PhaseGates>
@@ -310,6 +331,17 @@
         <evidence-3>reject-режим: openssl s_client получает unrecognized_name alert.</evidence-3>
       </required-evidence>
     </Gate-Phase-5>
+    <Gate-Phase-6 PHASE="Phase-6">
+      <goal>TLS profile capture &amp; replay: fake ServerHello структурно ближе к fronted-домену; тесты зелёные.</goal>
+      <commands>
+        <command-1>node --test</command-1>
+        <command-2>MTPROTO_SECRET=... MTPROTO_TLS_PROFILE_CAPTURE=true MTPROTO_TLS_DOMAIN=www.example.com PORT=8080 node src/index.js (smoke: лог tls_profile)</command-2>
+      </commands>
+      <required-evidence>
+        <evidence-1>85 тестов проходят (включая tls-profile capture/replay/manager).</evidence-1>
+        <evidence-2>Лог [proxy][tls_profile] captured с cipher/alpn/ccsCount/appDataSizes.</evidence-2>
+      </required-evidence>
+    </Gate-Phase-6>
   </PhaseGates>
 
   <FailurePackets>

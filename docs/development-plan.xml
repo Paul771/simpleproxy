@@ -405,6 +405,41 @@
         <note-1>Map с FIFO-вытеснением; lazy TTL на lookup; timestamp в последних 4 байтах digest (LE, сек). maxSize=0 → выключен.</note-1>
       </notes>
     </M-REPLAY>
+
+    <M-TLS-PROFILE NAME="TlsProfile" TYPE="CORE_LOGIC" LAYER="1" ORDER="7" STATUS="implemented">
+      <contract>
+        <purpose>Захват структуры TLS server-flight у fronted-домена и replay её в fake ServerHello (anti-DPI)</purpose>
+        <inputs>
+          <param name="host, port, timeoutMs, log" type="captureTlsProfile args" />
+          <param name="host, port, refreshMs, timeoutMs" type="createProfileManager args" />
+          <param name="profile" type="Profile | null" />
+        </inputs>
+        <outputs>
+          <param name="Profile | null" type="{ host, capturedAt, cipher, alpn, ccsCount, appDataSizes, ticketSizes, certLen }" />
+          <param name="{ get, start, stop, refresh }" type="profile manager" />
+        </outputs>
+        <errors><error code="none" /></errors>
+      </contract>
+      <interface>
+        <export-buildCaptureClientHello PURPOSE="TLS 1.3 ClientHello для probe origin" />
+        <export-captureTlsProfile PURPOSE="Сырой TCP-capture структуры server-flight" />
+        <export-createProfileManager PURPOSE="Кэш профиля + periodic refresh" />
+        <export-createTlsRecordObserver PURPOSE="Наблюдатель type+size записей" />
+      </interface>
+      <depends>node:net, node:crypto, M-FAKETLS</depends>
+      <target>
+        <source>src/tls-profile.js</source>
+        <tests>tests/tls-profile.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[tls_profile]</log-prefix>
+        <critical-block>BLOCK_CAPTURE</critical-block>
+      </observability>
+      <verification-ref>V-M-TLS-PROFILE</verification-ref>
+      <notes>
+        <note-1>Raw net.connect (не node:tls) — размеры записей видны. Профиль ~1KB, refresh 10 мин, off по умолчанию, failure → null → синтетический fallback.</note-1>
+      </notes>
+    </M-TLS-PROFILE>
   </Modules>
 
   <DataFlow>
@@ -481,6 +516,14 @@
       <step-6 module="M-MTPROTO-SERVER" status="done" verification="V-M-MTPROTO">wired routeUnknown + replayGuard + SNI-gate + ALPN; e2e replay+mask тест</step-6>
       <step-7 module="M-MTPROTO-SERVER" status="done" verification="V-M-MTPROTO">README, финальные GRACE-доки (requirements/knowledge-graph/verification)</step-7>
     </Phase-5>
+    <Phase-6 name="TlsProfileCapture" status="done">
+      <goal>TLS profile capture &amp; replay: fake ServerHello структурно ближе к fronted-домену (anti-DPI, telemt-style)</goal>
+      <step-1 module="M-TLS-PROFILE" status="done" verification="V-M-TLS-PROFILE">src/tls-profile.js + tests/tls-profile.test.js (capture/replay/manager)</step-1>
+      <step-2 module="M-FAKETLS" status="done" verification="V-M-FAKETLS">buildServerHello(..., profile) — replay cipher/ALPN/CCS/размеры app-data</step-2>
+      <step-3 module="M-MTPROTO-SERVER" status="done" verification="V-M-TLS-PROFILE">приём profileManager, передача profile в buildServerHello</step-3>
+      <step-4 module="M-CONFIG" status="done" verification="V-M-CONFIG">MTPROTO_TLS_PROFILE_CAPTURE/REFRESH_MS/TIMEOUT_MS</step-4>
+      <step-5 module="M-TLS-PROFILE" status="done" verification="V-M-TLS-PROFILE">README + финальные GRACE-доки (knowledge-graph/requirements/verification)</step-5>
+    </Phase-6>
   </ImplementationOrder>
 
   <ExecutionPolicy>

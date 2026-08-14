@@ -3,7 +3,7 @@
 // START_MODULE_CONTRACT
 //   PURPOSE: Entry point: loadConfig -> makeLog -> mux(connect + mtproto) -> start
 //   SCOPE: process bootstrap, dependency wiring, tg://proxy link generation
-//   DEPENDS: M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO, M-FAKETLS, M-MASK, M-REPLAY
+//   DEPENDS: M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO, M-FAKETLS, M-MASK, M-REPLAY, M-TLS-PROFILE
 //   LINKS: M-PROXY
 //   ROLE: ENTRY_POINT
 //   MAP_MODE: LOCALS
@@ -17,6 +17,7 @@ import { createConnectHandler, start } from "./proxy.js";
 import { createMtprotoHandler } from "./mtproto-server.js";
 import { createMuxServer } from "./mux.js";
 import { createReplayGuard } from "./replay-guard.js";
+import { createProfileManager } from "./tls-profile.js";
 
 // START_BLOCK_BOOT
 let cfg;
@@ -40,10 +41,22 @@ const replayGuard = cfg.mtprotoSecrets.length > 0 && cfg.mtprotoReplayWindow > 0
       freshnessMs: cfg.mtprotoDigestFreshnessMs,
     })
   : null;
+// TLS profile capture & replay (Phase 2 anti-DPI): captures the real server-flight shape
+// from MTPROTO_TLS_DOMAIN and replays it in buildServerHello. Off by default.
+const profileManager = cfg.mtprotoSecrets.length > 0 && cfg.mtprotoTlsProfileCapture
+  ? createProfileManager({
+      host: cfg.mtprotoTlsDomain,
+      port: 443,
+      refreshMs: cfg.mtprotoTlsProfileRefreshMs,
+      timeoutMs: cfg.mtprotoTlsProfileTimeoutMs,
+      log,
+    })
+  : null;
+if (profileManager) profileManager.start();
 const handlers = {
   "http-connect": httpHandlers["http-connect"],
   "http-other": httpHandlers["http-other"],
-  "mtproto": cfg.mtprotoSecrets.length > 0 ? createMtprotoHandler(cfg, log, undefined, replayGuard) : null,
+  "mtproto": cfg.mtprotoSecrets.length > 0 ? createMtprotoHandler(cfg, log, undefined, replayGuard, undefined, profileManager) : null,
 };
 
 const server = createMuxServer(handlers);
@@ -57,6 +70,7 @@ server.on("listening", () => {
       alpn: (cfg.mtprotoTlsAlpn || []).join(","),
       replay: replayGuard ? cfg.mtprotoReplayWindow : 0,
       ipv6: cfg.mtprotoPreferIpv6 ? 1 : 0,
+      profile_capture: cfg.mtprotoTlsProfileCapture ? 1 : 0,
     });
     const host = cfg.mtprotoHost;
     const port = cfg.mtprotoPort > 0 ? cfg.mtprotoPort : cfg.port;

@@ -39,12 +39,13 @@ const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 //   PURPOSE: Create the mtproto mux handler; validates handshake, connects to DC, relays
 //   INPUTS: { cfg: Config, log: Log, resolveDc?: (dcIdx, opts) => { host, port } | null,
 //             replayGuard?: { admit: (key: Buffer) => boolean } | null,
-//             maskImpl?: (opts) => void - mask splice function (injectable for tests) }
+//             maskImpl?: (opts) => void - mask splice function (injectable for tests),
+//             profileManager?: { get(): Profile | null } | null - TLS profile capture & replay }
 //   OUTPUTS: { (socket, head) => void }
 //   SIDE_EFFECTS: none
-//   LINKS: M-MTPROTO
+//   LINKS: M-MTPROTO, M-TLS-PROFILE
 // END_CONTRACT: createMtprotoHandler
-export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayGuard = null, maskImpl = maskConnection) {
+export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayGuard = null, maskImpl = maskConnection, profileManager = null) {
   let activeConnections = 0;
 
   // START_BLOCK_ROUTE_UNKNOWN
@@ -251,7 +252,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
         const alpn = Array.isArray(cfg.mtprotoTlsAlpn) && cfg.mtprotoTlsAlpn.length > 0
           ? cfg.mtprotoTlsAlpn[0]
           : null;
-        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn);
+        const profile = profileManager ? profileManager.get() : null;
+        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile);
         socket.write(response);
         tlsReader = createTlsRecordReader();
         phase = "tls-app";

@@ -136,10 +136,25 @@
       </annotations>
     </M-REPLAY>
 
+    <M-TLS-PROFILE NAME="TlsProfile" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Захват структуры TLS server-flight у fronted-домена и replay её в fake ServerHello (anti-DPI, telemt-style)</purpose>
+      <path>src/tls-profile.js</path>
+      <depends>node:net, node:crypto, M-FAKETLS</depends>
+      <verification-ref>V-M-TLS-PROFILE</verification-ref>
+      <annotations>
+        <fn-buildCaptureClientHello PURPOSE="Построить TLS 1.3 ClientHello для probe origin" />
+        <fn-captureTlsProfile PURPOSE="Сырой TCP-capture структуры server-flight (cipher/ALPN/CCS/размеры 0x17)" />
+        <fn-createProfileManager PURPOSE="Кэш профиля с periodic refresh" />
+        <fn-createTlsRecordObserver PURPOSE="Stateful наблюдатель TLS-записей (type+size)" />
+      </annotations>
+    </M-TLS-PROFILE>
+
     <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
     <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-FAKETLS" relation="uses fake-TLS for ee-secrets" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-TLS-PROFILE" relation="replays captured server-flight profile" />
+    <CrossLink from="M-TLS-PROFILE" to="M-FAKETLS" relation="uses genX25519PublicKey/buildAlpnExtension" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-MASK" relation="routes unknown-SNI/auth-fail (mask)" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-REPLAY" relation="admits fresh digests" />
     <CrossLink from="M-MASK" to="M-FAKETLS" relation="re-exports extractSni" />

@@ -115,28 +115,34 @@ export function validateClientHello(handshake, secrets) {
 
 // START_CONTRACT: buildServerHello
 //   PURPOSE: Build the fake ServerHello + ChangeCipherSpec + ApplicationData response
-//   INPUTS: { secret: Buffer(16), clientDigest: Buffer(32), sessionId: Buffer, alpn?: string - negotiated ALPN protocol }
+//   INPUTS: { secret: Buffer(16), clientDigest: Buffer(32), sessionId: Buffer, alpn?: string,
+//             profile?: { cipher: Buffer(2), alpn: string|null, ccsCount: number, appDataSizes: number[] } | null }
 //   OUTPUTS: { Buffer - full response packet }
 //   SIDE_EFFECTS: none
-//   LINKS: M-FAKETLS
+//   LINKS: M-FAKETLS, M-TLS-PROFILE
 // END_CONTRACT: buildServerHello
-export function buildServerHello(secret, clientDigest, sessionId, alpn = null) {
+export function buildServerHello(secret, clientDigest, sessionId, alpn = null, profile = null) {
   // START_BLOCK_BUILD
   const x25519 = genX25519PublicKey();
+  // When a captured profile is available, replay its structure: real cipher, real ALPN,
+  // the observed CCS count, and 0x17 app-data records with the observed sizes (random content —
+  // we replay the SHAPE, not the encrypted bytes, matching telemt's fidelity approach).
+  const replayAlpn = (profile && profile.alpn) || alpn;
+  const cipher = profile && profile.cipher ? Buffer.from(profile.cipher) : TLS_CIPHERSUITE;
   const tlsExtensions = Buffer.concat([
     Buffer.from([0x00, 0x2e, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]),
     x25519,
     Buffer.from([0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]),
     // ALPN extension (0x00 0x10): advertises the negotiated protocol, mirroring a real
     // TLS 1.3 server flight. Omitted entirely when no ALPN is configured (backward compatible).
-    ...(alpn ? [buildAlpnExtension([alpn])] : []),
+    ...(replayAlpn ? [buildAlpnExtension([replayAlpn])] : []),
   ]);
   const srvHello = Buffer.concat([
     TLS_VERS,
     Buffer.alloc(DIGEST_LEN), // random placeholder, replaced by response digest
     Buffer.from([sessionId.length]),
     sessionId,
-    TLS_CIPHERSUITE,
+    cipher,
     Buffer.from([0x00]),
     tlsExtensions,
   ]);
@@ -147,10 +153,20 @@ export function buildServerHello(secret, clientDigest, sessionId, alpn = null) {
   const hsLenBuf = Buffer.alloc(3);
   hsLenBuf.writeUIntBE(srvHello.length, 0, 3);
 
-  const fakeCertLen = 1024 + Math.floor(Math.random() * 3072); // 1024..4095
+  // Build the post-ServerHello flight: CCS record(s) + ONE 0x17 application-data record.
+  // The fake-TLS protocol (mtprotoproxy-compatible) treats the FIRST 0x17 record as the fake
+  // certificate and everything after it as the MTProto stream, so we must emit exactly one
+  // fake-cert record. With a captured profile we size it to match the real origin's Certificate
+  // record (profile.certLen) instead of a random 1024-4095 — a strong, stable fingerprint signal.
+  const flightParts = [];
+  const ccsCount = profile && profile.ccsCount ? profile.ccsCount : 1;
+  for (let i = 0; i < ccsCount; i++) flightParts.push(TLS_CHANGE_CIPHER);
+
+  const fakeCertLen = profile && profile.certLen ? profile.certLen : 1024 + Math.floor(Math.random() * 3072);
   const httpData = randomBytes(fakeCertLen);
   const httpLenBuf = Buffer.alloc(2);
   httpLenBuf.writeUInt16BE(httpData.length, 0);
+  flightParts.push(TLS_APP_HDR, httpLenBuf, httpData);
 
   let helloPkt = Buffer.concat([
     Buffer.from([0x16, 0x03, 0x03]),
@@ -158,10 +174,7 @@ export function buildServerHello(secret, clientDigest, sessionId, alpn = null) {
     Buffer.from([0x02]),
     hsLenBuf,
     srvHello,
-    TLS_CHANGE_CIPHER,
-    TLS_APP_HDR,
-    httpLenBuf,
-    httpData,
+    ...flightParts,
   ]);
 
   // Response digest = HMAC(secret, clientDigest + helloPkt); placed at [11:43].

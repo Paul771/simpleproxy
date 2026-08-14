@@ -27,6 +27,7 @@ import {
 import { createHmac } from "node:crypto";
 import { createReplayGuard } from "../src/replay-guard.js";
 import { maskConnection } from "../src/mask.js";
+import { createProfileManager } from "../src/tls-profile.js";
 
 const PROTO_TAG_ABRIDGED = Buffer.from([0xef, 0xef, 0xef, 0xef]);
 
@@ -517,5 +518,140 @@ test("e2e: replayed fake-TLS ClientHello is masked instead of reaching the DC tw
     server.close();
     fakeDc.close();
     mask.close();
+  }
+});
+
+// --- TLS profile capture & replay: profiled fake-TLS ServerHello still round-trips ---
+
+function buildScriptedFlight(appDataSizes) {
+  const parts = [];
+  const srvHello = Buffer.concat([
+    Buffer.from([0x03, 0x03]),
+    randomBytes(32),
+    Buffer.from([0x00]), // sidLen 0
+    Buffer.from([0x13, 0x02]), // cipher TLS_AES_256_GCM_SHA384
+    Buffer.from([0x00]), // compression
+    Buffer.from([0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]), // supported_versions ext
+  ]);
+  const hsLen = Buffer.alloc(3);
+  hsLen.writeUIntBE(srvHello.length, 0, 3);
+  const hsMsg = Buffer.concat([Buffer.from([0x02]), hsLen, srvHello]);
+  const recLen = Buffer.alloc(2);
+  recLen.writeUInt16BE(hsMsg.length, 0);
+  parts.push(Buffer.concat([Buffer.from([0x16, 0x03, 0x03]), recLen, hsMsg]));
+  parts.push(Buffer.from([0x14, 0x03, 0x03, 0x00, 0x01, 0x01])); // CCS
+  for (const size of appDataSizes) {
+    const len = Buffer.alloc(2);
+    len.writeUInt16BE(size, 0);
+    parts.push(Buffer.from([0x17, 0x03, 0x03]), len, randomBytes(size));
+  }
+  return Buffer.concat(parts);
+}
+
+function startScriptOrigin(flight) {
+  const server = net.createServer((socket) => {
+    socket.on("data", () => { socket.write(flight); socket.end(); });
+    socket.on("error", () => {});
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
+}
+
+test("e2e: profiled fake-TLS (TLS profile capture & replay) round-trips through the proxy", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const origin = await startScriptOrigin(buildScriptedFlight([180, 360, 90]));
+  const originAddr = origin.address();
+
+  const log = makeLog();
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 5_000,
+    rules: [],
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoTlsDomain: "www.google.com",
+    mtprotoTlsAlpn: ["h2"],
+  };
+  const profileManager = createProfileManager({
+    host: "127.0.0.1",
+    port: originAddr.port,
+    refreshMs: 60_000,
+    timeoutMs: 3000,
+  });
+  profileManager.start();
+  // Wait for the initial capture to populate the profile.
+  for (let i = 0; i < 20 && !profileManager.get(); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(profileManager.get(), "profile must be captured before the client connects");
+
+  const handlers = {
+    "http-connect": createConnectHandler(cfg, () => true, () => true, log)["http-connect"],
+    "http-other": createConnectHandler(cfg, () => true, () => true, log)["http-other"],
+    "mtproto": createMtprotoHandler(cfg, log, () => ({ host: "127.0.0.1", port: dcAddr.port }), null, maskConnection, profileManager),
+  };
+  const server = createMuxServer(handlers);
+  await new Promise((resolve) => server.listen(cfg.port, cfg.host, resolve));
+  const addr = server.address();
+
+  try {
+    const { handshake: obfsHandshake, stream, encKey, encIv } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello: tlsHello } = buildFakeTlsClientHello(secret, obfsHandshake);
+    const payload = "profiled-faketls-payload";
+    const sent = stream.encrypt(Buffer.from(payload));
+    const clientDec = createAesCtr(encKey, encIv);
+
+    const result = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(Buffer.concat([tlsHello, wrapTlsRecord(obfsHandshake), wrapTlsRecord(sent)]));
+      });
+      let rawBuf = Buffer.alloc(0);
+      let phase = "consume-response";
+      let tlsIn = null;
+      let appBuf = Buffer.alloc(0);
+      const timer = setTimeout(() => reject(new Error(`profiled timeout phase=${phase} got: ${appBuf.toString("hex")}`)), 3000);
+      socket.on("data", (d) => {
+        rawBuf = Buffer.concat([rawBuf, d]);
+        if (phase === "consume-response") {
+          while (rawBuf.length >= 5) {
+            const recLen = rawBuf.readUInt16BE(3);
+            if (rawBuf.length < 5 + recLen) break;
+            const recType = rawBuf[0];
+            rawBuf = rawBuf.subarray(5 + recLen);
+            if (recType === 0x17) {
+              phase = "app-data";
+              tlsIn = createTlsRecordReader();
+              break;
+            }
+          }
+        }
+        if (phase === "app-data" && rawBuf.length > 0) {
+          for (const appData of tlsIn.feed(rawBuf)) {
+            appBuf = Buffer.concat([appBuf, appData]);
+            if (appBuf.length >= payload.length) {
+              clearTimeout(timer);
+              socket.destroy();
+              resolve(clientDec.decrypt(appBuf).toString());
+              return;
+            }
+          }
+          rawBuf = Buffer.alloc(0);
+        }
+      });
+      socket.on("error", reject);
+    });
+    assert.equal(result, payload, "profiled fake-TLS must round-trip the MTProto payload");
+  } finally {
+    profileManager.stop();
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    origin.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+    origin.close();
   }
 });

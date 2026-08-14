@@ -103,6 +103,15 @@
       <Priority>low</Priority>
       <RelatedFlows>DF-MASK</RelatedFlows>
     </UC-010>
+    <UC-011>
+      <Actor>Operator</Actor>
+      <Action>Включает TLS profile capture (MTPROTO_TLS_PROFILE_CAPTURE=true)</Action>
+      <Goal>Fake ServerHello структурно близок к fronted-домену: replay cipher/ALPN/CCS/размеры 0x17-записей вместо синтетики</Goal>
+      <Preconditions>MTPROTO_TLS_PROFILE_CAPTURE=true; MTPROTO_TLS_DOMAIN задан; исходящий к домену доступен</Preconditions>
+      <AcceptanceCriteria>профиль захвачен (cipher/ALPN/ccsCount/appDataSizes); ServerHello replay'ит структуру; failure → синтетический fallback; лог [proxy][tls_profile]</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-TLS-PROFILE</RelatedFlows>
+    </UC-011>
   </UseCases>
 
   <NonGoals>
@@ -111,7 +120,7 @@
     <item-3>Не кэшировать ответы и не модифицировать тела/заголовки.</item-3>
     <item-4>Не поддерживать прозрачный перехват (iptables REDIRECT) — недоступно на контейнерном хостинге без root.</item-4>
     <item-5>Не поддерживать plain-HTTP (без CONNECT) пересылку — только CONNECT-туннели.</item-5>
-    <item-6>Не захватывать и не replay'ить реальный TLS-профиль fronted-домена (TLS profile capture &amp; replay) — отдельная фаза.</item-6>
+    <item-6>Не replay'ить реальные зашифрованные байты сертификата fronted-домена (fingerprint) — только структуру размеров/счётчиков записей.</item-6>
     <item-7>Не поддерживать Middle-End Pool / SOCKS5/Shadowsocks upstream — вне anti-DPI-скоупа.</item-7>
   </NonGoals>
 

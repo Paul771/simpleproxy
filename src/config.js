@@ -37,7 +37,8 @@ function parseIntEnv(value, fallback, name) {
 //                          mtprotoSecrets, mtprotoPort, mtprotoMaxConnections, mtprotoHost,
 //                          mtprotoTlsDomain, mtprotoTlsAlpn, mtprotoMaskHost, mtprotoMaskPort,
 //                          mtprotoUnknownSniAction, mtprotoReplayWindow, mtprotoReplayTtlMs,
-//                          mtprotoDigestFreshnessMs, mtprotoPreferIpv6 } }
+//                          mtprotoDigestFreshnessMs, mtprotoPreferIpv6,
+//                          mtprotoTlsProfileCapture, mtprotoTlsProfileRefreshMs, mtprotoTlsProfileTimeoutMs } }
 //   SIDE_EFFECTS: none
 //   LINKS: M-CONFIG
 // END_CONTRACT: loadConfig
@@ -109,6 +110,20 @@ export function loadConfig(env = process.env) {
   // Prefer IPv6 Telegram DC addresses when resolving dc_idx.
   const mtprotoPreferIpv6 = parseBoolEnv(env.MTPROTO_PREFER_IPV6, false);
 
+  // --- TLS profile capture & replay (Phase 2 anti-DPI, telemt-inspired) ---
+  // When enabled, the fake ServerHello replays the record structure captured from mtprotoTlsDomain.
+  const mtprotoTlsProfileCapture = parseBoolEnv(env.MTPROTO_TLS_PROFILE_CAPTURE, false);
+  const mtprotoTlsProfileRefreshMs = parseIntEnv(
+    env.MTPROTO_TLS_PROFILE_REFRESH_MS,
+    600_000,
+    "MTPROTO_TLS_PROFILE_REFRESH_MS"
+  );
+  const mtprotoTlsProfileTimeoutMs = parseIntEnv(
+    env.MTPROTO_TLS_PROFILE_TIMEOUT_MS,
+    5000,
+    "MTPROTO_TLS_PROFILE_TIMEOUT_MS"
+  );
+
   return {
     port,
     host: "0.0.0.0",
@@ -131,6 +146,9 @@ export function loadConfig(env = process.env) {
     mtprotoReplayTtlMs,
     mtprotoDigestFreshnessMs,
     mtprotoPreferIpv6,
+    mtprotoTlsProfileCapture,
+    mtprotoTlsProfileRefreshMs,
+    mtprotoTlsProfileTimeoutMs,
   };
 }
 

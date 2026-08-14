@@ -85,6 +85,9 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_DIGEST_FRESHNESS_MS` | `0` | Макс. отклонение timestamp в digest (0 = не проверять) |
 | `MTPROTO_TLS_ALPN` | `h2,http/1.1` | ALPN-список fake ServerHello; первый = выбранный протокол |
 | `MTPROTO_PREFER_IPV6` | `false` | Использовать IPv6-адреса DC Telegram (`1`/`true`/`yes`/`on`) |
+| `MTPROTO_TLS_PROFILE_CAPTURE` | `false` | Захват структуры TLS server-flight у `MTPROTO_TLS_DOMAIN` и replay в fake ServerHello (anti-DPI) |
+| `MTPROTO_TLS_PROFILE_REFRESH_MS` | `600000` | Интервал refresh TLS-профиля, мс (10 мин) |
+| `MTPROTO_TLS_PROFILE_TIMEOUT_MS` | `5000` | Таймаут захвата TLS-профиля, мс |
 
 ## MTProto proxy (официальные клиенты Telegram)
 
@@ -143,6 +146,13 @@ fake-TLS ClientHello (тот же digest) отклоняется и маскир
 В fake ServerHello добавлено **ALPN**-расширение (`MTPROTO_TLS_ALPN`, default `h2,http/1.1`)
 для снижения синтетичности fingerprint. Для IPv6-only сетей доступен `MTPROTO_PREFER_IPV6=true`.
 
+**TLS profile capture & replay** (`MTPROTO_TLS_PROFILE_CAPTURE=true`, off по умолчанию): прокси
+захватывает *структуру* server-flight у `MTPROTO_TLS_DOMAIN` (cipher suite, ALPN, число CCS,
+размеры ApplicationData-записей) и replay'ит её в fake ServerHello вместо синтетики — снижает
+record-size fingerprint (JA3/JA4 server-side). Захват — сырой `net.connect` + чтение первого
+flight, профиль ~1 КБ, refresh каждые `MTPROTO_TLS_PROFILE_REFRESH_MS`. При неудаче — fallback
+на синтетический ServerHello (обратная совместимость).
+
 При старте прокси логирует anti-DPI-конфиг:
 
 ```
@@ -192,6 +202,7 @@ src/faketls.js         — M-FAKETLS: fake-TLS (ee) handshake, ServerHello+ALPN,
 src/mtproto-server.js  — MTProto-обработчик: plain + fake-TLS → DC → relay; routeUnknown (mask/reject/drop) + replay
 src/mask.js            — M-MASK: traffic-masking (TCP-splice к mask_host)
 src/replay-guard.js    — M-REPLAY: LRU+TTL replay-защита по digest
+src/tls-profile.js     — M-TLS-PROFILE: capture & replay структуры TLS server-flight
 tests/                 — node:test (юнит + e2e, 77 тестов)
 docs/                  — GRACE-документы проекта
 ```
