@@ -96,6 +96,7 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_USER_MAX_CONNS` | — | JSON-карта `{user: N}` — лимит одновременных MTProto-соединений на пользователя |
 | `MTPROTO_USER_EXPIRATIONS` | — | JSON-карта `{user: "ISO-8601" | epochMs}` — срок действия секрета пользователя |
 | `MTPROTO_USER_QUOTAS` | — | JSON-карта `{user: bytes}` — суммарная байтовая квота пользователя |
+| `MTPROTO_BLOCKLIST` | — | Client-IP blocklist: CIDR/голые IP через запятую (IPv4/IPv6). Заблокированный IP → silent destroy на edge |
 
 ## MTProto proxy (официальные клиенты Telegram)
 
@@ -229,6 +230,25 @@ MTPROTO_USER_QUOTAS='{"alice":104857600}'             # 100 МБ суммарн�
 байтовая квота, не превышен ли лимит одновременных. Отказ → `destroy` + лог
 `[proxy][mtproto_user_reject]`. Без лимитов — обратная совместимость (admit всегда true).
 
+### Этап 3: IPv6 fallback и blocklist
+
+**IPv4↔IPv6 DC fallback** — `getDcAddressCandidates` возвращает упорядоченный список адресов DC
+(предпочитаемая семья первой, затем другая). При TCP connect-failure к кандидату прокси пробует
+следующего (лог `[proxy][mtproto_dc_fallback]`); все исчерпаны → `[proxy][mtproto_upstream_error]`.
+DC-таблицы (IPv4/IPv6) сверены с эталонным `mtprotoproxy.py`.
+
+**Client-IP blocklist** (`MTPROTO_BLOCKLIST`) — отсечение сканеров на edge: подключение с IP,
+попавшего в список (CIDR или голый IP, IPv4/IPv6, IPv4-mapped `::ffff:` нормализуется),
+получает silent destroy на мультиплексоре до обработки — ни HTTP, ни MTProto-обработчик не
+вызываются, байты не отправляются. Лог `[proxy][blocklist_reject]`. Невалидная запись →
+`INVALID_ENV` при старте.
+
+```bash
+MTPROTO_BLOCKLIST="10.0.0.0/8, 192.168.1.5, 2001:db8::/32"
+```
+
+> Middle-End Pool / SOCKS5-upstream осознанно **не реализованы** (этап 3 плана, «держать вне v1»).
+
 ## Ограничения
 
 - Только HTTPS-трафик через `CONNECT` (plain-HTTP не пересылается — `405`).
@@ -256,7 +276,8 @@ src/replay-guard.js    — M-REPLAY: LRU+TTL replay-защита по digest
 src/tls-profile.js     — M-TLS-PROFILE: capture & replay структуры TLS server-flight
 src/metrics.js         — M-METRICS: Prometheus text-exposition реестр + /metrics side-port
 src/user-store.js      — M-USER-STORE: per-user секреты, cap/expiry/quota (multi-tenant)
-tests/                 — node:test (юнит + e2e, 108 тестов)
+src/blocklist.js       — M-BLOCKLIST: client-IP blocklist (CIDR/bare IP, IPv4/IPv6, edge-reject)
+tests/                 — node:test (юнит + e2e, 127 тестов)
 docs/                  — GRACE-документы проекта
 ```
 

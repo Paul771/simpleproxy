@@ -1,5 +1,5 @@
 // FILE: src/mtproto.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto proxy obfuscated2 handshake parse/build and DC address mapping (pure logic)
 //   SCOPE: client handshake validation, upstream handshake construction, DC lookup
@@ -186,4 +186,22 @@ export function getDcAddress(dcIdx, { preferIpv6 = false } = {}) {
   const table = preferIpv6 ? TG_DATACENTERS_V6 : TG_DATACENTERS_V4;
   if (!Number.isInteger(idx) || idx < 0 || idx >= table.length) return null;
   return { host: table[idx], port: TG_DATACENTER_PORT };
+}
+
+// START_CONTRACT: getDcAddressCandidates
+//   PURPOSE: Return an ordered list of DC addresses for connect-with-fallback
+//   INPUTS: { dcIdx: number, opts?: { preferIpv6: boolean } }
+//   OUTPUTS: { Array<{ host: string, port: number }> - preferred family first, then the other }
+//   SIDE_EFFECTS: none
+//   LINKS: M-MTPROTO
+// END_CONTRACT: getDcAddressCandidates
+export function getDcAddressCandidates(dcIdx, { preferIpv6 = false } = {}) {
+  const idx = Math.abs(dcIdx) - 1;
+  if (!Number.isInteger(idx) || idx < 0 || idx >= TG_DATACENTERS_V4.length) return [];
+  const port = TG_DATACENTER_PORT;
+  const v4 = { host: TG_DATACENTERS_V4[idx], port };
+  const v6 = { host: TG_DATACENTERS_V6[idx], port };
+  // Only one address family is useful when the operator pinned a family; both lists have an
+  // entry for every valid index, so we always return two candidates ordered by preference.
+  return preferIpv6 ? [v6, v4] : [v4, v6];
 }

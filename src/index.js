@@ -1,9 +1,9 @@
 // FILE: src/index.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Entry point: loadConfig -> makeLog -> mux(connect + mtproto) -> start
 //   SCOPE: process bootstrap, dependency wiring, tg://proxy link generation
-//   DEPENDS: M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO, M-FAKETLS, M-MASK, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE
+//   DEPENDS: M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO, M-FAKETLS, M-MASK, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE, M-BLOCKLIST
 //   LINKS: M-PROXY
 //   ROLE: ENTRY_POINT
 //   MAP_MODE: LOCALS
@@ -20,6 +20,7 @@ import { createReplayGuard } from "./replay-guard.js";
 import { createProfileManager } from "./tls-profile.js";
 import { createMetrics, startMetricsServer } from "./metrics.js";
 import { createUserStore } from "./user-store.js";
+import { createBlocklist } from "./blocklist.js";
 
 // START_BLOCK_BOOT
 let cfg;
@@ -62,13 +63,18 @@ if (profileManager) profileManager.start();
 // Per-user secret limits (multi-tenant): built from cfg.mtprotoUsers. When no limits are
 // configured, admit() always returns true -> behaviour is unchanged from the single-tenant case.
 const userStore = cfg.mtprotoUsers.length > 0 ? createUserStore(cfg.mtprotoUsers) : null;
+// Client-IP blocklist (edge reject). Built from the validated entry strings in cfg.mtprotoBlocklist.
+const blocklist = cfg.mtprotoBlocklist.length > 0 ? createBlocklist(cfg.mtprotoBlocklist) : null;
 const handlers = {
   "http-connect": httpHandlers["http-connect"],
   "http-other": httpHandlers["http-other"],
   "mtproto": cfg.mtprotoSecrets.length > 0 ? createMtprotoHandler(cfg, log, undefined, replayGuard, undefined, profileManager, metrics, userStore) : null,
 };
 
-const server = createMuxServer(handlers);
+const server = createMuxServer(handlers, {
+  isBlocked: blocklist ? (ip) => blocklist.isBlocked(ip) : null,
+  onBlocked: (ip) => log("blocklist_reject", "DF-BLOCK", ip),
+});
 
 // Side-port /metrics server (off when MTPROTO_METRICS_PORT is 0).
 let metricsServer = null;

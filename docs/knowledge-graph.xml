@@ -4,9 +4,9 @@
     <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte. TLS end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.</annotation>
 
     <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="implemented">
-      <purpose>Чтение и валидация конфигурации из env (HTTP + MTProto + anti-DPI + per-user limits + metrics port)</purpose>
+      <purpose>Чтение и валидация конфигурации из env (HTTP + MTProto + anti-DPI + per-user limits + metrics port + blocklist)</purpose>
       <path>src/config.js</path>
-      <depends>none</depends>
+      <depends>M-BLOCKLIST (валидация записей при загрузке)</depends>
       <verification-ref>V-M-CONFIG</verification-ref>
       <annotations>
         <fn-loadConfig PURPOSE="Загрузить и валидировать конфиг из env" />
@@ -68,31 +68,32 @@
     </M-PROXY>
 
     <M-MUX NAME="Mux" TYPE="ENTRY_POINT" STATUS="implemented">
-      <purpose>Протокольный мультиплексор: определение HTTP CONNECT vs MTProto по первым байтам, маршрутизация</purpose>
+      <purpose>Протокольный мультиплексор: определение HTTP CONNECT vs MTProto по первым байтам, маршрутизация; edge-reject блоклиста IP</purpose>
       <path>src/mux.js</path>
-      <depends>none (handlers injected)</depends>
+      <depends>none (handlers injected), M-BLOCKLIST (edge-check)</depends>
       <verification-ref>V-M-MUX</verification-ref>
       <annotations>
-        <fn-createMuxServer PURPOSE="net.Server, читающий первые байты и маршрутизирующий" />
+        <fn-createMuxServer PURPOSE="net.Server, читающий первые байты и маршрутизирующий (+ edge-check блоклиста)" />
         <fn-classifyProtocol PURPOSE="Определить протокол по head" />
       </annotations>
     </M-MUX>
 
     <M-MTPROTO NAME="MTProto" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Obfuscated2 handshake parse/build и DC mapping (IPv4+IPv6, preferIpv6) (чистая логика)</purpose>
+      <purpose>Obfuscated2 handshake parse/build и DC mapping (IPv4+IPv6, preferIpv6, IPv4↔IPv6 fallback-кандидаты) (чистая логика)</purpose>
       <path>src/mtproto.js</path>
       <depends>node:crypto</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
       <annotations>
         <fn-parseClientHandshake PURPOSE="Валидировать 64-байтный handshake клиента по секретам" />
         <fn-buildUpstreamHandshake PURPOSE="Построить handshake к DC (FAST_MODE зеркалирование ключей)" />
-        <fn-getDcAddress PURPOSE="Разрешить dc_idx в адрес DC (IPv4/IPv6 по opts.preferIpv6)" />
+        <fn-getDcAddress PURPOSE="Разрешить dc_idx в одиночный адрес DC (IPv4/IPv6 по opts.preferIpv6)" />
+        <fn-getDcAddressCandidates PURPOSE="Упорядоченный список кандидатов DC (preferred family первым, затем другой) для fallback" />
         <fn-createAesCtr PURPOSE="Stateful AES-256-CTR шифр" />
       </annotations>
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC → relay (FAST_MODE); doppelganger-тайминги, pending-handshake cap, metrics, per-user limits</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (с IPv4↔IPv6 fallback) → relay (FAST_MODE); doppelganger-тайминги, pending-handshake cap, metrics, per-user limits</purpose>
       <path>src/mtproto-server.js</path>
       <depends>M-MTPROTO, M-FAKETLS, M-LOG, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
@@ -171,9 +172,19 @@
       </annotations>
     </M-USER-STORE>
 
+    <M-BLOCKLIST NAME="Blocklist" TYPE="UTILITY" STATUS="implemented">
+      <purpose>Client-IP blocklist (IPv4/IPv6 CIDR + bare IP) — edge reject на mux; family-aware через node:net.BlockList</purpose>
+      <path>src/blocklist.js</path>
+      <depends>node:net</depends>
+      <verification-ref>V-M-BLOCKLIST</verification-ref>
+      <annotations>
+        <fn-createBlocklist PURPOSE="Валидировать записи и построить isBlocked(ip) predicate" />
+      </annotations>
+    </M-BLOCKLIST>
+
     <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
     <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />
-    <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic (candidates + fallback)" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-FAKETLS" relation="uses fake-TLS for ee-secrets" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-TLS-PROFILE" relation="replays captured server-flight profile" />
     <CrossLink from="M-TLS-PROFILE" to="M-FAKETLS" relation="uses genX25519PublicKey/buildAlpnExtension" />
@@ -188,6 +199,8 @@
     <CrossLink from="M-PROXY" to="M-ALLOW" relation="uses allowlist" />
     <CrossLink from="M-PROXY" to="M-AUTH" relation="checks auth" />
     <CrossLink from="M-PROXY" to="M-TUNNEL" relation="opens tunnels" />
+    <CrossLink from="M-MUX" to="M-BLOCKLIST" relation="rejects blocked client IPs at the edge" />
+    <CrossLink from="M-CONFIG" to="M-BLOCKLIST" relation="validates blocklist entries at load" />
     <CrossLink from="M-PROXY" to="M-LOG" relation="logs via formatter" />
     <CrossLink from="M-TUNNEL" to="M-LOG" relation="logs via formatter" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-LOG" relation="logs via formatter" />

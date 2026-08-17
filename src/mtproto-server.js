@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -18,6 +18,7 @@ import {
   parseClientHandshake,
   buildUpstreamHandshake,
   getDcAddress,
+  getDcAddressCandidates,
 } from "./mtproto.js";
 import {
   validateClientHello,
@@ -38,7 +39,7 @@ const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 
 // START_CONTRACT: createMtprotoHandler
 //   PURPOSE: Create the mtproto mux handler; validates handshake, connects to DC, relays
-//   INPUTS: { cfg: Config, log: Log, resolveDc?: (dcIdx, opts) => { host, port } | null,
+//   INPUTS: { cfg: Config, log: Log, resolveDc?: (dcIdx, opts) => Array<{host,port}> | {host,port} | null,
 //             replayGuard?: { admit: (key: Buffer) => boolean } | null,
 //             maskImpl?: (opts) => void - mask splice function (injectable for tests),
 //             profileManager?: { get(): Profile | null } | null - TLS profile capture & replay,
@@ -49,7 +50,7 @@ const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 //   SIDE_EFFECTS: none
 //   LINKS: M-MTPROTO, M-TLS-PROFILE, M-USER-STORE
 // END_CONTRACT: createMtprotoHandler
-export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayGuard = null, maskImpl = maskConnection, profileManager = null, metrics = null, userStore = null) {
+export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidates, replayGuard = null, maskImpl = maskConnection, profileManager = null, metrics = null, userStore = null) {
   let activeConnections = 0;
   let pendingHandshakes = 0; // sockets in handshake phase, before relay is established
 
@@ -123,8 +124,11 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
         socket.destroy();
         return;
       }
-      const dc = resolveDc(parsed.dcIdx, { preferIpv6: cfg.mtprotoPreferIpv6 });
-      if (!dc) {
+      // DC resolution with IPv4↔IPv6 fallback: resolveDc may return a single {host,port}
+      // (legacy/test resolver) or an ordered candidate array (production). Normalise to a list.
+      const resolved = resolveDc(parsed.dcIdx, { preferIpv6: cfg.mtprotoPreferIpv6 });
+      const candidates = Array.isArray(resolved) ? resolved : resolved ? [resolved] : [];
+      if (candidates.length === 0) {
         log("mtproto_bad_dc", "DF-1", socket.remoteAddress, parsed.dcIdx);
         socket.destroy();
         return;
@@ -132,13 +136,15 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
       const up = buildUpstreamHandshake(parsed);
 
       // START_BLOCK_MT_RELAY
-      const upstream = net.connect({ host: dc.host, port: dc.port });
-      upstream.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS, () => {
-        upstream.destroy(new Error("upstream connect timeout"));
-      });
+      // Try each DC candidate in order; fall back to the next on TCP connect failure
+      // (the failed candidate never received the upstream handshake, so reuse is safe).
+      let attempt = 0;
+      let relayDc = null;
+      let relayUpstream = null;
 
-      upstream.once("connect", () => {
-        upstream.setTimeout(0);
+      const startRelay = (dc, upstream) => {
+        relayDc = dc;
+        relayUpstream = upstream;
         pendingHandshakes -= 1; // left handshake phase
         activeConnections += 1;
         syncPending();
@@ -229,14 +235,41 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
         socket.on("close", teardown);
         upstream.on("close", teardown);
         armIdle();
-        // END_BLOCK_MT_RELAY
-      });
+      };
 
-      upstream.once("error", (err) => {
-        log("mtproto_upstream_error", "DF-1", `${dc.host}:${dc.port}`, err.code || err.message);
-        socket.destroy();
-      });
-      socket.once("error", () => upstream.destroy());
+      const tryConnect = () => {
+        const dc = candidates[attempt];
+        const upstream = net.connect({ host: dc.host, port: dc.port });
+        upstream.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS, () => {
+          upstream.destroy(new Error("upstream connect timeout"));
+        });
+        let connected = false;
+
+        upstream.once("connect", () => {
+          connected = true;
+          upstream.setTimeout(0);
+          startRelay(dc, upstream);
+        });
+
+        upstream.once("error", (err) => {
+          if (connected) return; // post-connect error: startRelay's teardown handles it
+          // TCP connect failure on this candidate — try the next one.
+          attempt += 1;
+          if (attempt < candidates.length) {
+            log("mtproto_dc_fallback", "DF-1", socket.remoteAddress, {
+              failed: `${dc.host}:${dc.port}`,
+              next: `${candidates[attempt].host}:${candidates[attempt].port}`,
+            });
+            tryConnect();
+          } else {
+            log("mtproto_upstream_error", "DF-1", `${dc.host}:${dc.port}`, err.code || err.message);
+            socket.destroy();
+          }
+        });
+      };
+      tryConnect();
+      socket.once("error", () => relayUpstream && relayUpstream.destroy());
+      // END_BLOCK_MT_RELAY
     };
 
     const complete = () => {

@@ -1,9 +1,9 @@
 // FILE: src/config.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
-//   DEPENDS: none
+//   DEPENDS: M-BLOCKLIST
 //   LINKS: M-CONFIG
 //   ROLE: RUNTIME
 //   MAP_MODE: EXPORTS
@@ -12,6 +12,8 @@
 // START_MODULE_MAP
 //   loadConfig - load and validate config from env
 // END_MODULE_MAP
+
+import { createBlocklist } from "./blocklist.js";
 
 // START_BLOCK_ALLOW_RULES
 // Telegram Bot API endpoints and subdomains. Port is always 443.
@@ -203,6 +205,23 @@ export function loadConfig(env = process.env) {
       ? env.MTPROTO_METRICS_HOST.trim()
       : "0.0.0.0";
 
+  // --- Client-IP blocklist (edge reject). Comma-separated CIDRs or bare IPs (IPv4/IPv6).
+  // Validated eagerly via createBlocklist so an invalid entry fails at load (INVALID_ENV).
+  // We store the raw validated strings (not the runtime object) so hot-reload deep-equality
+  // works and index.js owns runtime-object construction (same pattern as replay/profile/metrics).
+  let mtprotoBlocklist = [];
+  if (env.MTPROTO_BLOCKLIST && env.MTPROTO_BLOCKLIST.trim() !== "") {
+    const entries = env.MTPROTO_BLOCKLIST.split(",").map((s) => s.trim()).filter((s) => s !== "");
+    if (entries.length > 0) {
+      try {
+        createBlocklist(entries); // validate (throws on bad entry)
+      } catch (err) {
+        throw new Error(err.message);
+      }
+      mtprotoBlocklist = entries;
+    }
+  }
+
   return {
     port,
     host: "0.0.0.0",
@@ -234,6 +253,7 @@ export function loadConfig(env = process.env) {
     mtprotoDoppelgangerMaxDelayMs,
     mtprotoMetricsPort,
     mtprotoMetricsHost,
+    mtprotoBlocklist,
   };
 }
 

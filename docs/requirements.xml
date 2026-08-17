@@ -1,7 +1,7 @@
 <RequirementsAnalysis VERSION="0.2.0">
   <Project>
     <name>SimpleProxy</name>
-    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей) для обхода блокировки из РФ. Fake-TLS усилен anti-DPI: traffic-masking (passthrough на mask_host), reject_handshake, replay-защита, ALPN, IPv6 DC, TLS-profile capture &amp; replay, doppelganger timing. Наблюдаемость: Prometheus /metrics side-port + SIGUSR2 hot-reload. Multi-tenant: per-user секреты с лимитами/сроками/квотами. Развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск). TLS end-to-end, токены ботов прокси не видит.</annotation>
+    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей) для обхода блокировки из РФ. Fake-TLS усилен anti-DPI: traffic-masking (passthrough на mask_host), reject_handshake, replay-защита, ALPN, IPv6 DC, TLS-profile capture &amp; replay, doppelganger timing. Наблюдаемость: Prometheus /metrics side-port + SIGUSR2 hot-reload. Multi-tenant: per-user секреты с лимитами/сроками/квотами. IPv4↔IPv6 DC fallback + client-IP blocklist (этап 3). Развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск). TLS end-to-end, токены ботов прокси не видит.</annotation>
     <keywords>telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel, mtproto, faketls, anti-dpi, masking</keywords>
   </Project>
 
@@ -148,6 +148,24 @@
       <Priority>medium</Priority>
       <RelatedFlows>DF-USER</RelatedFlows>
     </UC-015>
+    <UC-016>
+      <Actor>TelegramClient</Actor>
+      <Action>Подключается к DC, у которого недоступна предпочитаемая адресная семья (IPv4 или IPv6)</Action>
+      <Goal>IPv4↔IPv6 fallback: при TCP connect-failure прокси пробует следующего DC-кандидата (другая семья)</Goal>
+      <Preconditions>resolveDc возвращает массив кандидатов (production — getDcAddressCandidates)</Preconditions>
+      <AcceptanceCriteria>первый кандидат недоступен → лог [proxy][mtproto_dc_fallback], relay через второй; все исчерпаны → destroy + mtproto_upstream_error</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-DC-FALLBACK</RelatedFlows>
+    </UC-016>
+    <UC-017>
+      <Actor>Operator</Actor>
+      <Action>Задаёт MTPROTO_BLOCKLIST (CIDR/голые IP, IPv4/IPv6) для отсечения сканеров/нежелательных клиентов</Action>
+      <Goal>Edge-reject: заблокированный IP получает silent destroy на mux, handler не вызывается</Goal>
+      <Preconditions>MTPROTO_BLOCKLIST содержит валидные записи</Preconditions>
+      <AcceptanceCriteria>подключение с заблокированного IP → destroy без байт + лог [proxy][blocklist_reject]; невалидная запись → INVALID_ENV при старте</AcceptanceCriteria>
+      <Priority>low</Priority>
+      <RelatedFlows>DF-BLOCK</RelatedFlows>
+    </UC-017>
   </UseCases>
 
   <NonGoals>

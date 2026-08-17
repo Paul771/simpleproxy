@@ -13,7 +13,7 @@
           <param name="env" type="Record<string, string|undefined>" />
         </inputs>
         <outputs>
-          <param name="Config" type="{ port, host, maxTunnels, idleTimeoutMs, authUser?, authPass?, rules }" />
+          <param name="Config" type="{ port, host, maxTunnels, idleTimeoutMs, authUser?, authPass?, rules, mtproto*, mtprotoBlocklist }" />
         </outputs>
         <errors>
           <error code="INVALID_ENV" />
@@ -21,8 +21,9 @@
       </contract>
       <interface>
         <export-loadConfig PURPOSE="Загрузить и валидировать конфиг из env" />
+        <export-applyConfigUpdate PURPOSE="Слить новый конфиг в live-объект (hot-reload, без port/host)" />
       </interface>
-      <depends>none</depends>
+      <depends>M-BLOCKLIST (валидация записей при загрузке)</depends>
       <target>
         <source>src/config.js</source>
         <tests>tests/config.test.js</tests>
@@ -206,9 +207,10 @@
 
     <M-MUX NAME="Mux" TYPE="ENTRY_POINT" LAYER="2" ORDER="2" STATUS="implemented">
       <contract>
-        <purpose>Протокольный мультиплексор на одном порту: HTTP CONNECT vs MTProto по первым байтам</purpose>
+        <purpose>Протокольный мультиплексор на одном порту: HTTP CONNECT vs MTProto по первым байтам; edge-reject блоклиста IP</purpose>
         <inputs>
           <param name="handlers" type="{ http-connect, http-other, mtproto }" />
+          <param name="opts" type="{ isBlocked?, onBlocked? }" />
         </inputs>
         <outputs>
           <param name="net.Server" type="Сервер с маршрутизацией" />
@@ -218,21 +220,21 @@
         </errors>
       </contract>
       <interface>
-        <export-createMuxServer PURPOSE="net.Server: peek первых байт, маршрутизация" />
+        <export-createMuxServer PURPOSE="net.Server: edge-check блоклиста + peek первых байт, маршрутизация" />
         <export-classifyProtocol PURPOSE="Определить протокол по head" />
       </interface>
-      <depends>none (handlers injected)</depends>
+      <depends>none (handlers injected), M-BLOCKLIST (edge-check)</depends>
       <target>
         <source>src/mux.js</source>
         <tests>tests/mux.test.js</tests>
       </target>
       <observability>
         <log-prefix>[mux]</log-prefix>
-        <critical-block>BLOCK_PEEK</critical-block>
+        <critical-block>BLOCK_PEEK / BLOCK_EDGE_CHECK</critical-block>
       </observability>
       <verification-ref>V-M-MUX</verification-ref>
       <notes>
-        <note-1>Пик 8 байт; 'CONNECT ' → http-connect, HTTP-методы → http-other, иначе mtproto. Head передаётся обработчику.</note-1>
+        <note-1>Пик 8 байт; 'CONNECT ' → http-connect, HTTP-методы → http-other, иначе mtproto. Head передаётся обработчику. Заблокированный IP → silent destroy до peek (лог [proxy][blocklist_reject]).</note-1>
       </notes>
     </M-MUX>
 
@@ -257,7 +259,8 @@
       <interface>
         <export-parseClientHandshake PURPOSE="Валидировать handshake по секретам" />
         <export-buildUpstreamHandshake PURPOSE="Построить upstream handshake (FAST_MODE зеркалирование)" />
-        <export-getDcAddress PURPOSE="dc_idx → адрес DC" />
+        <export-getDcAddress PURPOSE="dc_idx → одиночный адрес DC (IPv4/IPv6)" />
+        <export-getDcAddressCandidates PURPOSE="dc_idx → упорядоченный список кандидатов (preferred family первым) для fallback" />
         <export-createAesCtr PURPOSE="Stateful AES-256-CTR" />
       </interface>
       <depends>node:crypto</depends>
@@ -277,11 +280,11 @@
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" LAYER="2" ORDER="3" STATUS="implemented">
       <contract>
-        <purpose>MTProto-обработчик соединений: handshake → подключение к DC → relay (FAST_MODE)</purpose>
+        <purpose>MTProto-обработчик соединений: handshake → подключение к DC (IPv4↔IPv6 fallback) → relay (FAST_MODE)</purpose>
         <inputs>
           <param name="cfg" type="Config" />
           <param name="log" type="Log" />
-          <param name="resolveDc" type="(dcIdx) => { host, port } | null" />
+          <param name="resolveDc" type="(dcIdx, opts) => Array<{host,port}> | {host,port} | null" />
         </inputs>
         <outputs>
           <param name="(socket, head) => void" type="Обработчик для mux" />
@@ -293,7 +296,7 @@
       <interface>
         <export-createMtprotoHandler PURPOSE="Создать mtproto-обработчик для mux" />
       </interface>
-      <depends>M-MTPROTO, M-LOG</depends>
+      <depends>M-MTPROTO, M-LOG, M-FAKETLS, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
       <target>
         <source>src/mtproto-server.js</source>
         <tests>tests/mtproto.e2e.test.js</tests>
@@ -304,7 +307,7 @@
       </observability>
       <verification-ref>V-M-MTPROTO</verification-ref>
       <notes>
-        <note-1>FAST_MODE: клиент→DC перешифровка (decrypt клиента → encrypt upstream); DC→клиент байт-в-байт.</note-1>
+        <note-1>FAST_MODE: клиент→DC перешифровка (decrypt клиента → encrypt upstream); DC→клиент байт-в-байт. resolveDc может вернуть массив кандидатов — TCP connect-failure → следующий кандидат (лог mtproto_dc_fallback); одиночный {host,port} нормализуется (обр. совместимость).</note-1>
       </notes>
     </M-MTPROTO-SERVER>
 
@@ -505,6 +508,38 @@
         <note-1>MTPROTO_SECRET парсится как user:secret (bare → "default"). MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS — JSON-карты. admit без лимитов всегда true (обр. совместимость).</note-1>
       </notes>
     </M-USER-STORE>
+
+    <M-BLOCKLIST NAME="Blocklist" TYPE="UTILITY" LAYER="0" ORDER="10" STATUS="implemented">
+      <contract>
+        <purpose>Client-IP blocklist (IPv4/IPv6 CIDR + bare IP): edge-reject заблокированных клиентов на mux</purpose>
+        <inputs>
+          <param name="entries" type="string[] - CIDR или голый IP" />
+          <param name="ip" type="string|null|undefined" />
+        </inputs>
+        <outputs>
+          <param name="boolean" type="isBlocked(ip)" />
+        </outputs>
+        <errors>
+          <error code="INVALID_ENV" />
+        </errors>
+      </contract>
+      <interface>
+        <export-createBlocklist PURPOSE="Валидировать записи и построить isBlocked(ip) predicate" />
+      </interface>
+      <depends>node:net (BlockList, family-aware)</depends>
+      <target>
+        <source>src/blocklist.js</source>
+        <tests>tests/blocklist.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[blocklist]</log-prefix>
+        <critical-block>BLOCK_RULES</critical-block>
+      </observability>
+      <verification-ref>V-M-BLOCKLIST</verification-ref>
+      <notes>
+        <note-1>node:net.BlockList.check требует family для IPv6 — per-family BlockList, family передаётся явно на add/check. ::ffff: (v4-mapped) нормализуется. config хранит валидированные строки (reload-friendly), runtime-объект строит index.js.</note-1>
+      </notes>
+    </M-BLOCKLIST>
   </Modules>
 
   <DataFlow>
@@ -560,6 +595,17 @@
       <step-3>на relay: addBytes(user, len) на каждый chunk; на close: release(user)</step-3>
       <evidence>[proxy][mtproto_user_reject][DF-4]; per-user snapshot доступен через metrics/тесты</evidence>
     </DF-USER>
+    <DF-BLOCK NAME="BlocklistEdge" TRIGGER="TCP-соединение от IP, попавшего в MTPROTO_BLOCKLIST">
+      <step-1>mux: isBlocked(remoteAddress) → true</step-1>
+      <step-2>лог [proxy][blocklist_reject] + silent destroy (handler не вызывается, байты не пишутся)</step-2>
+      <evidence>[proxy][blocklist_reject][DF-BLOCK]; e2e: blocked → close без данных, handler не достигнут</evidence>
+    </DF-BLOCK>
+    <DF-DC-FALLBACK NAME="DcAddressFallback" TRIGGER="TCP connect к первому DC-кандидату завершился ошибкой">
+      <step-1>resolveDc(dcIdx, {preferIpv6}) → массив кандидатов (preferred family первым)</step-1>
+      <step-2>net.connect к candidates[0]; connect-failure → лог [proxy][mtproto_dc_fallback] + candidates[1]</step-2>
+      <step-3>все кандидаты исчерпаны → destroy + лог [proxy][mtproto_upstream_error]</step-3>
+      <evidence>[proxy][mtproto_dc_fallback][DF-1]; e2e: dead-первый-кандидат → round-trip через второй</evidence>
+    </DF-DC-FALLBACK>
   </DataFlow>
 
   <ImplementationOrder>
@@ -618,6 +664,15 @@
       <step-7 module="M-MTPROTO-SERVER" status="done" verification="V-M-USER-STORE">wired userStore: admit на handshake, addBytes на relay, release на close</step-7>
       <step-8 module="M-INDEX" status="done" verification="V-M-METRICS">README + финальные GRACE-доки (knowledge-graph/requirements/verification)</step-8>
     </Phase-7>
+    <Phase-8 name="Stage3Optional" status="done">
+      <goal>Этап 3 (по выбору): IPv4↔IPv6 fallback DC + client-IP blocklist. SOCKS5/Middle-End upstream — осознанно вне v1 (план).</goal>
+      <step-1 module="M-MTPROTO" status="done" verification="V-M-MTPROTO">getDcAddressCandidates (упорядоченный список V4/V6 по preferIpv6) + tests/dc-fallback.test.js</step-1>
+      <step-2 module="M-MTPROTO-SERVER" status="done" verification="V-M-MTPROTO">fallback-цикл: TCP connect-failure → следующий кандидат; single-address resolver нормализуется (обр. совместимость); e2e fallback тест</step-2>
+      <step-3 module="M-BLOCKLIST" status="done" verification="V-M-BLOCKLIST">src/blocklist.js + tests/blocklist.test.js (CIDR/bare IP, IPv4/IPv6, ::ffff: нормализация, INVALID_ENV)</step-3>
+      <step-4 module="M-CONFIG" status="done" verification="V-M-CONFIG">MTPROTO_BLOCKLIST (валидированные строки, reload-friendly)</step-4>
+      <step-5 module="M-MUX" status="done" verification="V-M-MUX">edge-check блоклиста (opts.isBlocked/onBlocked) + e2e reject тесты</step-5>
+      <step-6 module="M-INDEX" status="done" verification="V-M-BLOCKLIST">README + финальные GRACE-доки (knowledge-graph/requirements/verification)</step-6>
+    </Phase-8>
   </ImplementationOrder>
 
   <ExecutionPolicy>

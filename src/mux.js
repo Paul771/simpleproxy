@@ -1,5 +1,5 @@
 // FILE: src/mux.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Protocol multiplexer: single net.Server routes connections to HTTP CONNECT or MTProto handlers
 //   SCOPE: peek first bytes, classify protocol, hand off with buffered head
@@ -49,13 +49,23 @@ export function classifyProtocol(head) {
 // START_CONTRACT: createMuxServer
 //   PURPOSE: Create a net.Server that reads the first bytes and routes to protocol handlers
 //   INPUTS: { handlers: { "http-connect": (socket, head) => void, "http-other": (socket, head) => void,
-//                         "mtproto": (socket, head) => void } }
+//                         "mtproto": (socket, head) => void },
+//             opts?: { isBlocked?: (ip: string) => boolean, onBlocked?: (ip: string) => void } }
 //   OUTPUTS: { net.Server }
-//   SIDE_EFFECTS: registers 'connection' listener
-//   LINKS: M-MUX
+//   SIDE_EFFECTS: registers 'connection' listener; rejects blocked client IPs at the edge
+//   LINKS: M-MUX, M-BLOCKLIST
 // END_CONTRACT: createMuxServer
-export function createMuxServer(handlers) {
+export function createMuxServer(handlers, { isBlocked = null, onBlocked = null } = {}) {
   const server = net.createServer((socket) => {
+    // START_BLOCK_EDGE_CHECK
+    // Optional client-IP blocklist: reject before peeking, so a blocked scanner never reaches
+    // a handler (no TLS handshake, no masking — immediate silent close).
+    if (isBlocked && socket.remoteAddress && isBlocked(socket.remoteAddress)) {
+      if (onBlocked) onBlocked(socket.remoteAddress);
+      socket.destroy();
+      return;
+    }
+    // END_BLOCK_EDGE_CHECK
     // START_BLOCK_PEEK
     let head = Buffer.alloc(0);
     let routed = false;

@@ -695,3 +695,56 @@ test("e2e: pending-handshake cap rejects slowloris connections", async () => {
     fakeDc.close();
   }
 });
+
+test("e2e: DC fallback — first candidate unreachable, second candidate serves the relay", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+
+  // A dead port: listen, grab the port, close -> connect will be refused fast.
+  const dead = net.createServer();
+  await new Promise((r) => dead.listen(0, "127.0.0.1", r));
+  const deadPort = dead.address().port;
+  await new Promise((r) => dead.close(r));
+
+  // Ordered candidates: dead first, real fake-DC second -> proxy must fall back.
+  const { server, addr } = await startProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    () => [
+      { host: "127.0.0.1", port: deadPort },
+      { host: "127.0.0.1", port: dcAddr.port },
+    ]
+  );
+
+  try {
+    const { handshake, stream, encKey, encIv } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const payload = "fallback-echo";
+    const sent = stream.encrypt(Buffer.from(payload));
+    const clientDec = createAesCtr(encKey, encIv);
+
+    const result = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(Buffer.concat([handshake, sent]));
+      });
+      let buf = Buffer.alloc(0);
+      const timer = setTimeout(() => reject(new Error(`timeout, got: ${buf.toString("hex")}`)), 4000);
+      socket.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (buf.length >= payload.length) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(clientDec.decrypt(buf).toString());
+        }
+      });
+      socket.on("error", reject);
+    });
+
+    // Reaching the echo proves the proxy fell back from the dead candidate to the live one.
+    assert.equal(result, payload);
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});

@@ -1,6 +1,6 @@
 {
   "name": "simpleproxy",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Forward HTTP CONNECT proxy + MTProto proxy for Telegram (api.telegram.org) with anti-DPI fake-TLS masking, zero dependencies",
   "type": "module",
   "main": "src/index.js",

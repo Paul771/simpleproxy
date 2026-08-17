@@ -349,6 +349,43 @@
         <marker-2>[proxy][reload_fail][DF-RELOAD]</marker-2>
       </required-log-markers>
     </V-M-RELOAD>
+
+    <V-M-BLOCKLIST MODULE="M-BLOCKLIST" PRIORITY="medium">
+      <test-files>
+        <file>tests/blocklist.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/blocklist.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">bare IPv4/IPv6 exact match; CIDR диапазоны для обеих семейств.</scenario-1>
+        <scenario-2 kind="success">::ffff: (IPv4-mapped) нормализуется → v4-правило матчит.</scenario-2>
+        <scenario-3 kind="success">пустой/null/undefined ip → не заблокирован; пустой блоклист ничего не блокирует.</scenario-3>
+        <scenario-4 kind="failure">невалидная запись / prefix за пределами семейства → INVALID_ENV (в т.ч. через loadConfig).</scenario-4>
+        <scenario-5 kind="success">e2e: blocked IP → mux destroy без байт, handler не достигнут; non-blocked → handler отвечает 200.</scenario-5>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][blocklist_reject][DF-BLOCK]</marker-1>
+      </required-log-markers>
+    </V-M-BLOCKLIST>
+
+    <V-M-DC-FALLBACK MODULE="M-MTPROTO" PRIORITY="medium">
+      <test-files>
+        <file>tests/dc-fallback.test.js</file>
+        <file>tests/mtproto.e2e.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/dc-fallback.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">getDcAddressCandidates: preferIpv6=false → [V4, V6]; true → [V6, V4]; invalid idx → [].</scenario-1>
+        <scenario-2 kind="success">getDcAddress (single) обратно совместим.</scenario-2>
+        <scenario-3 kind="success">e2e: первый кандидат dead-порт, второй fake-DC → round-trip проходит (fallback сработал).</scenario-3>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][mtproto_dc_fallback][DF-1]</marker-1>
+      </required-log-markers>
+    </V-M-DC-FALLBACK>
   </ModuleVerification>
 
   <PhaseGates>
@@ -426,6 +463,18 @@
         <evidence-3>(POSIX) kill -USR2 → лог [proxy][reload]; (Windows) restart через панель.</evidence-3>
       </required-evidence>
     </Gate-Phase-7>
+    <Gate-Phase-8 PHASE="Phase-8">
+      <goal>Этап 3: IPv4↔IPv6 DC fallback + client-IP blocklist; все тесты зелёные. SOCKS5/Middle-End — вне v1.</goal>
+      <commands>
+        <command-1>node --test</command-1>
+        <command-2>MTPROTO_SECRET=... MTPROTO_BLOCKLIST="10.0.0.0/8" PORT=8080 node src/index.js (smoke)</command-2>
+      </commands>
+      <required-evidence>
+        <evidence-1>127 тестов проходят (включая dc-fallback + blocklist).</evidence-1>
+        <evidence-2>e2e: dead первый DC-кандидат → relay через второй (лог mtproto_dc_fallback).</evidence-2>
+        <evidence-3>e2e: заблокированный IP → destroy без данных + лог blocklist_reject.</evidence-3>
+      </required-evidence>
+    </Gate-Phase-8>
   </PhaseGates>
 
   <FailurePackets>

@@ -1,10 +1,10 @@
 # GRACE Framework - Project Engineering Protocol
 
 ## Keywords
-telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel, mtproto, faketls, anti-dpi, masking, prometheus, metrics, hot-reload, sigusr2, multi-tenant, per-user
+telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel, mtproto, faketls, anti-dpi, masking, prometheus, metrics, hot-reload, sigusr2, multi-tenant, per-user, ipv6, fallback, blocklist
 
 ## Annotation
-Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск) для обхода блокировки api.telegram.org из РФ. Fake-TLS усилен anti-DPI по мотивам telemt: traffic-masking (passthrough на mask_host при unknown SNI/неверном секрете), reject_handshake (TLS alert), replay-защита (LRU+TTL по digest), ALPN в ServerHello, IPv6 DC, TLS profile capture & replay (захват структуры server-flight fronted-домена), doppelganger timing replay. Наблюдаемость: Prometheus /metrics side-port (M-METRICS) + SIGUSR2 hot-reload конфига (M-CONFIG.applyConfigUpdate). Multi-tenant: per-user секреты (M-USER-STORE) с лимитами одновременных соединений, сроками действия и байтовыми квотами. TLS идёт end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.
+Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск) для обхода блокировки api.telegram.org из РФ. Fake-TLS усилен anti-DPI по мотивам telemt: traffic-masking (passthrough на mask_host при unknown SNI/неверном секрете), reject_handshake (TLS alert), replay-защита (LRU+TTL по digest), ALPN в ServerHello, IPv6 DC, TLS profile capture & replay (захват структуры server-flight fronted-домена), doppelganger timing replay. Наблюдаемость: Prometheus /metrics side-port (M-METRICS) + SIGUSR2 hot-reload конфига (M-CONFIG.applyConfigUpdate). Multi-tenant: per-user секреты (M-USER-STORE) с лимитами одновременных соединений, сроками действия и байтовыми квотами. IPv4↔IPv6 DC fallback (M-MTPROTO.getDcAddressCandidates) + client-IP blocklist (M-BLOCKLIST, edge-reject на mux). TLS идёт end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.
 
 ## Core Principles
 
