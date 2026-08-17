@@ -440,6 +440,71 @@
         <note-1>Raw net.connect (не node:tls) — размеры записей видны. Профиль ~1KB, refresh 10 мин, off по умолчанию, failure → null → синтетический fallback.</note-1>
       </notes>
     </M-TLS-PROFILE>
+
+    <M-METRICS NAME="Metrics" TYPE="UTILITY" LAYER="0" ORDER="8" STATUS="implemented">
+      <contract>
+        <purpose>Prometheus text-exposition реестр (counter/gauge) + side-port /metrics HTTP-сервер (ноль зависимостей)</purpose>
+        <inputs>
+          <param name="none" type="void" />
+          <param name="opts" type="{ port, host }" />
+        </inputs>
+        <outputs>
+          <param name="Metrics" type="{ inc, set, get, render }" />
+          <param name="net.Server" type="startMetricsServer (GET /metrics)" />
+        </outputs>
+        <errors><error code="none" /></errors>
+      </contract>
+      <interface>
+        <export-createMetrics PURPOSE="Counter/gauge реестр с render()" />
+        <export-startMetricsServer PURPOSE="Tiny HTTP-сервер, отдающий /metrics" />
+      </interface>
+      <depends>node:net</depends>
+      <target>
+        <source>src/metrics.js</source>
+        <tests>tests/metrics.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[metrics]</log-prefix>
+        <critical-block>BLOCK_METRIC_DEFS</critical-block>
+      </observability>
+      <verification-ref>V-M-METRICS</verification-ref>
+      <notes>
+        <note-1>Off по умолчанию (MTPROTO_METRICS_PORT=0). Только предопределённые имена метрик; inc/set на unknown name = no-op. Текст exposition v0.0.4.</note-1>
+      </notes>
+    </M-METRICS>
+
+    <M-USER-STORE NAME="UserStore" TYPE="CORE_LOGIC" LAYER="1" ORDER="9" STATUS="implemented">
+      <contract>
+        <purpose>Per-user secret management: resolve-by-secret, concurrent-conn cap, expiry, byte-quota (multi-tenant)</purpose>
+        <inputs>
+          <param name="users" type="Array<{ user, secretHex, maxConns, expiresAt, byteQuota }>" />
+          <param name="hex" type="string" />
+          <param name="user" type="User" />
+          <param name="n" type="number" />
+        </inputs>
+        <outputs>
+          <param name="User | null" type="resolve" />
+          <param name="boolean" type="admit / addBytes" />
+        </outputs>
+        <errors><error code="none" /></errors>
+      </contract>
+      <interface>
+        <export-createUserStore PURPOSE="Stateful admit/release/addBytes guard" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>src/user-store.js</source>
+        <tests>tests/user-store.test.js</tests>
+      </target>
+      <observability>
+        <log-prefix>[user]</log-prefix>
+        <critical-block>BLOCK_STORE</critical-block>
+      </observability>
+      <verification-ref>V-M-USER-STORE</verification-ref>
+      <notes>
+        <note-1>MTPROTO_SECRET парсится как user:secret (bare → "default"). MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS — JSON-карты. admit без лимитов всегда true (обр. совместимость).</note-1>
+      </notes>
+    </M-USER-STORE>
   </Modules>
 
   <DataFlow>
@@ -477,6 +542,24 @@
       <step-4>action=drop → socket.destroy (legacy)</step-4>
       <evidence>[proxy][faketls_auth_fail], [proxy][faketls_unknown_sni], [proxy][faketls_replay], [proxy][mask_connect], [proxy][mask_close]</evidence>
     </DF-MASK>
+    <DF-METRICS NAME="MetricsScrape" TRIGGER="Prometheus scraper стучит на MTPROTO_METRICS_PORT /metrics">
+      <step-1>metrics server: parse HTTP request line</step-1>
+      <step-2>GET /metrics → 200 text/plain; version=0.0.4 + render() реестра (counters/gauges)</step-2>
+      <step-3>иначе → 404</step-3>
+      <evidence>[proxy][metrics_listen]; HTTP-ответ содержит # TYPE/HELP + значения счётчиков</evidence>
+    </DF-METRICS>
+    <DF-RELOAD NAME="ConfigHotReload" TRIGGER="Сигнал SIGUSR2 процессу (POSIX); на Windows — no-op">
+      <step-1>loadConfig() → при INVALID_ENV лог [proxy][reload_fail], старый конфиг сохраняется</step-1>
+      <step-2>applyConfigUpdate(cfg, next): in-place мутация всех полей кроме port/host; handlers читают cfg.* fresh → секреты/маска/caps применяются сразу</step-2>
+      <step-3>поля boot-time state (replay guard, profile manager, metrics server, listen port) → flagged restart_needed</step-3>
+      <evidence>[proxy][reload] { changed, fields, restart_needed }</evidence>
+    </DF-RELOAD>
+    <DF-USER NAME="PerUserLimits" TRIGGER="MTProto handshake с валидным секретом, сопоставленным user-записи">
+      <step-1>userStore.resolve(secretHex) → User</step-1>
+      <step-2>admit: expired / over byteQuota / over maxConns → false → destroy + лог [proxy][mtproto_user_reject]</step-2>
+      <step-3>на relay: addBytes(user, len) на каждый chunk; на close: release(user)</step-3>
+      <evidence>[proxy][mtproto_user_reject][DF-4]; per-user snapshot доступен через metrics/тесты</evidence>
+    </DF-USER>
   </DataFlow>
 
   <ImplementationOrder>
@@ -524,6 +607,17 @@
       <step-4 module="M-CONFIG" status="done" verification="V-M-CONFIG">MTPROTO_TLS_PROFILE_CAPTURE/REFRESH_MS/TIMEOUT_MS</step-4>
       <step-5 module="M-TLS-PROFILE" status="done" verification="V-M-TLS-PROFILE">README + финальные GRACE-доки (knowledge-graph/requirements/verification)</step-5>
     </Phase-6>
+    <Phase-7 name="ObservabilityAndMultiTenant" status="done">
+      <goal>Наблюдаемость и операционка: Prometheus-метрики, hot-reload конфига (SIGUSR2), per-user секреты с лимитами/сроками/квотами</goal>
+      <step-1 module="M-METRICS" status="done" verification="V-M-METRICS">src/metrics.js + tests/metrics.test.js (counter/gauge/render + /metrics server)</step-1>
+      <step-2 module="M-PROXY" status="done" verification="V-M-PROXY">metrics?.inc/set в createConnectHandler; openTunnel bytes in/out</step-2>
+      <step-3 module="M-MTPROTO-SERVER" status="done" verification="V-M-MTPROTO">metrics в mtproto handler (conn/pending/bytes/replay/mask caps)</step-3>
+      <step-4 module="M-CONFIG" status="done" verification="V-M-CONFIG">MTPROTO_METRICS_PORT/HOST; applyConfigUpdate (hot-reload, SIGUSR2)</step-4>
+      <step-5 module="M-USER-STORE" status="done" verification="V-M-USER-STORE">src/user-store.js + tests/user-store.test.js (resolve/admit/release/addBytes)</step-5>
+      <step-6 module="M-CONFIG" status="done" verification="V-M-CONFIG">MTPROTO_SECRET=user:secret, MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS (JSON)</step-6>
+      <step-7 module="M-MTPROTO-SERVER" status="done" verification="V-M-USER-STORE">wired userStore: admit на handshake, addBytes на relay, release на close</step-7>
+      <step-8 module="M-INDEX" status="done" verification="V-M-METRICS">README + финальные GRACE-доки (knowledge-graph/requirements/verification)</step-8>
+    </Phase-7>
   </ImplementationOrder>
 
   <ExecutionPolicy>

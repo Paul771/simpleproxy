@@ -1,7 +1,7 @@
 <RequirementsAnalysis VERSION="0.2.0">
   <Project>
     <name>SimpleProxy</name>
-    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей) для обхода блокировки из РФ. Fake-TLS усилен anti-DPI: traffic-masking (passthrough на mask_host), reject_handshake, replay-защита, ALPN, IPv6 DC. Развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск). TLS end-to-end, токены ботов прокси не видит.</annotation>
+    <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) + MTProto-прокси (obfuscated2: simple/dd/ee fake-TLS) на Node.js (ноль внешних зависимостей) для обхода блокировки из РФ. Fake-TLS усилен anti-DPI: traffic-masking (passthrough на mask_host), reject_handshake, replay-защита, ALPN, IPv6 DC, TLS-profile capture &amp; replay, doppelganger timing. Наблюдаемость: Prometheus /metrics side-port + SIGUSR2 hot-reload. Multi-tenant: per-user секреты с лимитами/сроками/квотами. Развёртывается на бесплатном хостинге Wispbyte (1 vCPU 35%, 512MB RAM, 1GB диск). TLS end-to-end, токены ботов прокси не видит.</annotation>
     <keywords>telegram, proxy, connect, nodejs, bot-api, wispbyte, tunnel, mtproto, faketls, anti-dpi, masking</keywords>
   </Project>
 
@@ -121,6 +121,33 @@
       <Priority>medium</Priority>
       <RelatedFlows>DF-4</RelatedFlows>
     </UC-012>
+    <UC-013>
+      <Actor>Operator</Actor>
+      <Action>Скрапит /metrics на side-порту (MTPROTO_METRICS_PORT) для мониторинга нагрузки и сканирования</Action>
+      <Goal>Prometheus text exposition: счётчики соединений/байт/replay/mask, gauges active/pending</Goal>
+      <Preconditions>MTPROTO_METRICS_PORT &gt; 0</Preconditions>
+      <AcceptanceCriteria>GET /metrics → 200 text/plain; version=0.0.4 со всеми метриками; не-/metrics → 404; off при port=0</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-METRICS</RelatedFlows>
+    </UC-013>
+    <UC-014>
+      <Actor>Operator</Actor>
+      <Action>Шлёт SIGUSR2 для горячей смены секрета/маски/лимита без рестарта</Action>
+      <Goal>Конфиг перечитывается из env и применяется in-place; слушающий порт и boot-time подсистемы не перезапускаются</Goal>
+      <Preconditions>POSIX-хост (Windows SIGUSR2 не доставляется)</Preconditions>
+      <AcceptanceCriteria>лог [proxy][reload] со списком changed-полей; INVALID_ENV → [proxy][reload_fail] + старый конфиг; port/host не меняются</AcceptanceCriteria>
+      <Priority>low</Priority>
+      <RelatedFlows>DF-RELOAD</RelatedFlows>
+    </UC-014>
+    <UC-015>
+      <Actor>Operator</Actor>
+      <Action>Раздаёт прокси нескольким пользователям: MTPROTO_SECRET=user:secret + лимиты/сроки/квоты</Action>
+      <Goal>Per-user: cap одновременных соединений, expiry-срок секрета, cumulative byte-quota</Goal>
+      <Preconditions>MTPROTO_SECRET в формате user:secret; MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS — JSON-карты</Preconditions>
+      <AcceptanceCriteria>истёкший/превышивший лимит пользователь → destroy + лог [proxy][mtproto_user_reject]; без лимитов → обр. совместимость</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-USER</RelatedFlows>
+    </UC-015>
   </UseCases>
 
   <NonGoals>

@@ -4,12 +4,13 @@
     <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte. TLS end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.</annotation>
 
     <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="implemented">
-      <purpose>Чтение и валидация конфигурации из env (HTTP + MTProto + anti-DPI: mask/replay/ALPN/IPv6)</purpose>
+      <purpose>Чтение и валидация конфигурации из env (HTTP + MTProto + anti-DPI + per-user limits + metrics port)</purpose>
       <path>src/config.js</path>
       <depends>none</depends>
       <verification-ref>V-M-CONFIG</verification-ref>
       <annotations>
         <fn-loadConfig PURPOSE="Загрузить и валидировать конфиг из env" />
+        <fn-applyConfigUpdate PURPOSE="Слить новый конфиг в live-объект (hot-reload, без port/host)" />
       </annotations>
     </M-CONFIG>
 
@@ -91,9 +92,9 @@
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC → relay (FAST_MODE); doppelganger-тайминги, pending-handshake cap</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC → relay (FAST_MODE); doppelganger-тайминги, pending-handshake cap, metrics, per-user limits</purpose>
       <path>src/mtproto-server.js</path>
-      <depends>M-MTPROTO, M-FAKETLS, M-LOG</depends>
+      <depends>M-MTPROTO, M-FAKETLS, M-LOG, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
       <annotations>
         <fn-createMtprotoHandler PURPOSE="Создать mtproto-обработчик для mux" />
@@ -149,6 +150,27 @@
       </annotations>
     </M-TLS-PROFILE>
 
+    <M-METRICS NAME="Metrics" TYPE="UTILITY" STATUS="implemented">
+      <purpose>Prometheus text-exposition registry (counter/gauge) + side-port /metrics HTTP-сервер (ноль зависимостей)</purpose>
+      <path>src/metrics.js</path>
+      <depends>node:net</depends>
+      <verification-ref>V-M-METRICS</verification-ref>
+      <annotations>
+        <fn-createMetrics PURPOSE="Создать counter/gauge реестр с render() в Prometheus text" />
+        <fn-startMetricsServer PURPOSE="Tiny HTTP-сервер, отдающий GET /metrics" />
+      </annotations>
+    </M-METRICS>
+
+    <M-USER-STORE NAME="UserStore" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Per-user secret management: resolve-by-secret, concurrent-conn cap, expiry, byte-quota (multi-tenant)</purpose>
+      <path>src/user-store.js</path>
+      <depends>none</depends>
+      <verification-ref>V-M-USER-STORE</verification-ref>
+      <annotations>
+        <fn-createUserStore PURPOSE="Stateful admit/release/addBytes guard по user-записям" />
+      </annotations>
+    </M-USER-STORE>
+
     <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
     <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic" />
@@ -157,6 +179,10 @@
     <CrossLink from="M-TLS-PROFILE" to="M-FAKETLS" relation="uses genX25519PublicKey/buildAlpnExtension" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-MASK" relation="routes unknown-SNI/auth-fail (mask)" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-REPLAY" relation="admits fresh digests" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-METRICS" relation="increments counters/gauges" />
+    <CrossLink from="M-MTPROTO-SERVER" to="M-USER-STORE" relation="enforces per-user limits" />
+    <CrossLink from="M-PROXY" to="M-METRICS" relation="increments counters/gauges" />
+    <CrossLink from="M-TUNNEL" to="M-METRICS" relation="counts bytes in/out" />
     <CrossLink from="M-MASK" to="M-FAKETLS" relation="re-exports extractSni" />
     <CrossLink from="M-PROXY" to="M-CONFIG" relation="reads config" />
     <CrossLink from="M-PROXY" to="M-ALLOW" relation="uses allowlist" />

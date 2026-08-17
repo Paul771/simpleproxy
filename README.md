@@ -72,7 +72,7 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `IDLE_TIMEOUT_MS` | `120000` | Idle-таймаут туннеля; сброс на любой байт |
 | `PROXY_USER` | — | Включает basic auth (нужны оба: `PROXY_USER` + `PROXY_PASS`) |
 | `PROXY_PASS` | — | Пароль basic auth |
-| `MTPROTO_SECRET` | — | MTProto-секрет, 32 hex (16 байт); несколько через запятую. **Не задан → MTProto выключен** |
+| `MTPROTO_SECRET` | — | MTProto-секреты, 32 hex (16 байт); несколько через запятую. Формат `user:secret` (или просто `secret` → пользователь `default`). **Не задан → MTProto выключен** |
 | `MTPROTO_PORT` | `0` | Отдельный порт для MTProto; `0` = мультиплексировать с HTTP на `PORT` |
 | `MTPROTO_MAX_CONNECTIONS` | `64` | Лимит одновременных MTProto-соединений |
 | `MTPROTO_HOST` | `YOUR_HOST_OR_IP` | Публичный адрес сервера для подстановки в `tg://proxy`-ссылки (домен или IP) |
@@ -91,6 +91,11 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_DOPPELGANGER` | `false` | Replay inter-arrival delays server-flight при отправке fake ServerHello (требует TLS-профиль) |
 | `MTPROTO_DOPPELGANGER_MAX_DELAY_MS` | `500` | Верхняя граница задержки в doppelganger-режиме, мс |
 | `MTPROTO_PENDING_MAX` | `256` | Лимит сокетов в фазе MTProto-handshake (slowloris-защита) |
+| `MTPROTO_METRICS_PORT` | `0` | Side-port для Prometheus `/metrics`; `0` = выключен |
+| `MTPROTO_METRICS_HOST` | `0.0.0.0` | Хост, на котором слушает `/metrics`-сервер |
+| `MTPROTO_USER_MAX_CONNS` | — | JSON-карта `{user: N}` — лимит одновременных MTProto-соединений на пользователя |
+| `MTPROTO_USER_EXPIRATIONS` | — | JSON-карта `{user: "ISO-8601" | epochMs}` — срок действия секрета пользователя |
+| `MTPROTO_USER_QUOTAS` | — | JSON-карта `{user: bytes}` — суммарная байтовая квота пользователя |
 
 ## MTProto proxy (официальные клиенты Telegram)
 
@@ -186,32 +191,72 @@ curl -x http://<адрес-и-порт-от-wispbyte> https://api.telegram.org
 
 6. Откройте `tg://proxy`-ссылку (см. лог старта) в Telegram — статус «Готово к использованию».
 
+### Наблюдаемость и операционка
+
+**Prometheus-метрики** (`MTPROTO_METRICS_PORT`, off по умолчанию): side-порт `/metrics` отдаёт
+text-exposition (v0.0.4) со счётчиками (`*_http_connections_total`, `*_mtproto_connections_total`,
+`*_bytes_in_total`, `*_bytes_out_total`, `*_replay_attacks_total`, `*_mask_splices_total`,
+`*_pending_caps_total`, `*_rejected_total`) и gauges (`*_active_tunnels`, `*_active_mtproto`,
+`*_pending_mtproto`). Ноль зависимостей — крошечный HTTP-сервер на `node:net`.
+
+```bash
+# scrape
+curl http://<host>:9091/metrics
+# в prometheus.yml: scrape http://<host>:9091/metrics
+```
+
+**Hot-reload конфига (SIGUSR2)**: `kill -USR2 <pid>` перечитывает env и сливает новый конфиг
+в live-объект in-place. Обработчики читают `cfg.*` на каждом соединении, поэтому **ротация
+секретов, смена mask-host/TLS-domain/caps/doppelganger применяются без рестарта**. Подсистемы
+с boot-time state (replay guard, profile manager, metrics-сервер, слушающий порт) помечаются
+как `restart_needed` в логе `[proxy][reload]`. На Windows `SIGUSR2` не доставляется — используйте
+рестарт через панель. При ошибке валидации env логируется `[proxy][reload_fail]` и старый
+конфиг сохраняется.
+
+### Multi-tenant: per-user секреты
+
+`MTPROTO_SECRET` парсится как `user:secret` (без префикса → пользователь `default`), а лимиты
+задаются JSON-картами:
+
+```bash
+MTPROTO_SECRET="alice:00112233445566778899aabbccddeeff,bob:ffeeddccbbaa99887766554433221100"
+MTPROTO_USER_MAX_CONNS='{"alice":5,"bob":2}'          # одновременных соединений
+MTPROTO_USER_EXPIRATIONS='{"bob":"2025-12-31T23:59:59Z"}'  # срок действия секрета
+MTPROTO_USER_QUOTAS='{"alice":104857600}'             # 100 МБ суммарного трафика
+```
+
+При handshake прокси находит user по секрету и проверяет: не истёк ли срок, не исчерпана ли
+байтовая квота, не превышен ли лимит одновременных. Отказ → `destroy` + лог
+`[proxy][mtproto_user_reject]`. Без лимитов — обратная совместимость (admit всегда true).
+
 ## Ограничения
 
 - Только HTTPS-трафик через `CONNECT` (plain-HTTP не пересылается — `405`).
 - HTTP: только домены `*.telegram.org:443`; остальное — `403`.
 - MTProto: только `*.telegram.org` DC-IP, порт 443; секреты simple/dd/ee (fake-TLS).
-- Anti-DPI masking — TCP-splice к mask_host без TLS-терминации; TLS profile capture & replay и Middle-End Pool не реализуются (вне скоупа).
+- Anti-DPI masking — TCP-splice к mask_host без TLS-терминации; Middle-End Pool / SOCKS5-upstream не реализуется (вне скоупа).
 - Масштаб: десятки параллельных ботов + сотни MTProto-клиентов комфортно; тысячи упрутся в лимит CPU 35% Wispbyte.
 
 ## Структура
 
 ```
-src/index.js           — точка входа: wiring config → log → allow → auth → mux → start (replay-guard, mask-config лог)
-src/config.js          — M-CONFIG: env → конфиг (вкл. MTPROTO_* + anti-DPI)
+src/index.js           — точка входа: wiring config → log → allow → auth → mux → start (replay-guard, profile manager, metrics, user-store, SIGUSR2 reload)
+src/config.js          — M-CONFIG: env → конфиг (вкл. MTPROTO_* + anti-DPI + per-user + applyConfigUpdate для hot-reload)
 src/log.js             — M-LOG: форматтер [proxy][marker], redaction
 src/allow.js           — M-ALLOW: парсер authority + allowlist
 src/auth.js            — M-AUTH: basic auth (timing-safe)
-src/tunnel.js          — M-TUNNEL: байтовый туннель, idle-таймер, счётчики
-src/proxy.js           — M-PROXY: парсер CONNECT, auth→allow→cap→tunnel
+src/tunnel.js          — M-TUNNEL: байтовый туннель, idle-таймер, счётчики, metrics bytes in/out
+src/proxy.js           — M-PROXY: парсер CONNECT, auth→allow→cap→tunnel, metrics counters
 src/mux.js             — M-MUX: определение протокола по первым байтам, маршрутизация
 src/mtproto.js         — M-MTPROTO: obfuscated2 handshake (parse/build), DC mapping (IPv4+IPv6)
 src/faketls.js         — M-FAKETLS: fake-TLS (ee) handshake, ServerHello+ALPN, SNI-парсинг, TLS alert
-src/mtproto-server.js  — MTProto-обработчик: plain + fake-TLS → DC → relay; routeUnknown (mask/reject/drop) + replay
+src/mtproto-server.js  — MTProto-обработчик: plain + fake-TLS → DC → relay; routeUnknown (mask/reject/drop) + replay + metrics + per-user
 src/mask.js            — M-MASK: traffic-masking (TCP-splice к mask_host)
 src/replay-guard.js    — M-REPLAY: LRU+TTL replay-защита по digest
 src/tls-profile.js     — M-TLS-PROFILE: capture & replay структуры TLS server-flight
-tests/                 — node:test (юнит + e2e, 77 тестов)
+src/metrics.js         — M-METRICS: Prometheus text-exposition реестр + /metrics side-port
+src/user-store.js      — M-USER-STORE: per-user секреты, cap/expiry/quota (multi-tenant)
+tests/                 — node:test (юнит + e2e, 108 тестов)
 docs/                  — GRACE-документы проекта
 ```
 

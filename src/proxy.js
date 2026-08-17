@@ -57,13 +57,17 @@ function parseConnectRequest(head) {
 
 // START_CONTRACT: createConnectHandler
 //   PURPOSE: Create protocol handlers (http-connect / http-other) for the mux server
-//   INPUTS: { cfg: Config, allow: (raw: string) => boolean, auth: (h?: string) => boolean, log: Log }
+//   INPUTS: { cfg: Config, allow: (raw: string) => boolean, auth: (h?: string) => boolean, log: Log, metrics?: Metrics }
 //   OUTPUTS: { { "http-connect": (socket, head) => void, "http-other": (socket, head) => void } }
 //   SIDE_EFFECTS: none
 //   LINKS: M-PROXY
 // END_CONTRACT: createConnectHandler
-export function createConnectHandler(cfg, allow, auth, log) {
+export function createConnectHandler(cfg, allow, auth, log, metrics = null) {
   let activeTunnels = 0;
+
+  const syncGauge = () => {
+    if (metrics) metrics.set("simpleproxy_active_tunnels", activeTunnels);
+  };
 
   const rejectHttp = (socket, code, message) => {
     socket.write(`HTTP/1.1 ${code} ${message}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -133,6 +137,7 @@ export function createConnectHandler(cfg, allow, auth, log) {
     // DF-4: capacity limit (UC-003)
     if (activeTunnels >= cfg.maxTunnels) {
       log("cap_limit", "DF-4", socket.remoteAddress, target, { active: activeTunnels });
+      if (metrics) metrics.inc("simpleproxy_rejected_total");
       socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
       socket.destroy();
       return;
@@ -150,6 +155,10 @@ export function createConnectHandler(cfg, allow, auth, log) {
     upstream.once("connect", () => {
       upstream.setTimeout(0);
       activeTunnels += 1;
+      if (metrics) {
+        metrics.inc("simpleproxy_http_connections_total");
+        syncGauge();
+      }
       log("connect", "DF-1", socket.remoteAddress, `${host}:${port}`);
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       openTunnel({
@@ -158,8 +167,10 @@ export function createConnectHandler(cfg, allow, auth, log) {
         target: { host, port },
         cfg,
         log,
+        metrics,
         onClose: () => {
           activeTunnels -= 1;
+          syncGauge();
         },
       });
       // Forward any bytes pipelined after the CONNECT header block.

@@ -15,12 +15,12 @@
 
 // START_CONTRACT: openTunnel
 //   PURPOSE: Pipe data both ways, track bytes, reset idle timer on any data, tear down on close/error
-//   INPUTS: { opts: { clientSocket, upstream, target, cfg, log, onClose } }
+//   INPUTS: { opts: { clientSocket, upstream, target, cfg, log, onClose, metrics? } }
 //   OUTPUTS: { void }
 //   SIDE_EFFECTS: wires socket event handlers; destroys both sockets on termination
 //   LINKS: M-TUNNEL
 // END_CONTRACT: openTunnel
-export function openTunnel({ clientSocket, upstream, target, cfg, log, onClose = () => {} }) {
+export function openTunnel({ clientSocket, upstream, target, cfg, log, onClose = () => {}, metrics = null }) {
   let bytesIn = 0; // client -> upstream
   let bytesOut = 0; // upstream -> client
   const startedAt = Date.now();
@@ -60,12 +60,14 @@ export function openTunnel({ clientSocket, upstream, target, cfg, log, onClose =
   // START_BLOCK_PUMP
   clientSocket.on("data", (chunk) => {
     bytesIn += chunk.length;
+    if (metrics) metrics.inc("simpleproxy_bytes_in_total", chunk.length);
     resetIdle();
     upstream.write(chunk);
   });
 
   upstream.on("data", (chunk) => {
     bytesOut += chunk.length;
+    if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
     resetIdle();
     clientSocket.write(chunk);
   });

@@ -41,14 +41,24 @@ const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 //   INPUTS: { cfg: Config, log: Log, resolveDc?: (dcIdx, opts) => { host, port } | null,
 //             replayGuard?: { admit: (key: Buffer) => boolean } | null,
 //             maskImpl?: (opts) => void - mask splice function (injectable for tests),
-//             profileManager?: { get(): Profile | null } | null - TLS profile capture & replay }
+//             profileManager?: { get(): Profile | null } | null - TLS profile capture & replay,
+//             metrics?: { inc(name, n?): void, set(name, v): void } | null - Prometheus registry,
+//             userStore?: { resolve(hex): User|null, admit(user): boolean, release(user): void,
+//                           addBytes(user, n): boolean } | null - per-user limits }
 //   OUTPUTS: { (socket, head) => void }
 //   SIDE_EFFECTS: none
-//   LINKS: M-MTPROTO, M-TLS-PROFILE
+//   LINKS: M-MTPROTO, M-TLS-PROFILE, M-USER-STORE
 // END_CONTRACT: createMtprotoHandler
-export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayGuard = null, maskImpl = maskConnection, profileManager = null) {
+export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayGuard = null, maskImpl = maskConnection, profileManager = null, metrics = null, userStore = null) {
   let activeConnections = 0;
   let pendingHandshakes = 0; // sockets in handshake phase, before relay is established
+
+  const syncPending = () => {
+    if (metrics) metrics.set("simpleproxy_pending_mtproto", pendingHandshakes);
+  };
+  const syncActive = () => {
+    if (metrics) metrics.set("simpleproxy_active_mtproto", activeConnections);
+  };
 
   // START_BLOCK_ROUTE_UNKNOWN
   // Behaviour on unknown SNI / failed fake-TLS auth (telemt-inspired anti-DPI).
@@ -57,6 +67,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
   const routeUnknown = (socket, head) => {
     const action = cfg.mtprotoUnknownSniAction || "drop";
     if (action === "mask") {
+      if (metrics) metrics.inc("simpleproxy_mask_splices_total");
       maskImpl({ clientSocket: socket, head, cfg, log });
       return;
     }
@@ -73,16 +84,19 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
     // START_BLOCK_MT_HANDSHAKE
     if (activeConnections >= cfg.mtprotoMaxConnections) {
       log("mtproto_cap", "DF-4", socket.remoteAddress, { active: activeConnections });
+      if (metrics) metrics.inc("simpleproxy_rejected_total");
       socket.destroy();
       return;
     }
     // Slowloris guard: cap the number of sockets still in the handshake phase.
     if (pendingHandshakes >= cfg.mtprotoPendingMax) {
       log("mtproto_pending_cap", "DF-4", socket.remoteAddress, { pending: pendingHandshakes });
+      if (metrics) metrics.inc("simpleproxy_pending_caps_total");
       socket.destroy();
       return;
     }
     pendingHandshakes += 1;
+    syncPending();
 
     const secrets = cfg.mtprotoSecrets.map((s) => Buffer.from(s, "hex"));
     const isTls =
@@ -99,6 +113,13 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
       const parsed = parseClientHandshake(obfsHandshake.subarray(0, HANDSHAKE_LEN), secrets);
       if (!parsed) {
         log("mtproto_auth_fail", "DF-1", socket.remoteAddress);
+        socket.destroy();
+        return;
+      }
+      // Per-user limits (multi-tenant): resolve the user by matched secret, enforce cap/expiry/quota.
+      const user = userStore ? userStore.resolve(parsed.secret.toString("hex")) : null;
+      if (userStore && !userStore.admit(user)) {
+        log("mtproto_user_reject", "DF-4", socket.remoteAddress, { user: user ? user.user : "unknown" });
         socket.destroy();
         return;
       }
@@ -120,6 +141,9 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
         upstream.setTimeout(0);
         pendingHandshakes -= 1; // left handshake phase
         activeConnections += 1;
+        syncPending();
+        syncActive();
+        if (metrics) metrics.inc("simpleproxy_mtproto_connections_total");
         log("mtproto_connect", "DF-1", socket.remoteAddress, `${dc.host}:${dc.port}`, {
           dc: parsed.dcIdx,
           tls: isTls ? 1 : 0,
@@ -147,6 +171,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
           tornDown = true;
           clearTimeout(idleTimer);
           activeConnections -= 1;
+          syncActive();
+          if (userStore && user) userStore.release(user);
           log("mtproto_close", "DF-2", dc.host, dc.port, {
             bytes_in: bytesIn,
             bytes_out: bytesOut,
@@ -159,6 +185,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
         // client -> DC: decrypt client obfuscated2, re-encrypt upstream.
         const pushAppDataToDc = (appData) => {
           bytesIn += appData.length;
+          if (metrics) metrics.inc("simpleproxy_bytes_in_total", appData.length);
+          if (userStore && user) userStore.addBytes(user, appData.length);
           armIdle();
           const plain = parsed.decryptor.decrypt(appData);
           upstream.write(up.encryptorUp.encrypt(plain));
@@ -176,6 +204,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
           // DC -> client: wrap in fake-TLS application-data records.
           upstream.on("data", (chunk) => {
             bytesOut += chunk.length;
+            if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
+            if (userStore && user) userStore.addBytes(user, chunk.length);
             armIdle();
             socket.write(wrapTlsRecord(chunk));
           });
@@ -183,6 +213,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
           socket.on("data", pushAppDataToDc);
           upstream.on("data", (chunk) => {
             bytesOut += chunk.length;
+            if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
+            if (userStore && user) userStore.addBytes(user, chunk.length);
             armIdle();
             socket.write(chunk);
           });
@@ -256,6 +288,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
         // Replay protection: admit each client digest at most once within the guard window.
         if (replayGuard && !replayGuard.admit(validated.digest)) {
           log("faketls_replay", "DF-MASK", socket.remoteAddress);
+          if (metrics) metrics.inc("simpleproxy_replay_attacks_total");
           routeUnknown(socket, clientHello);
           return;
         }
@@ -324,7 +357,10 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddress, replayG
     socket.on("error", () => socket.destroy());
     // Release the pending slot if the socket dies before entering relay.
     socket.once("close", () => {
-      if (!completed) pendingHandshakes -= 1;
+      if (!completed) {
+        pendingHandshakes -= 1;
+        syncPending();
+      }
     });
     processBuffer(buf);
     // END_BLOCK_MT_HANDSHAKE

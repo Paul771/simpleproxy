@@ -30,6 +30,41 @@ function parseIntEnv(value, fallback, name) {
   return n;
 }
 
+// Port-style integer: 0 means "disabled" and is always allowed.
+function parsePortEnv(value, fallback, name) {
+  if (value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`INVALID_ENV: ${name} must be a non-negative integer, got "${value}"`);
+  }
+  return n;
+}
+
+// Parse a JSON object env var. Empty/absent -> fallback. Throws INVALID_ENV on bad JSON / non-object.
+function parseJsonEnv(value, fallback, name) {
+  if (value === undefined || value === "" || value == null) return fallback;
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error(`INVALID_ENV: ${name} must be valid JSON, got "${value}"`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`INVALID_ENV: ${name} must be a JSON object, got "${value}"`);
+  }
+  return parsed;
+}
+
+// Accept ISO-8601 string or epoch-ms number; null when absent. NaN -> throws.
+function parseExpiry(value) {
+  if (value == null || value === "") return null;
+  const ms = typeof value === "number" ? value : Date.parse(value);
+  if (!Number.isFinite(ms)) {
+    throw new Error(`INVALID_ENV: MTPROTO_USER_EXPIRATIONS entry must be ISO-8601 or epoch-ms, got "${value}"`);
+  }
+  return ms;
+}
+
 // START_CONTRACT: loadConfig
 //   PURPOSE: Read env and return validated config
 //   INPUTS: { env: Record<string, string | undefined> - environment (default process.env) }
@@ -38,7 +73,9 @@ function parseIntEnv(value, fallback, name) {
 //                          mtprotoTlsDomain, mtprotoTlsAlpn, mtprotoMaskHost, mtprotoMaskPort,
 //                          mtprotoUnknownSniAction, mtprotoReplayWindow, mtprotoReplayTtlMs,
 //                          mtprotoDigestFreshnessMs, mtprotoPreferIpv6,
-//                          mtprotoTlsProfileCapture, mtprotoTlsProfileRefreshMs, mtprotoTlsProfileTimeoutMs } }
+//                          mtprotoTlsProfileCapture, mtprotoTlsProfileRefreshMs, mtprotoTlsProfileTimeoutMs,
+//                          mtprotoDoppelganger, mtprotoDoppelgangerMaxDelayMs,
+//                          mtprotoMetricsPort, mtprotoMetricsHost } }
 //   SIDE_EFFECTS: none
 //   LINKS: M-CONFIG
 // END_CONTRACT: loadConfig
@@ -52,19 +89,40 @@ export function loadConfig(env = process.env) {
   // Auth is enabled only when BOTH user and pass are provided.
   const creds = authUser !== null && authPass !== null ? { user: authUser, pass: authPass } : null;
 
-  // MTProto secrets: comma-separated 32-hex (16-byte) values.
-  // MTPROTO_SECRET unset or empty -> MTProto listener disabled.
-  let mtprotoSecrets = [];
+  // MTProto secrets: comma-separated entries, each "user:secret" or just "secret".
+  // A bare secret maps to the "default" user. MTPROTO_SECRET unset/empty -> listener disabled.
+  let mtprotoUsers = [];
   if (env.MTPROTO_SECRET && env.MTPROTO_SECRET.trim() !== "") {
-    mtprotoSecrets = env.MTPROTO_SECRET.split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter((s) => s !== "");
-    for (const s of mtprotoSecrets) {
-      if (!/^[0-9a-f]{32}$/.test(s)) {
-        throw new Error(`INVALID_ENV: MTPROTO_SECRET entries must be 32 hex chars, got "${s}"`);
+    const rawEntries = env.MTPROTO_SECRET.split(",").map((s) => s.trim()).filter((s) => s !== "");
+    mtprotoUsers = rawEntries.map((entry) => {
+      const colon = entry.indexOf(":");
+      let user, secretHex;
+      if (colon > 0) {
+        user = entry.slice(0, colon).trim();
+        secretHex = entry.slice(colon + 1).trim().toLowerCase();
+      } else {
+        user = "default";
+        secretHex = entry.toLowerCase();
       }
-    }
+      if (!/^[0-9a-f]{32}$/.test(secretHex)) {
+        throw new Error(`INVALID_ENV: MTPROTO_SECRET entries must be 32 hex chars, got "${secretHex}"`);
+      }
+      return { user, secretHex };
+    });
   }
+  const mtprotoSecrets = mtprotoUsers.map((u) => u.secretHex);
+
+  // --- Per-user limits (multi-tenant): JSON maps keyed by user name. ---
+  const userMaxConns = parseJsonEnv(env.MTPROTO_USER_MAX_CONNS, {}, "MTPROTO_USER_MAX_CONNS");
+  const userExpirations = parseJsonEnv(env.MTPROTO_USER_EXPIRATIONS, {}, "MTPROTO_USER_EXPIRATIONS");
+  const userQuotas = parseJsonEnv(env.MTPROTO_USER_QUOTAS, {}, "MTPROTO_USER_QUOTAS");
+  mtprotoUsers = mtprotoUsers.map((u) => ({
+    user: u.user,
+    secretHex: u.secretHex,
+    maxConns: userMaxConns[u.user] != null ? Number(userMaxConns[u.user]) : null,
+    expiresAt: parseExpiry(userExpirations[u.user]),
+    byteQuota: userQuotas[u.user] != null ? Number(userQuotas[u.user]) : null,
+  }));
 
   const mtprotoPort = parseIntEnv(env.MTPROTO_PORT, 0, "MTPROTO_PORT");
   const mtprotoMaxConnections = parseIntEnv(
@@ -138,6 +196,13 @@ export function loadConfig(env = process.env) {
     "MTPROTO_DOPPELGANGER_MAX_DELAY_MS"
   );
 
+  // --- Observability: Prometheus metrics side-port (off by default = 0). ---
+  const mtprotoMetricsPort = parsePortEnv(env.MTPROTO_METRICS_PORT, 0, "MTPROTO_METRICS_PORT");
+  const mtprotoMetricsHost =
+    env.MTPROTO_METRICS_HOST && env.MTPROTO_METRICS_HOST.trim() !== ""
+      ? env.MTPROTO_METRICS_HOST.trim()
+      : "0.0.0.0";
+
   return {
     port,
     host: "0.0.0.0",
@@ -148,6 +213,7 @@ export function loadConfig(env = process.env) {
     creds,
     rules: DEFAULT_RULES,
     mtprotoSecrets,
+    mtprotoUsers,
     mtprotoPort,
     mtprotoMaxConnections,
     mtprotoPendingMax,
@@ -166,6 +232,8 @@ export function loadConfig(env = process.env) {
     mtprotoTlsProfileTimeoutMs,
     mtprotoDoppelganger,
     mtprotoDoppelgangerMaxDelayMs,
+    mtprotoMetricsPort,
+    mtprotoMetricsHost,
   };
 }
 
@@ -182,4 +250,39 @@ function parseBoolEnv(value, fallback) {
   if (value === undefined || value === "") return fallback;
   const v = value.trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+// Fields that are bound to the listening socket and must NOT be reloaded in place.
+const IMMUTABLE_FIELDS = new Set(["port", "host"]);
+
+// START_CONTRACT: applyConfigUpdate
+//   PURPOSE: Merge a freshly-loaded config into a live config object in place (hot-reload)
+//   INPUTS: { target: Config - the live cfg mutated in place, source: Config - new loadConfig() result }
+//   OUTPUTS: { string[] - names of fields whose value changed (port/host excluded) }
+//   SIDE_EFFECTS: mutates `target` in place; never touches target.port / target.host
+//   LINKS: M-CONFIG
+// END_CONTRACT: applyConfigUpdate
+// Deep equality that handles primitives, arrays, and plain objects (order-stable via JSON).
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null) return a == null && b == null;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+export function applyConfigUpdate(target, source) {
+  const changed = [];
+  for (const key of Object.keys(source)) {
+    if (IMMUTABLE_FIELDS.has(key)) continue;
+    const a = target[key];
+    const b = source[key];
+    if (!deepEqual(a, b)) {
+      target[key] = b;
+      changed.push(key);
+    }
+  }
+  return changed;
 }

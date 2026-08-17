@@ -294,6 +294,61 @@
         <marker-1>[proxy][mtproto_pending_cap][DF-4]</marker-1>
       </required-log-markers>
     </V-M-HARDEN>
+
+    <V-M-METRICS MODULE="M-METRICS" PRIORITY="medium">
+      <test-files>
+        <file>tests/metrics.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/metrics.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">counter inc с n=1 и n=2 аккумулируется; gauge хранит последний set.</scenario-1>
+        <scenario-2 kind="success">render(): каждая метрика имеет # HELP, # TYPE (counter/gauge) и значение; trailing newline.</scenario-2>
+        <scenario-3 kind="success">unknown metric inc/set = no-op, get = 0 (нельзя изобрести метрики).</scenario-3>
+        <scenario-4 kind="success">e2e: GET /metrics → 200 text/plain; version=0.0.4 со всеми метриками; не-/metrics → 404.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][metrics_listen][DF-METRICS]</marker-1>
+      </required-log-markers>
+    </V-M-METRICS>
+
+    <V-M-USER-STORE MODULE="M-USER-STORE" PRIORITY="medium">
+      <test-files>
+        <file>tests/user-store.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/user-store.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">resolve: known secretHex → user; unknown → null.</scenario-1>
+        <scenario-2 kind="success">admit: default user без лимитов → всегда true; maxConns cap → false сверх лимита; release восстанавливает.</scenario-2>
+        <scenario-3 kind="failure">expired user (expiresAt в прошлом) → admit false; future expiry → true.</scenario-3>
+        <scenario-4 kind="success">byte-quota: addBytes накапливает; admit false при превышении квоты.</scenario-4>
+        <scenario-5 kind="success">config: MTPROTO_SECRET=user:secret парсится в mtprotoUsers; MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS (JSON) применяются.</scenario-5>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][mtproto_user_reject][DF-4]</marker-1>
+      </required-log-markers>
+    </V-M-USER-STORE>
+
+    <V-M-RELOAD MODULE="M-CONFIG" PRIORITY="low">
+      <test-files>
+        <file>tests/reload.test.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>node --test tests/reload.test.js</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">applyConfigUpdate: копирует mutable поля in-place, сохраняет port/host; identical config → пустой change-set.</scenario-1>
+        <scenario-2 kind="success">deep equality для массивов/объектов (mtprotoSecrets, mtprotoUsers) — содержимое-равные не считаются changed.</scenario-2>
+        <scenario-3 kind="success">rules (allowlist default) не затираются при reload.</scenario-3>
+      </scenarios>
+      <required-log-markers>
+        <marker-1>[proxy][reload][DF-RELOAD]</marker-1>
+        <marker-2>[proxy][reload_fail][DF-RELOAD]</marker-2>
+      </required-log-markers>
+    </V-M-RELOAD>
   </ModuleVerification>
 
   <PhaseGates>
@@ -359,6 +414,18 @@
         <evidence-2>Лог [proxy][tls_profile] captured с cipher/alpn/ccsCount/appDataSizes.</evidence-2>
       </required-evidence>
     </Gate-Phase-6>
+    <Gate-Phase-7 PHASE="Phase-7">
+      <goal>Наблюдаемость + multi-tenant: Prometheus /metrics, SIGUSR2 hot-reload, per-user секреты; все тесты зелёные.</goal>
+      <commands>
+        <command-1>node --test</command-1>
+        <command-2>MTPROTO_SECRET=00000000000000000000000000000000 MTPROTO_METRICS_PORT=9091 PORT=8080 node src/index.js (smoke: curl localhost:9091/metrics)</command-2>
+      </commands>
+      <required-evidence>
+        <evidence-1>108 тестов проходят (включая metrics/reload/user-store).</evidence-1>
+        <evidence-2>GET /metrics → 200 text/plain с # TYPE simpleproxy_*.</evidence-2>
+        <evidence-3>(POSIX) kill -USR2 → лог [proxy][reload]; (Windows) restart через панель.</evidence-3>
+      </required-evidence>
+    </Gate-Phase-7>
   </PhaseGates>
 
   <FailurePackets>
