@@ -182,6 +182,16 @@
       </annotations>
     </M-BLOCKLIST>
 
+    <M-LIVE-SMOKE NAME="LiveSmoke" TYPE="SCRIPT" STATUS="implemented">
+      <purpose>Live smoke-тест задеплоенного инстанса: TCP, CONNECT allowlist/denylist, 405, plain-MTProto reject, mask-splice (byte-compare vs origin), obfs2 + fake-TLS handshake</purpose>
+      <path>scripts/live-smoke.mjs</path>
+      <depends>node:net, node:crypto</depends>
+      <verification-ref>V-M-LIVE-SMOKE</verification-ref>
+      <annotations>
+        <fn-main PURPOSE="CLI: node scripts/live-smoke.mjs [host:port] [--secret hex] [--compare-mask]" />
+      </annotations>
+    </M-LIVE-SMOKE>
+
     <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
     <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-MTPROTO" relation="uses handshake/DC logic (candidates + fallback)" />
@@ -204,6 +214,8 @@
     <CrossLink from="M-PROXY" to="M-LOG" relation="logs via formatter" />
     <CrossLink from="M-TUNNEL" to="M-LOG" relation="logs via formatter" />
     <CrossLink from="M-MTPROTO-SERVER" to="M-LOG" relation="logs via formatter" />
+    <CrossLink from="M-LIVE-SMOKE" to="M-MTPROTO-SERVER" relation="exercises obfs2/fake-TLS handshake live" />
+    <CrossLink from="M-LIVE-SMOKE" to="M-MASK" relation="verifies mask-splice byte-equal vs origin" />
 
   </Project>
 </KnowledgeGraph>

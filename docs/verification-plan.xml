@@ -369,6 +369,19 @@
       </required-log-markers>
     </V-M-BLOCKLIST>
 
+    <V-M-LIVE-SMOKE MODULE="M-LIVE-SMOKE" PRIORITY="low">
+      <test-files>
+        <file>scripts/live-smoke.mjs</file>
+      </test-files>
+      <module-checks>
+        <check-1>node scripts/live-smoke.mjs --secret &lt;hex&gt; (против задеплоенного инстанса)</check-1>
+        <check-2>node scripts/live-smoke.mjs --secret &lt;hex&gt; --compare-mask (byte-compare mask splice vs origin)</check-2>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">8/8: tcp, connect-telegram 200, connect-denied 403, plain-http 405, plain-mt-reject close, mask-splice байт-в-байт равен origin, obfs2 relay открыт, faketls ServerHello.</scenario-1>
+      </scenarios>
+    </V-M-LIVE-SMOKE>
+
     <V-M-DC-FALLBACK MODULE="M-MTPROTO" PRIORITY="medium">
       <test-files>
         <file>tests/dc-fallback.test.js</file>
