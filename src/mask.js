@@ -1,5 +1,5 @@
 // FILE: src/mask.js
-// VERSION: 1.0.0
+// VERSION: 1.0.1
 // START_MODULE_CONTRACT
 //   PURPOSE: Traffic masking: transparent TCP-splice of non-keyed/unknown-SNI clients to a real web server
 //   SCOPE: connect to mask_host, forward buffered ClientHello, bidirectional splice with idle timer
@@ -12,6 +12,10 @@
 // START_MODULE_MAP
 //   maskConnection - splice a client socket (with buffered head) to mask_host:mask_port
 // END_MODULE_MAP
+//
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.0.1 - abort upstream without splicing if the client is already gone
+// END_CHANGE_SUMMARY
 
 import net from "node:net";
 
@@ -33,26 +37,37 @@ export function maskConnection({ clientSocket, head, cfg, log, onOpen = () => {}
   const host = cfg.mtprotoMaskHost;
   const port = cfg.mtprotoMaskPort || 443;
 
+  if (clientSocket.destroyed) {
+    onClose();
+    log("mask_close", "DF-MASK", host, port, { reason: "client_close" });
+    return;
+  }
+
   const upstream = net.connect({ host, port });
   upstream.setTimeout(MASK_CONNECT_TIMEOUT_MS, () => {
     upstream.destroy(new Error("mask upstream connect timeout"));
   });
 
-  let active = false;
+  let tornDown = false;
+  let spliced = false;
   const teardown = (reason) => {
-    if (active) return;
-    active = true;
+    if (tornDown) return;
+    tornDown = true;
     upstream.destroy();
-    clientSocket.destroy();
+    if (!clientSocket.destroyed) clientSocket.destroy();
     onClose();
     log("mask_close", "DF-MASK", host, port, reason ? { reason } : undefined);
   };
 
   upstream.once("connect", () => {
+    if (tornDown || clientSocket.destroyed) {
+      upstream.destroy();
+      return;
+    }
     upstream.setTimeout(0);
+    spliced = true;
     log("mask_connect", "DF-MASK", clientSocket.remoteAddress, `${host}:${port}`);
     onOpen();
-    // Forward the buffered ClientHello (and any pipelined bytes) to the real server first.
     if (head.length > 0) upstream.write(head);
   });
 
@@ -61,8 +76,12 @@ export function maskConnection({ clientSocket, head, cfg, log, onOpen = () => {}
     teardown("upstream_error");
   });
 
-  // If the client closes before the upstream connects, abort the connect attempt.
-  clientSocket.once("close", () => teardown("client_close"));
+  clientSocket.once("close", () => {
+    if (!spliced) {
+      upstream.destroy();
+    }
+    teardown("client_close");
+  });
   clientSocket.once("error", () => teardown("client_error"));
 
   // Bidirectional splice with an idle timer (mirrors M-TUNNEL semantics, distinct markers).

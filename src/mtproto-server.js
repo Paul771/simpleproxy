@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.2.0
+// VERSION: 1.2.1
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -12,6 +12,10 @@
 // START_MODULE_MAP
 //   createMtprotoHandler - build the mtproto handler for the mux server
 // END_MODULE_MAP
+//
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.2.1 - detach handshake listener before mask/reject; log sni/recordLen/digestPrefix on auth_fail
+// END_CHANGE_SUMMARY
 
 import net from "node:net";
 import {
@@ -106,6 +110,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     let buf = head;
     let phase = isTls ? "tls-hello" : "plain"; // tls-hello -> tls-app -> relay
     let completed = false;
+    let handedOff = false;
     let tlsReader = null;
     let obfsHandshake = Buffer.alloc(0);
     let extraAppData = Buffer.alloc(0); // app bytes received beyond the 64-byte obfs handshake
@@ -272,16 +277,21 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       // END_BLOCK_MT_RELAY
     };
 
-    const complete = () => {
-      completed = true;
+    const detachHandshake = () => {
+      handedOff = true;
       socket.removeListener("data", onData);
       clearTimeout(timer);
+    };
+
+    const complete = () => {
+      completed = true;
+      detachHandshake();
       finishHandshakeAndRelay();
     };
 
     const processBuffer = (data) => {
       buf = data;
-      if (completed) return;
+      if (completed || handedOff) return;
 
       if (phase === "plain") {
         if (buf.length < HANDSHAKE_LEN) return;
@@ -295,6 +305,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         if (buf.length < 5) return;
         const recordLen = buf.readUInt16BE(3);
         if (recordLen < 512) {
+          detachHandshake();
           log("faketls_reject", "DF-1", socket.remoteAddress, { recordLen });
           socket.destroy();
           return;
@@ -306,7 +317,12 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         if (!validated) {
           // Non-keyed client (crawler / wrong secret): mask or reject instead of a bare RST,
           // so port 443 is wire-indistinguishable from a real web server.
-          log("faketls_auth_fail", "DF-1", socket.remoteAddress);
+          detachHandshake();
+          log("faketls_auth_fail", "DF-1", socket.remoteAddress, {
+            sni: extractSni(clientHello),
+            recordLen,
+            digestPrefix: clientHello.subarray(11, 15).toString("hex"),
+          });
           routeUnknown(socket, clientHello);
           return;
         }
@@ -314,12 +330,14 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // unknown. Absent SNI stays lenient (legacy clients / test emulators without SNI).
         const sni = extractSni(clientHello);
         if (sni !== null && sni !== cfg.mtprotoTlsDomain.toLowerCase()) {
+          detachHandshake();
           log("faketls_unknown_sni", "DF-MASK", socket.remoteAddress, { sni });
           routeUnknown(socket, clientHello);
           return;
         }
         // Replay protection: admit each client digest at most once within the guard window.
         if (replayGuard && !replayGuard.admit(validated.digest)) {
+          detachHandshake();
           log("faketls_replay", "DF-MASK", socket.remoteAddress);
           if (metrics) metrics.inc("simpleproxy_replay_attacks_total");
           routeUnknown(socket, clientHello);

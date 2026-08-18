@@ -236,3 +236,93 @@ test("drop: action=drop destroys the socket with no response (legacy behaviour)"
     server.close();
   }
 });
+
+test("mask: handshake listener detaches so a follow-up chunk cannot destroy the splice", async () => {
+  const mask = await startMaskServer();
+  const { server, addr } = await startProxy({ mtprotoMaskPort: mask.address().port });
+  try {
+    const hello = buildNonKeyedClientHello("www.yandex.ru");
+    const reply = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(hello);
+        setTimeout(() => {
+          socket.write(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x10, ...Buffer.alloc(16)]));
+        }, 30);
+      });
+      let buf = Buffer.alloc(0);
+      const timer = setTimeout(() => reject(new Error(`detach timeout, got: ${buf.toString("latin1")}`)), 3000);
+      socket.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (buf.includes("MASK-OK")) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(buf.toString("latin1"));
+        }
+      });
+      socket.on("error", reject);
+    });
+    assert.ok(reply.includes("MASK-OK"), "follow-up chunk must not tear down the mask splice");
+  } finally {
+    server.closeAllConnections?.();
+    mask.closeAllConnections?.();
+    server.close();
+    mask.close();
+  }
+});
+
+test("faketls_auth_fail log includes sni, recordLen and digestPrefix", async () => {
+  const mask = await startMaskServer();
+  const lines = [];
+  const orig = console.log;
+  console.log = (...args) => {
+    lines.push(args.map(String).join(" "));
+    orig.apply(console, args);
+  };
+  const { server, addr } = await startProxy({ mtprotoMaskPort: mask.address().port });
+  try {
+    const hello = buildNonKeyedClientHello("www.yandex.ru");
+    await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(hello));
+      const timer = setTimeout(() => reject(new Error("auth_fail log timeout")), 3000);
+      socket.on("data", () => {
+        clearTimeout(timer);
+        socket.destroy();
+        resolve();
+      });
+      socket.on("error", reject);
+    });
+    const line = lines.find((l) => l.includes("[faketls_auth_fail]"));
+    assert.ok(line, "must emit faketls_auth_fail");
+    assert.match(line, /"sni":"www\.yandex\.ru"/);
+    assert.match(line, /"recordLen":\d+/);
+    assert.match(line, /"digestPrefix":"[0-9a-f]{8}"/);
+  } finally {
+    console.log = orig;
+    server.closeAllConnections?.();
+    mask.closeAllConnections?.();
+    server.close();
+    mask.close();
+  }
+});
+
+test("mask: client close before upstream connect only aborts the upstream", async () => {
+  const hanging = net.createServer(() => {});
+  await new Promise((resolve) => hanging.listen(0, "127.0.0.1", resolve));
+  const client = new net.Socket();
+  const seen = [];
+  const log = (marker, ...args) => {
+    seen.push({ marker, args });
+  };
+  await new Promise((resolve) => client.connect(9, "127.0.0.1", resolve).on("error", () => resolve()));
+  client.destroy();
+  await new Promise((r) => setTimeout(r, 20));
+  maskConnection({
+    clientSocket: client,
+    head: Buffer.from("hello"),
+    cfg: { mtprotoMaskHost: "127.0.0.1", mtprotoMaskPort: hanging.address().port, idleTimeoutMs: 5_000 },
+    log,
+  });
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(hanging._connections, 0, "upstream connect must be aborted when client is already closed");
+  hanging.close();
+});

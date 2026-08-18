@@ -206,6 +206,7 @@
         <scenario-2 kind="success">buildServerHello: response digest = HMAC(secret, clientDigest+helloPkt), структура 0x16/0x14/0x17; ALPN-расширение присутствует при alpn, отсутствует при null (обр. совместимость).</scenario-2>
         <scenario-3 kind="success">createTlsRecordReader + wrapTlsRecord round-trip; 0x14 ChangeCipherSpec пропускается.</scenario-3>
         <scenario-4 kind="success">E2E fake-TLS: клиент → прокси → fake-DC, данные round-trip; неверный secret → маскирование/закрытие.</scenario-4>
+        <scenario-7 kind="success">faketls_auth_fail логирует sni, recordLen и digestPrefix (8 hex); handshake-listener снимается до mask.</scenario-7>
         <scenario-5 kind="success">extractSni: парсит SNI из ClientHello с расширением server_name; null без SNI.</scenario-5>
         <scenario-6 kind="success">buildTlsAlert(112) == 15 03 03 00 02 02 70 (unrecognized_name для reject_handshake).</scenario-6>
       </scenarios>
@@ -226,7 +227,8 @@
         <check-1>node --test tests/mask.test.js</check-1>
       </module-checks>
       <scenarios>
-        <scenario-1 kind="success">mask: failed fake-TLS auth (action=mask) → splice к локальному mask-серверу, клиент получает реальный ответ (MASK-OK).</scenario-1>
+        <scenario-1 kind="success">mask: failed fake-TLS auth (action=mask) → splice к локальному mask-серверу, клиент получает реальный ответ (MASK-OK). Повторный chunk после handoff не рвёт splice.</scenario-1>
+        <scenario-5 kind="success">mask: client уже destroyed → upstream не поднимается, лог mask_close reason=client_close.</scenario-5>
         <scenario-2 kind="success">mask: unknown SNI (SNI ≠ MTPROTO_TLS_DOMAIN) → splice к mask-серверу.</scenario-2>
         <scenario-3 kind="success">reject: action=reject → клиент получает TLS alert 0x15 … 0x70 (unrecognized_name).</scenario-3>
         <scenario-4 kind="success">drop: action=drop → socket.destroy без записи байт (legacy-поведение).</scenario-4>
