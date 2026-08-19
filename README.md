@@ -76,7 +76,7 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_PORT` | `0` | Отдельный порт для MTProto; `0` = мультиплексировать с HTTP на `PORT` |
 | `MTPROTO_MAX_CONNECTIONS` | `64` | Лимит одновременных MTProto-соединений |
 | `MTPROTO_HOST` | `YOUR_HOST_OR_IP` | Публичный адрес сервера для подстановки в `tg://proxy`-ссылки (домен или IP) |
-| `MTPROTO_TLS_DOMAIN` | `www.google.com` | Домен для fake-TLS (ee) маскировки; подставляется в ee-ссылку как SNI |
+| `MTPROTO_TLS_DOMAIN` | `www.google.com` | Домен для fake-TLS (ee) маскировки; подставляется в ee-ссылку как SNI. См. примечание ниже про выбор домена |
 | `MTPROTO_MASK_HOST` | = `MTPROTO_TLS_DOMAIN` | Реальный upstream для traffic-masking при unknown SNI / неверном секрете |
 | `MTPROTO_MASK_PORT` | `443` | Порт mask-host |
 | `MTPROTO_UNKNOWN_SNI_ACTION` | `mask` | Поведение при unknown SNI / неверном fake-TLS секрете: `mask` (splice к mask_host) \| `reject` (TLS alert) \| `drop` (destroy) |
@@ -123,11 +123,14 @@ node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
 - **simple** — обычный obfuscated2.
 - **dd** — фиксирует конкретный датацентр Telegram (полезно при роуминге).
 - **ee** — fake-TLS: соединение выглядит как обычный HTTPS к домену из `MTPROTO_TLS_DOMAIN`,
-  маскирует трафик от DPI. Берите домен, правдоподобный для IP сервера. Не фронтите
-  `www.google.com` и крупные западные CDN с IP не из их ASN — DPI на пути часто
-  режет или мутирует такой ClientHello, HMAC ломается (`faketls_auth_fail`).
-  Для хостинга в РФ/СНГ рабочий пример: `MTPROTO_TLS_DOMAIN=www.yandex.ru`
-  (ee-ссылка получит суффикс `7777772e79616e6465782e7275`).
+  маскирует трафик от DPI. Берите домен, правдоподобный для IP сервера.
+
+> **Выбор `MTPROTO_TLS_DOMAIN` критичен.** DPI на пути к серверу режет ClientHello с
+> популярными SNI (`www.google.com`, `www.yandex.ru`, `www.cloudflare.com`, `vk.com`,
+> `github.com` и т.п.) — соединение висит 0 байт, HMAC ломается (`faketls_auth_fail`).
+> Проверено на Wispbyte (78.154.103.40): рабочий фронт — **`rutube.ru`** (RU-домен, DPI
+> не ест, TLS :443 за ~70 мс). Запасные: `mail.ru`, `ozon.ru`, `habr.com`.
+> ee-ссылка для `rutube.ru` получит суффикс `7275747562652e7275`.
 
 Подставьте адрес и порт вашего сервера Wispbyte, откройте ссылку в Telegram
 (Настройки → Прокси → «Добавить прокси» или просто перейдите по `tg://`-ссылке)
@@ -178,6 +181,7 @@ flight, профиль ~1 КБ, refresh каждые `MTPROTO_TLS_PROFILE_REFRES
 ```
 
 > Выбирайте `MTPROTO_TLS_DOMAIN` / `MTPROTO_MASK_HOST` как домен, правдоподобный для IP вашего сервера
+> и **не режущийся DPI** (см. примечание выше; на Wispbyte рабочий — `rutube.ru`)
 > (напр., CDN, который реально отвечает TLS-рукопожатием). Masking — чистый TCP-splice, прокси не
 > расшифровывает TLS и не видит содержимое.
 
