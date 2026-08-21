@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.3.0
+// VERSION: 1.4.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,8 +14,10 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.3.0 - backpressure in relay (pause/resume on drain) + buffer client bytes
-//                arriving during the async DC connect so large payloads are not dropped
+//   LAST_CHANGE: v1.4.0 - wave-1 hardening: set-once pending-slot release (auth-fail paths
+//                no longer leak pendingHandshakes), single drain-listener per relay direction,
+//                handshake listeners detached on mask/reject handoff, bounded handshake and
+//                pending-data buffers (handshake_overflow)
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -39,6 +41,12 @@ import { maskConnection } from "./mask.js";
 const HANDSHAKE_LEN = 64;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+// Memory bounds (512MB box): a valid ClientHello record is <= 16 KiB+5 (RFC 8446 §5.1)
+// and the obfuscated2 handshake is 64 bytes, so 64 KiB of pre-handshake bytes is generous;
+// anything beyond that is a probe or an attack, not a client.
+const HANDSHAKE_BUF_MAX_BYTES = 64 * 1024;
+// Bytes collectable while the DC connection is being established (up to 10s x candidates).
+const PENDING_DATA_MAX_BYTES = 1024 * 1024;
 const TLS_START = [0x16, 0x03, 0x01];
 const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 
@@ -104,6 +112,19 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     pendingHandshakes += 1;
     syncPending();
 
+    // Set-once release guard (telemt UserConnectionReservation pattern): exactly one
+    // decrement per connection regardless of which exit path fires first — relay start,
+    // post-handshake failure (auth fail / user reject / bad dc / exhausted candidates),
+    // or an early close. Without this, failure paths after complete() leaked the slot
+    // and 256 garbage probes could permanently brick the listener (mtproto_pending_cap).
+    let pendingReleased = false;
+    const releasePending = () => {
+      if (pendingReleased) return;
+      pendingReleased = true;
+      pendingHandshakes -= 1;
+      syncPending();
+    };
+
     const secrets = cfg.mtprotoSecrets.map((s) => Buffer.from(s, "hex"));
     const isTls =
       head.length >= 3 && head[0] === TLS_START[0] && head[1] === TLS_START[1] && head[2] === TLS_START[2];
@@ -120,6 +141,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     const finishHandshakeAndRelay = () => {
       const parsed = parseClientHandshake(obfsHandshake.subarray(0, HANDSHAKE_LEN), secrets);
       if (!parsed) {
+        releasePending();
         log("mtproto_auth_fail", "DF-1", socket.remoteAddress);
         socket.destroy();
         return;
@@ -127,6 +149,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       // Per-user limits (multi-tenant): resolve the user by matched secret, enforce cap/expiry/quota.
       const user = userStore ? userStore.resolve(parsed.secret.toString("hex")) : null;
       if (userStore && !userStore.admit(user)) {
+        releasePending();
         log("mtproto_user_reject", "DF-4", socket.remoteAddress, { user: user ? user.user : "unknown" });
         socket.destroy();
         return;
@@ -136,6 +159,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       const resolved = resolveDc(parsed.dcIdx, { preferIpv6: cfg.mtprotoPreferIpv6 });
       const candidates = Array.isArray(resolved) ? resolved : resolved ? [resolved] : [];
       if (candidates.length === 0) {
+        releasePending();
         log("mtproto_bad_dc", "DF-1", socket.remoteAddress, parsed.dcIdx);
         socket.destroy();
         return;
@@ -152,7 +176,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       const startRelay = (dc, upstream) => {
         relayDc = dc;
         relayUpstream = upstream;
-        pendingHandshakes -= 1; // left handshake phase
+        releasePending(); // left handshake phase (idempotent)
         activeConnections += 1;
         syncPending();
         syncActive();
@@ -199,6 +223,10 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // Backpressure: when the DC socket's write buffer is full, pause the client
         // socket and resume it on the DC's 'drain' — prevents unbounded buffering
         // (and OOM on the 512MB box) during large media uploads.
+        // dcPaused guard: a single 'data' chunk can fan out into many records, each
+        // write failing while paused — without the guard every failure attached another
+        // 'drain' listener (MaxListenersExceededWarning under 1 MiB payloads).
+        let dcPaused = false;
         const pushAppDataToDc = (appData) => {
           bytesIn += appData.length;
           if (metrics) metrics.inc("simpleproxy_bytes_in_total", appData.length);
@@ -206,15 +234,21 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           armIdle();
           const plain = parsed.decryptor.decrypt(appData);
           const ok = upstream.write(up.encryptorUp.encrypt(plain));
-          if (!ok) {
+          if (!ok && !dcPaused) {
+            dcPaused = true;
             socket.pause();
-            upstream.once("drain", () => socket.resume());
+            upstream.once("drain", () => {
+              dcPaused = false;
+              socket.resume();
+            });
           }
         };
 
         // Stop the handshake listener; the relay handlers below take over.
         socket.removeListener("data", onData);
 
+        // DC -> client: same single-listener backpressure guard as above, mirrored.
+        let clientPaused = false;
         if (isTls) {
           socket.on("data", (chunk) => {
             for (const appData of tlsReader.feed(chunk)) pushAppDataToDc(appData);
@@ -229,9 +263,13 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             if (userStore && user) userStore.addBytes(user, chunk.length);
             armIdle();
             const ok = socket.write(wrapTlsRecord(chunk));
-            if (!ok) {
+            if (!ok && !clientPaused) {
+              clientPaused = true;
               upstream.pause();
-              socket.once("drain", () => upstream.resume());
+              socket.once("drain", () => {
+                clientPaused = false;
+                upstream.resume();
+              });
             }
           });
         } else {
@@ -242,9 +280,13 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             if (userStore && user) userStore.addBytes(user, chunk.length);
             armIdle();
             const ok = socket.write(chunk);
-            if (!ok) {
+            if (!ok && !clientPaused) {
+              clientPaused = true;
               upstream.pause();
-              socket.once("drain", () => upstream.resume());
+              socket.once("drain", () => {
+                clientPaused = false;
+                upstream.resume();
+              });
             }
           });
         }
@@ -297,6 +339,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             });
             tryConnect();
           } else {
+            releasePending(); // all candidates failed: never entering relay
             log("mtproto_upstream_error", "DF-1", `${dc.host}:${dc.port}`, err.code || err.message);
             socket.destroy();
           }
@@ -312,6 +355,18 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       clearTimeout(timer);
     };
 
+    // Full handoff (mask splice / reject / drop): socket ownership leaves the handshake
+    // state machine entirely. The 'data' listener MUST be removed here — otherwise every
+    // byte of a long masked TLS session keeps flowing into processBuffer and accumulating
+    // in `buf` without bound (remote OOM vector on the 512MB box). complete() deliberately
+    // does NOT use this: the relay still needs onData to collect pendingData during the
+    // async DC connect.
+    const detachForHandoff = () => {
+      detachHandshake();
+      socket.removeListener("data", onData);
+      buf = null;
+    };
+
     const complete = () => {
       completed = true;
       detachHandshake();
@@ -321,6 +376,16 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     const processBuffer = (data) => {
       buf = data;
       if (completed || handedOff) return;
+
+      // Pre-handshake memory bound: no legitimate client needs more than 64 KiB before
+      // the handshake completes (ClientHello <= ~16 KiB, obfuscated2 hello = 64 B).
+      if (buf.length > HANDSHAKE_BUF_MAX_BYTES) {
+        detachForHandoff();
+        releasePending();
+        log("handshake_overflow", "DF-1", socket.remoteAddress, { kind: "handshake_buf", bytes: buf.length });
+        socket.destroy();
+        return;
+      }
 
       if (phase === "plain") {
         if (buf.length < HANDSHAKE_LEN) return;
@@ -334,7 +399,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         if (buf.length < 5) return;
         const recordLen = buf.readUInt16BE(3);
         if (recordLen < 512) {
-          detachHandshake();
+          detachForHandoff();
           log("faketls_reject", "DF-1", socket.remoteAddress, { recordLen });
           socket.destroy();
           return;
@@ -346,7 +411,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         if (!validated) {
           // Non-keyed client (crawler / wrong secret): mask or reject instead of a bare RST,
           // so port 443 is wire-indistinguishable from a real web server.
-          detachHandshake();
+          detachForHandoff();
           log("faketls_auth_fail", "DF-1", socket.remoteAddress, {
             sni: extractSni(clientHello),
             recordLen,
@@ -359,14 +424,14 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // unknown. Absent SNI stays lenient (legacy clients / test emulators without SNI).
         const sni = extractSni(clientHello);
         if (sni !== null && sni !== cfg.mtprotoTlsDomain.toLowerCase()) {
-          detachHandshake();
+          detachForHandoff();
           log("faketls_unknown_sni", "DF-MASK", socket.remoteAddress, { sni });
           routeUnknown(socket, clientHello);
           return;
         }
         // Replay protection: admit each client digest at most once within the guard window.
         if (replayGuard && !replayGuard.admit(validated.digest)) {
-          detachHandshake();
+          detachForHandoff();
           log("faketls_replay", "DF-MASK", socket.remoteAddress);
           if (metrics) metrics.inc("simpleproxy_replay_attacks_total");
           routeUnknown(socket, clientHello);
@@ -428,6 +493,13 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     const onData = (chunk) => {
       if (completed) {
         pendingData = Buffer.concat([pendingData, chunk]);
+        // Bound buffering during the async DC connect window (up to 10s per candidate):
+        // unbounded accumulation here was a remote OOM vector.
+        if (pendingData.length > PENDING_DATA_MAX_BYTES) {
+          releasePending();
+          log("handshake_overflow", "DF-1", socket.remoteAddress, { kind: "pending_data", bytes: pendingData.length });
+          socket.destroy();
+        }
         return;
       }
       processBuffer(Buffer.concat([buf, chunk]));
@@ -441,12 +513,11 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
 
     socket.on("data", onData);
     socket.on("error", () => socket.destroy());
-    // Release the pending slot if the socket dies before entering relay.
+    // Release the pending slot if the socket dies before entering relay. Idempotent:
+    // also covers post-handshake failures where `completed` is already true (the
+    // v1.3.x leak that let garbage probes exhaust mtprotoPendingMax permanently).
     socket.once("close", () => {
-      if (!completed) {
-        pendingHandshakes -= 1;
-        syncPending();
-      }
+      releasePending();
     });
     processBuffer(buf);
     // END_BLOCK_MT_HANDSHAKE

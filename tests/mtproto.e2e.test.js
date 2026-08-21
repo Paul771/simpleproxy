@@ -373,6 +373,15 @@ test("e2e: fake-TLS (ee) handshake -> proxy -> fake DC, data round-trips", async
 });
 
 test("e2e: fake-TLS relay carries a 1 MiB payload (backpressure) without loss", async () => {
+  // Regression guard (wave-1): bursts of failing writes used to stack 'drain'
+  // listeners and trip MaxListenersExceededWarning. The transfer below must not
+  // emit any process warning of that kind.
+  const warnings = [];
+  const onWarning = (w) => {
+    if (w && w.name === "MaxListenersExceededWarning") warnings.push(w);
+  };
+  process.on("warning", onWarning);
+
   const secret = randomBytes(16);
   const fakeDc = await startFakeDc();
   const dcAddr = fakeDc.address();
@@ -441,7 +450,13 @@ test("e2e: fake-TLS relay carries a 1 MiB payload (backpressure) without loss", 
     });
 
     assert.equal(result, payloadHash);
+    assert.equal(
+      warnings.length,
+      0,
+      `relay must not stack drain listeners (got ${warnings.length} MaxListenersExceededWarning)`
+    );
   } finally {
+    process.off("warning", onWarning);
     server.closeAllConnections?.();
     fakeDc.closeAllConnections?.();
     server.close();
