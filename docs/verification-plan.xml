@@ -39,6 +39,7 @@
         <scenario-1 kind="success">PORT подхватывается из env; дефолт 8080 при отсутствии.</scenario-1>
         <scenario-2 kind="success">authUser/authPass читаются из PROXY_USER/PROXY_PASS; заданы оба → auth включена, один → выключена.</scenario-2>
         <scenario-3 kind="failure">Некорректный PORT (не число) → throw INVALID_ENV.</scenario-3>
+        <scenario-4 kind="success">MTPROTO_MASK_RELAY_MAX_BYTES: дефолт 32 MiB (33554432), override парсится, 0 = кап выключен, отрицательное/мусор → throw INVALID_ENV.</scenario-4>
       </scenarios>
       <required-log-markers>
         <marker-1>[config][load][env]</marker-1>
@@ -223,9 +224,10 @@
     <V-M-MASK MODULE="M-MASK" PRIORITY="high">
       <test-files>
         <file>tests/mask.test.js</file>
+        <file>tests/hardening.test.js</file>
       </test-files>
       <module-checks>
-        <check-1>node --test tests/mask.test.js</check-1>
+        <check-1>node --test tests/mask.test.js tests/hardening.test.js</check-1>
       </module-checks>
       <scenarios>
         <scenario-1 kind="success">mask: failed fake-TLS auth (action=mask) → splice к локальному mask-серверу, клиент получает реальный ответ (MASK-OK). Повторный chunk после handoff не рвёт splice.</scenario-1>
@@ -233,6 +235,7 @@
         <scenario-2 kind="success">mask: unknown SNI (SNI ≠ MTPROTO_TLS_DOMAIN) → splice к mask-серверу.</scenario-2>
         <scenario-3 kind="success">reject: action=reject → клиент получает TLS alert 0x15 … 0x70 (unrecognized_name).</scenario-3>
         <scenario-4 kind="success">drop: action=drop → socket.destroy без записи байт (legacy-поведение).</scenario-4>
+        <scenario-6 kind="failure">mask_relay_cap: суммарные байты маскированной сессии превышают MTPROTO_MASK_RELAY_MAX_BYTES → teardown обеих сторон + лог mask_close reason=mask_relay_cap; 0 = кап выключен.</scenario-6>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mask_connect][DF-MASK]</marker-1>
@@ -285,16 +288,22 @@
     <V-M-HARDEN MODULE="M-MTPROTO-SERVER" PRIORITY="medium">
       <test-files>
         <file>tests/mtproto.e2e.test.js</file>
+        <file>tests/hardening.test.js</file>
       </test-files>
       <module-checks>
-        <check-1>node --test tests/mtproto.e2e.test.js</check-1>
+        <check-1>node --test tests/mtproto.e2e.test.js tests/hardening.test.js</check-1>
       </module-checks>
       <scenarios>
         <scenario-1 kind="success">pending-cap: MTPROTO_PENDING_MAX=1 → медленный (slowloris) сокет в handshake удерживает слот, следующий → destroy + лог [proxy][mtproto_pending_cap].</scenario-1>
         <scenario-2 kind="success">pending-слот освобождается при входе в relay и при закрытии сокета до relay.</scenario-2>
+        <scenario-3 kind="success">C-1 leak regression: 10 wrong-secret проб при MTPROTO_PENDING_MAX=4 → каждая закрывается, gauge simpleproxy_pending_mtproto → 0, валидное соединение после burst round-trip (set-once releasePending).</scenario-3>
+        <scenario-4 kind="success">bad-dc (resolver → null): 5 проб подряд, слот освобождается каждый раз (gauge → 0).</scenario-4>
+        <scenario-5 kind="failure">handshake_overflow: пре-хендшейк буфер &gt; 64 KiB и pendingData &gt; 1 MiB при stalled DC-connect → destroy + лог [proxy][handshake_overflow] с kind=handshake_buf|pending_data.</scenario-5>
+        <scenario-6 kind="success">1 MiB fake-TLS relay не порождает process-warning MaxListenersExceededWarning (drain-guard: один listener на направление).</scenario-6>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_pending_cap][DF-4]</marker-1>
+        <marker-2>[proxy][handshake_overflow][DF-1]</marker-2>
       </required-log-markers>
     </V-M-HARDEN>
 

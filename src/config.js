@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -11,7 +11,13 @@
 //
 // START_MODULE_MAP
 //   loadConfig - load and validate config from env
+//   applyConfigUpdate - merge a fresh config into a live config in place (hot-reload)
 // END_MODULE_MAP
+//
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.2.0 - new env MTPROTO_MASK_RELAY_MAX_BYTES (default 32 MiB, 0 = off):
+//                total byte cap for one masked session, enforced by M-MASK
+// END_CHANGE_SUMMARY
 
 import { createBlocklist } from "./blocklist.js";
 
@@ -73,6 +79,7 @@ function parseExpiry(value) {
 //   OUTPUTS: { Config - { port, host, maxTunnels, idleTimeoutMs, authUser, authPass, creds, rules,
 //                          mtprotoSecrets, mtprotoPort, mtprotoMaxConnections, mtprotoHost,
 //                          mtprotoTlsDomain, mtprotoTlsAlpn, mtprotoMaskHost, mtprotoMaskPort,
+//                          mtprotoMaskRelayMaxBytes,
 //                          mtprotoUnknownSniAction, mtprotoReplayWindow, mtprotoReplayTtlMs,
 //                          mtprotoDigestFreshnessMs, mtprotoPreferIpv6,
 //                          mtprotoTlsProfileCapture, mtprotoTlsProfileRefreshMs, mtprotoTlsProfileTimeoutMs,
@@ -160,7 +167,15 @@ export function loadConfig(env = process.env) {
     env.MTPROTO_MASK_HOST && env.MTPROTO_MASK_HOST.trim() !== ""
       ? env.MTPROTO_MASK_HOST.trim()
       : mtprotoTlsDomain;
-  const mtprotoMaskPort = parseIntEnv(env.MTPROTO_MASK_PORT, 443, "MTPROTO_MASK_PORT");
+  const mtprotoMaskPort = parsePortEnv(env.MTPROTO_MASK_PORT, 443, "MTPROTO_MASK_PORT");
+  // Total byte cap for one masked (non-keyed) session, both directions combined.
+  // Bounds memory/traffic of spliced crawlers/probes (telemt-style mask_relay_max_bytes).
+  // 0 disables the cap.
+  const mtprotoMaskRelayMaxBytes = parsePortEnv(
+    env.MTPROTO_MASK_RELAY_MAX_BYTES,
+    33_554_432, // 32 MiB
+    "MTPROTO_MASK_RELAY_MAX_BYTES"
+  );
   // Behaviour on unknown SNI / failed fake-TLS auth: "mask" (splice to mask_host, default),
   // "reject" (emit TLS unrecognized_name alert + close), "drop" (destroy, legacy behaviour).
   const mtprotoUnknownSniAction = parseActionEnv(env.MTPROTO_UNKNOWN_SNI_ACTION, "mask");
@@ -241,6 +256,7 @@ export function loadConfig(env = process.env) {
     mtprotoTlsAlpn,
     mtprotoMaskHost,
     mtprotoMaskPort,
+    mtprotoMaskRelayMaxBytes,
     mtprotoUnknownSniAction,
     mtprotoReplayWindow,
     mtprotoReplayTtlMs,

@@ -1,5 +1,5 @@
 // FILE: src/mask.js
-// VERSION: 1.0.1
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Traffic masking: transparent TCP-splice of non-keyed/unknown-SNI clients to a real web server
 //   SCOPE: connect to mask_host, forward buffered ClientHello, bidirectional splice with idle timer
@@ -14,7 +14,9 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.0.1 - abort upstream without splicing if the client is already gone
+//   LAST_CHANGE: v1.1.0 - bounded masked sessions: total relayed bytes capped via
+//                cfg.mtprotoMaskRelayMaxBytes (teardown reason "mask_relay_cap"; 0 = off)
+//   v1.0.1 - abort upstream without splicing if the client is already gone
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -93,12 +95,32 @@ export function maskConnection({ clientSocket, head, cfg, log, onOpen = () => {}
   };
   armIdle();
 
+  // START_BLOCK_MASK_RELAY_CAP
+  // Total byte cap for the masked session (both directions combined). Non-keyed
+  // clients are unauthenticated, so their relayed traffic must be bounded — a long
+  // spliced session otherwise grows process memory for the benefit of a crawler
+  // (telemt ships an analogous mask_relay_max_bytes default). 0 disables the cap.
+  const maxBytes = cfg.mtprotoMaskRelayMaxBytes ?? 0;
+  let relayBytes = 0;
+  const chargeMaskBytes = (n) => {
+    if (maxBytes <= 0) return true;
+    relayBytes += n;
+    if (relayBytes > maxBytes) {
+      teardown("mask_relay_cap");
+      return false;
+    }
+    return true;
+  };
+  // END_BLOCK_MASK_RELAY_CAP
+
   upstream.on("data", (chunk) => {
     armIdle();
+    if (!chargeMaskBytes(chunk.length)) return;
     if (!clientSocket.destroyed) clientSocket.write(chunk);
   });
   clientSocket.on("data", (chunk) => {
     armIdle();
+    if (!chargeMaskBytes(chunk.length)) return;
     if (!upstream.destroyed) upstream.write(chunk);
   });
   upstream.on("end", () => {
