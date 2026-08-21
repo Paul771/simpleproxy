@@ -47,7 +47,7 @@
     </M-AUTH>
 
     <M-TUNNEL NAME="Tunnel" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Байтовый туннель client↔upstream со счётчиками и idle-таймером</purpose>
+      <purpose>Байтовый туннель client↔upstream со счётчиками, idle-таймером и backpressure (pause/resume на drain)</purpose>
       <path>src/tunnel.js</path>
       <depends>M-LOG</depends>
       <verification-ref>V-M-TUNNEL</verification-ref>
@@ -93,7 +93,7 @@
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (с IPv4↔IPv6 fallback) → relay (FAST_MODE); doppelganger-тайминги, pending-handshake cap, metrics, per-user limits</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (с IPv4↔IPv6 fallback) → relay (FAST_MODE) с backpressure (pause/resume на drain) и буферизацией хвоста при async DC-connect; doppelganger-тайминги, pending-handshake cap, metrics, per-user limits</purpose>
       <path>src/mtproto-server.js</path>
       <depends>M-MTPROTO, M-FAKETLS, M-LOG, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>

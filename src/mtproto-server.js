@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.2.1
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,7 +14,8 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.1 - detach handshake listener before mask/reject; log sni/recordLen/digestPrefix on auth_fail
+//   LAST_CHANGE: v1.3.0 - backpressure in relay (pause/resume on drain) + buffer client bytes
+//                arriving during the async DC connect so large payloads are not dropped
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -114,6 +115,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     let tlsReader = null;
     let obfsHandshake = Buffer.alloc(0);
     let extraAppData = Buffer.alloc(0); // app bytes received beyond the 64-byte obfs handshake
+    let pendingData = Buffer.alloc(0); // client bytes arriving during the async DC connect
 
     const finishHandshakeAndRelay = () => {
       const parsed = parseClientHandshake(obfsHandshake.subarray(0, HANDSHAKE_LEN), secrets);
@@ -194,31 +196,43 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         };
 
         // client -> DC: decrypt client obfuscated2, re-encrypt upstream.
+        // Backpressure: when the DC socket's write buffer is full, pause the client
+        // socket and resume it on the DC's 'drain' — prevents unbounded buffering
+        // (and OOM on the 512MB box) during large media uploads.
         const pushAppDataToDc = (appData) => {
           bytesIn += appData.length;
           if (metrics) metrics.inc("simpleproxy_bytes_in_total", appData.length);
           if (userStore && user) userStore.addBytes(user, appData.length);
           armIdle();
           const plain = parsed.decryptor.decrypt(appData);
-          upstream.write(up.encryptorUp.encrypt(plain));
+          const ok = upstream.write(up.encryptorUp.encrypt(plain));
+          if (!ok) {
+            socket.pause();
+            upstream.once("drain", () => socket.resume());
+          }
         };
 
+        // Stop the handshake listener; the relay handlers below take over.
+        socket.removeListener("data", onData);
+
         if (isTls) {
-          // Feed leftover app bytes that arrived with the handshake.
-          if (extraAppData.length > 0) {
-            pushAppDataToDc(extraAppData);
-            extraAppData = Buffer.alloc(0);
-          }
           socket.on("data", (chunk) => {
             for (const appData of tlsReader.feed(chunk)) pushAppDataToDc(appData);
           });
           // DC -> client: wrap in fake-TLS application-data records.
+          // Backpressure: pause the DC socket when the client's write buffer is full,
+          // resume on the client's 'drain' — prevents unbounded buffering during
+          // large media downloads.
           upstream.on("data", (chunk) => {
             bytesOut += chunk.length;
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
             if (userStore && user) userStore.addBytes(user, chunk.length);
             armIdle();
-            socket.write(wrapTlsRecord(chunk));
+            const ok = socket.write(wrapTlsRecord(chunk));
+            if (!ok) {
+              upstream.pause();
+              socket.once("drain", () => upstream.resume());
+            }
           });
         } else {
           socket.on("data", pushAppDataToDc);
@@ -227,12 +241,28 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
             if (userStore && user) userStore.addBytes(user, chunk.length);
             armIdle();
-            socket.write(chunk);
+            const ok = socket.write(chunk);
+            if (!ok) {
+              upstream.pause();
+              socket.once("drain", () => upstream.resume());
+            }
           });
-          if (extraAppData.length > 0) {
-            pushAppDataToDc(extraAppData);
-            extraAppData = Buffer.alloc(0);
+        }
+
+        // Flush buffered client bytes in arrival order. extraAppData is already app data
+        // (TLS framing stripped during the handshake); pendingData is raw bytes that landed
+        // during the async DC connect window and still needs TLS framing stripped for fake-TLS.
+        if (extraAppData.length > 0) {
+          pushAppDataToDc(extraAppData);
+          extraAppData = Buffer.alloc(0);
+        }
+        if (pendingData.length > 0) {
+          if (isTls) {
+            for (const appData of tlsReader.feed(pendingData)) pushAppDataToDc(appData);
+          } else {
+            pushAppDataToDc(pendingData);
           }
+          pendingData = Buffer.alloc(0);
         }
 
         socket.on("error", () => {});
@@ -279,7 +309,6 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
 
     const detachHandshake = () => {
       handedOff = true;
-      socket.removeListener("data", onData);
       clearTimeout(timer);
     };
 
@@ -396,7 +425,13 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       }
     };
 
-    const onData = (chunk) => processBuffer(Buffer.concat([buf, chunk]));
+    const onData = (chunk) => {
+      if (completed) {
+        pendingData = Buffer.concat([pendingData, chunk]);
+        return;
+      }
+      processBuffer(Buffer.concat([buf, chunk]));
+    };
 
     const timer = setTimeout(() => {
       socket.removeListener("data", onData);

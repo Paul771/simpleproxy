@@ -1,5 +1,5 @@
 // FILE: src/tunnel.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Byte tunnel between client and upstream sockets with byte counters and idle timer
 //   SCOPE: bidirectional piping, idle timeout, socket error handling, close accounting
@@ -58,18 +58,28 @@ export function openTunnel({ clientSocket, upstream, target, cfg, log, onClose =
   };
 
   // START_BLOCK_PUMP
+  // Backpressure: pause the source socket when the destination's write buffer is
+  // full, resume on 'drain' — bounds buffering during large transfers.
   clientSocket.on("data", (chunk) => {
     bytesIn += chunk.length;
     if (metrics) metrics.inc("simpleproxy_bytes_in_total", chunk.length);
     resetIdle();
-    upstream.write(chunk);
+    const ok = upstream.write(chunk);
+    if (!ok) {
+      clientSocket.pause();
+      upstream.once("drain", () => clientSocket.resume());
+    }
   });
 
   upstream.on("data", (chunk) => {
     bytesOut += chunk.length;
     if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
     resetIdle();
-    clientSocket.write(chunk);
+    const ok = clientSocket.write(chunk);
+    if (!ok) {
+      upstream.pause();
+      clientSocket.once("drain", () => upstream.resume());
+    }
   });
 
   const onClientEnd = () => {

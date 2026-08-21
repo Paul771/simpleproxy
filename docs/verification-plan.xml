@@ -180,6 +180,7 @@
         <scenario-3 kind="success">getDcAddress: dc_idx 1..5 → правильные IPv4; 0/6/-99 → null; preferIpv6 → IPv6 (тот же индекс-порядок).</scenario-3>
         <scenario-4 kind="success">E2E (fake-DC): полный handshake клиент→прокси→DC, данные round-trip; неверный secret → закрытие; bad DC → закрытие.</scenario-4>
         <scenario-5 kind="success">Лог [proxy][mtproto_link] с tg://proxy-ссылками при старте (smoke).</scenario-5>
+        <scenario-6 kind="success">1 MiB fake-TLS payload round-trips без потерь (SHA-256 целостность) — backpressure + буферизация хвоста при async DC-connect.</scenario-6>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_connect][DF-1]</marker-1>

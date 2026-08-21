@@ -372,6 +372,83 @@ test("e2e: fake-TLS (ee) handshake -> proxy -> fake DC, data round-trips", async
   }
 });
 
+test("e2e: fake-TLS relay carries a 1 MiB payload (backpressure) without loss", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const { server, addr } = await startProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    () => ({ host: "127.0.0.1", port: dcAddr.port })
+  );
+
+  try {
+    const { handshake: obfsHandshake, stream, encKey, encIv } = buildClientHandshake(
+      secret,
+      PROTO_TAG_ABRIDGED,
+      1
+    );
+    const { hello: tlsHello } = buildFakeTlsClientHello(secret, obfsHandshake);
+
+    // 1 MiB — large enough to overflow the default 16 KiB socket write buffer and
+    // force the relay's pause/resume backpressure path in both directions.
+    const payload = randomBytes(1024 * 1024);
+    const payloadHash = createHash("sha256").update(payload).digest("hex");
+    const sent = stream.encrypt(payload);
+    const clientDec = createAesCtr(encKey, encIv);
+
+    const result = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(
+          Buffer.concat([tlsHello, wrapTlsRecord(obfsHandshake), wrapTlsRecord(sent)])
+        );
+      });
+      let rawBuf = Buffer.alloc(0);
+      let phase = "consume-response";
+      let tlsIn = null;
+      let appBuf = Buffer.alloc(0);
+      const timer = setTimeout(
+        () => reject(new Error(`large-payload timeout, got ${appBuf.length} bytes`)),
+        10000
+      );
+      socket.on("data", (d) => {
+        rawBuf = Buffer.concat([rawBuf, d]);
+        if (phase === "consume-response") {
+          while (rawBuf.length >= 5) {
+            const recLen = rawBuf.readUInt16BE(3);
+            if (rawBuf.length < 5 + recLen) break;
+            const recType = rawBuf[0];
+            rawBuf = rawBuf.subarray(5 + recLen);
+            if (recType === 0x17) {
+              phase = "app-data";
+              tlsIn = createTlsRecordReader();
+              break;
+            }
+          }
+        }
+        if (phase === "app-data" && rawBuf.length > 0) {
+          for (const appData of tlsIn.feed(rawBuf)) appBuf = Buffer.concat([appBuf, appData]);
+          rawBuf = Buffer.alloc(0);
+          if (appBuf.length >= payload.length) {
+            clearTimeout(timer);
+            socket.destroy();
+            const plain = clientDec.decrypt(appBuf.subarray(0, payload.length));
+            resolve(createHash("sha256").update(plain).digest("hex"));
+            return;
+          }
+        }
+      });
+      socket.on("error", reject);
+    });
+
+    assert.equal(result, payloadHash);
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
 test("e2e: fake-TLS with wrong secret is rejected, connection closed", async () => {
   const secret = randomBytes(16);
   const wrong = randomBytes(16);
