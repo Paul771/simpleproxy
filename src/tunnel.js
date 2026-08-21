@@ -1,5 +1,5 @@
 // FILE: src/tunnel.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Byte tunnel between client and upstream sockets with byte counters and idle timer
 //   SCOPE: bidirectional piping, idle timeout, socket error handling, close accounting
@@ -12,6 +12,11 @@
 // START_MODULE_MAP
 //   openTunnel - start bidirectional pump for an established tunnel
 // END_MODULE_MAP
+//
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.2.0 - single 'drain' listener per pump direction (paused guards):
+//                bursts of failing writes no longer stack listeners on the sockets
+// END_CHANGE_SUMMARY
 
 // START_CONTRACT: openTunnel
 //   PURPOSE: Pipe data both ways, track bytes, reset idle timer on any data, tear down on close/error
@@ -60,25 +65,37 @@ export function openTunnel({ clientSocket, upstream, target, cfg, log, onClose =
   // START_BLOCK_PUMP
   // Backpressure: pause the source socket when the destination's write buffer is
   // full, resume on 'drain' — bounds buffering during large transfers.
+  // Paused guards: keep at most one 'drain' listener per direction (a burst of
+  // failing writes in one tick must not stack listeners on the socket).
+  let upstreamPaused = false;
   clientSocket.on("data", (chunk) => {
     bytesIn += chunk.length;
     if (metrics) metrics.inc("simpleproxy_bytes_in_total", chunk.length);
     resetIdle();
     const ok = upstream.write(chunk);
-    if (!ok) {
+    if (!ok && !upstreamPaused) {
+      upstreamPaused = true;
       clientSocket.pause();
-      upstream.once("drain", () => clientSocket.resume());
+      upstream.once("drain", () => {
+        upstreamPaused = false;
+        clientSocket.resume();
+      });
     }
   });
 
+  let clientPaused = false;
   upstream.on("data", (chunk) => {
     bytesOut += chunk.length;
     if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
     resetIdle();
     const ok = clientSocket.write(chunk);
-    if (!ok) {
+    if (!ok && !clientPaused) {
+      clientPaused = true;
       upstream.pause();
-      clientSocket.once("drain", () => upstream.resume());
+      clientSocket.once("drain", () => {
+        clientPaused = false;
+        upstream.resume();
+      });
     }
   });
 
