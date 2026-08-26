@@ -1,5 +1,5 @@
 // FILE: scripts/live-smoke.mjs
-// VERSION: 1.1.0
+// VERSION: 1.1.1
 // START_MODULE_CONTRACT
 //   PURPOSE: Live smoke-test suite against a deployed SimpleProxy instance (Wispbyte / any host)
 //   SCOPE: TCP reachability, CONNECT allowlist/denylist, plain-HTTP 405, plain-MTProto reject,
@@ -28,10 +28,10 @@
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.1.0 - --isp-diag mode (W2-5): Telegram DC reachability table (same
-//                addresses as M-MTPROTO getDcAddressCandidates) and timed fake-TLS
-//                handshake series for diagnosing ISP-side interference (Rostelecom DPI,
-//                IPv6 peering); diagnostic failures are reported as INFO, not FAIL
+//   LAST_CHANGE: v1.1.1 - normalizeSecret(): ee-links ("ee" + 32 hex + hex(domain), e.g.
+//                rutube.ru -> 52+ chars) now reduce to the raw 16-byte secret; previously
+//                only the dd-form (exactly 34 chars) was stripped, so ee users got a bogus
+//                "no secret" for obfs2/faketls/handshake-timing checks
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -71,9 +71,16 @@ for (let i = 0; i < args.length; i++) {
 }
 
 // MTPROTO_SECRET entries may be "user:secret" and/or carry the dd/ee tg://proxy prefix.
+// Accepted forms (lowercased): plain 32-hex; "dd"+32-hex (34); "user:"+any of those;
+// "ee"+32-hex+hex(domain) — e.g. ee<64hex>7275747562652e7275 for rutube.ru (52+ chars).
 function normalizeSecret(raw) {
-  const hex = raw.includes(":") ? raw.slice(raw.lastIndexOf(":") + 1) : raw;
-  if (hex.length === 34 && (hex.startsWith("dd") || hex.startsWith("ee"))) return hex.slice(2);
+  let hex = raw.includes(":") ? raw.slice(raw.lastIndexOf(":") + 1) : raw;
+  hex = hex.trim().toLowerCase();
+  if (/^[0-9a-f]{34,}$/.test(hex) && (hex.startsWith("dd") || hex.startsWith("ee"))) {
+    // tg://proxy prefixed form: the next 32 hex chars are the raw 16-byte MTProto secret;
+    // anything after them is the fake-TLS domain in hex and must be dropped.
+    return hex.slice(2, 34);
+  }
   return hex;
 }
 
