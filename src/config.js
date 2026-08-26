@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -15,8 +15,9 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.0 - new env MTPROTO_MASK_RELAY_MAX_BYTES (default 32 MiB, 0 = off):
-//                total byte cap for one masked session, enforced by M-MASK
+//   LAST_CHANGE: v1.3.0 - new env MTPROTO_USERS_STRICT (default false): deny secrets that
+//                pass the MTProto HMAC but resolve to no user record, instead of the
+//                legacy unlimited fallback (W2-3 deny-unknown multi-tenant mode)
 // END_CHANGE_SUMMARY
 
 import { createBlocklist } from "./blocklist.js";
@@ -133,6 +134,11 @@ export function loadConfig(env = process.env) {
     byteQuota: userQuotas[u.user] != null ? Number(userQuotas[u.user]) : null,
   }));
 
+  // Strict multi-tenant mode (W2-3): when true, a secret that passes the MTProto HMAC but is
+  // NOT present in MTPROTO_USER_SECRETS (i.e. resolves to no user record) is denied instead of
+  // falling back to the legacy unlimited path. Only meaningful together with per-user limits.
+  const mtprotoUsersStrict = parseBoolEnv(env.MTPROTO_USERS_STRICT, false);
+
   const mtprotoPort = parseIntEnv(env.MTPROTO_PORT, 0, "MTPROTO_PORT");
   const mtprotoMaxConnections = parseIntEnv(
     env.MTPROTO_MAX_CONNECTIONS,
@@ -248,6 +254,7 @@ export function loadConfig(env = process.env) {
     rules: DEFAULT_RULES,
     mtprotoSecrets,
     mtprotoUsers,
+    mtprotoUsersStrict,
     mtprotoPort,
     mtprotoMaxConnections,
     mtprotoPendingMax,

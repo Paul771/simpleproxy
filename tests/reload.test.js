@@ -91,3 +91,23 @@ test("applyConfigUpdate: reload preserves derived structures (rules unchanged)",
   assert.ok(cur.rules.length >= 2);
   assert.equal(cur.rules[0].host, "api.telegram.org");
 });
+
+// --- W2-1: multi-tenant fields must be detected so index.js can runtime-swap userStore ---
+test("applyConfigUpdate: detects tenant-table and strict-flag changes", () => {
+  const cur = loadConfig(
+    baseEnv({ MTPROTO_SECRET: `alice:${"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"}`, MTPROTO_USER_QUOTAS: '{"alice":1000}' })
+  );
+  const next = loadConfig(
+    baseEnv({
+      MTPROTO_SECRET: `alice:${"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"}`,
+      MTPROTO_USER_QUOTAS: '{"alice":2000}',
+      MTPROTO_USERS_STRICT: "1",
+    })
+  );
+  const changed = applyConfigUpdate(cur, next);
+  assert.ok(changed.includes("mtprotoUsers"), "tenant table change must be reported");
+  assert.ok(changed.includes("mtprotoUsersStrict"), "strict flag change must be reported");
+  // And the live cfg object carries the swapped values for the runtime swap to consume.
+  assert.equal(cur.mtprotoUsers[0].byteQuota, 2000);
+  assert.equal(cur.mtprotoUsersStrict, true);
+});

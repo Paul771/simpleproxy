@@ -1,5 +1,5 @@
 // FILE: src/index.js
-// VERSION: 1.3.0
+// VERSION: 1.4.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Entry point: loadConfig -> makeLog -> mux(connect + mtproto) -> start
 //   SCOPE: process bootstrap, dependency wiring, tg://proxy link generation
@@ -8,6 +8,13 @@
 //   ROLE: ENTRY_POINT
 //   MAP_MODE: LOCALS
 // END_MODULE_CONTRACT
+
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.4.0 - W2-1 runtime swap on SIGUSR2: userStore.update() and blocklist
+//                rebuild when mtprotoUsers/mtprotoBlocklist change (previously both stayed
+//                boot-time stale), generation counter in reload log, MTProto enable/disable
+//                topology flip flagged as restart_needed
+// END_CHANGE_SUMMARY
 
 import { loadConfig, applyConfigUpdate } from "./config.js";
 import { makeLog } from "./log.js";
@@ -60,11 +67,15 @@ const profileManager = cfg.mtprotoSecrets.length > 0 && cfg.mtprotoTlsProfileCap
     })
   : null;
 if (profileManager) profileManager.start();
-// Per-user secret limits (multi-tenant): built from cfg.mtprotoUsers. When no limits are
-// configured, admit() always returns true -> behaviour is unchanged from the single-tenant case.
-const userStore = cfg.mtprotoUsers.length > 0 ? createUserStore(cfg.mtprotoUsers) : null;
+// Per-user secret limits (multi-tenant): ALWAYS built (even from an empty list) so SIGUSR2
+// reload can swap the tenant table in place via update() — including the 0->N transition
+// when the first user is added without a restart. With an empty table admit(null)=true,
+// preserving single-tenant behaviour; strict-mode denial additionally gates on size() > 0.
+const userStore = createUserStore(cfg.mtprotoUsers);
 // Client-IP blocklist (edge reject). Built from the validated entry strings in cfg.mtprotoBlocklist.
-const blocklist = cfg.mtprotoBlocklist.length > 0 ? createBlocklist(cfg.mtprotoBlocklist) : null;
+// Mutable binding (W2-1): SIGUSR2 rebuilds this object when MTPROTO_BLOCKLIST changes; the mux
+// closure below reads the latest binding on every connection.
+let blocklist = cfg.mtprotoBlocklist.length > 0 ? createBlocklist(cfg.mtprotoBlocklist) : null;
 const handlers = {
   "http-connect": httpHandlers["http-connect"],
   "http-other": httpHandlers["http-other"],
@@ -72,7 +83,7 @@ const handlers = {
 };
 
 const server = createMuxServer(handlers, {
-  isBlocked: blocklist ? (ip) => blocklist.isBlocked(ip) : null,
+  isBlocked: (ip) => (blocklist ? blocklist.isBlocked(ip) : false),
   onBlocked: (ip) => log("blocklist_reject", "DF-BLOCK", ip),
 });
 
@@ -122,7 +133,11 @@ start(server, cfg, log).catch((err) => {
 // each connection, so secret rotation, mask host, TLS domain, caps, doppelganger, etc. take
 // effect immediately. Subsystems with boot-time state (replay guard, profile manager, metrics
 // server, listening port) cannot be reconfigured live — those are flagged for a restart.
-// On Windows SIGUSR2 is not delivered, so this is a no-op there (restart via panel instead).
+// W2-1 runtime swap: stateful subsystems whose boot-time objects would otherwise go stale
+// (userStore, blocklist) are rebuilt/updated in place on reload — a generation counter makes
+// each applied reload observable. On Windows SIGUSR2 is not delivered, so this is a no-op
+// there (restart via panel instead).
+let generation = 0;
 const RESTART_FIELDS = new Set([
   "mtprotoMetricsPort",
   "mtprotoMetricsHost",
@@ -141,12 +156,37 @@ process.on("SIGUSR2", () => {
     log("reload_fail", "DF-RELOAD", err.message);
     return;
   }
+  // Capture pre-merge state BEFORE applyConfigUpdate mutates cfg in place — post-merge
+  // comparisons against cfg would always see the new values (review fix, v1.4.0).
+  const prevHadSecrets = cfg.mtprotoSecrets.length > 0;
   const changed = applyConfigUpdate(cfg, next);
+
+  // Runtime swap: keep counters, replace definitions. userStore.update preserves per-user
+  // active-conn and byte state for surviving usernames; blocklist is stateless so a plain
+  // rebuild is safe. Both were silently stale before v1.4.0.
+  const swapped = [];
+  if (changed.includes("mtprotoUsers")) {
+    userStore.update(next.mtprotoUsers);
+    swapped.push("userStore");
+  }
+  if (changed.includes("mtprotoBlocklist")) {
+    blocklist = next.mtprotoBlocklist.length > 0 ? createBlocklist(next.mtprotoBlocklist) : null;
+    swapped.push("blocklist");
+  }
+
+  // Enabling/disabling MTProto entirely changes mux routing topology -> restart required.
+  const secretsTopologyFlip = prevHadSecrets !== (next.mtprotoSecrets.length > 0);
   const restartNeeded = changed.filter((k) => RESTART_FIELDS.has(k));
+  generation += 1;
   log("reload", "DF-RELOAD", {
+    generation,
     changed: changed.length,
     fields: changed.join(",") || "none",
-    restart_needed: restartNeeded.join(",") || "none",
+    swapped: swapped.join(",") || "none",
+    restart_needed: [
+      ...(secretsTopologyFlip ? ["mtprotoSecrets(topology)"] : []),
+      ...restartNeeded,
+    ].join(",") || "none",
   });
 });
 // END_BLOCK_HOT_RELOAD
