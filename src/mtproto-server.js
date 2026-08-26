@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.4.0
+// VERSION: 1.5.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,10 +14,10 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.4.0 - wave-1 hardening: set-once pending-slot release (auth-fail paths
-//                no longer leak pendingHandshakes), single drain-listener per relay direction,
-//                handshake listeners detached on mask/reject handoff, bounded handshake and
-//                pending-data buffers (handshake_overflow)
+//   LAST_CHANGE: v1.5.0 - wave-2 multi-tenant enforcement: mid-stream per-user byte-quota
+//                teardown (addBytes false -> mtproto_quota_exceeded, W2-2) and strict mode
+//                denying unknown secrets (MTPROTO_USERS_STRICT -> mtproto_user_unknown, W2-3);
+//                tornDown guard at relay data-handler entry
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -147,12 +147,23 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         return;
       }
       // Per-user limits (multi-tenant): resolve the user by matched secret, enforce cap/expiry/quota.
+      // Strict mode (W2-3): a valid-HMAC secret that resolves to no user record is denied
+      // instead of silently taking the legacy unlimited path. Gated on size() > 0 so an
+      // EMPTY tenant table under strict mode keeps serving single-tenant secrets.
       const user = userStore ? userStore.resolve(parsed.secret.toString("hex")) : null;
-      if (userStore && !userStore.admit(user)) {
-        releasePending();
-        log("mtproto_user_reject", "DF-4", socket.remoteAddress, { user: user ? user.user : "unknown" });
-        socket.destroy();
-        return;
+      if (userStore) {
+        const unknownDenied =
+          cfg.mtprotoUsersStrict === true && userStore.size() > 0 && user === null;
+        if (unknownDenied || !userStore.admit(user)) {
+          releasePending();
+          if (unknownDenied && metrics) metrics.inc("simpleproxy_user_unknown_total");
+          log(unknownDenied ? "mtproto_user_unknown" : "mtproto_user_reject", "DF-4", socket.remoteAddress, {
+            user: user ? user.user : "unknown",
+            strict: cfg.mtprotoUsersStrict === true,
+          });
+          socket.destroy();
+          return;
+        }
       }
       // DC resolution with IPv4↔IPv6 fallback: resolveDc may return a single {host,port}
       // (legacy/test resolver) or an ordered candidate array (production). Normalise to a list.
@@ -228,9 +239,18 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // 'drain' listener (MaxListenersExceededWarning under 1 MiB payloads).
         let dcPaused = false;
         const pushAppDataToDc = (appData) => {
+          if (tornDown) return;
           bytesIn += appData.length;
           if (metrics) metrics.inc("simpleproxy_bytes_in_total", appData.length);
-          if (userStore && user) userStore.addBytes(user, appData.length);
+          // Per-user byte quota, mid-stream enforcement (W2-2): addBytes charges first and
+          // returns false once the quota is crossed -> tear the relay down immediately
+          // instead of letting an exhausted user keep transferring until TCP EOF.
+          if (userStore && user && !userStore.addBytes(user, appData.length)) {
+            log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_in: bytesIn });
+            if (metrics) metrics.inc("simpleproxy_quota_exceeded_total");
+            teardown();
+            return;
+          }
           armIdle();
           const plain = parsed.decryptor.decrypt(appData);
           const ok = upstream.write(up.encryptorUp.encrypt(plain));
@@ -258,9 +278,15 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           // resume on the client's 'drain' — prevents unbounded buffering during
           // large media downloads.
           upstream.on("data", (chunk) => {
+            if (tornDown) return;
             bytesOut += chunk.length;
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
-            if (userStore && user) userStore.addBytes(user, chunk.length);
+            if (userStore && user && !userStore.addBytes(user, chunk.length)) {
+              log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut });
+              if (metrics) metrics.inc("simpleproxy_quota_exceeded_total");
+              teardown();
+              return;
+            }
             armIdle();
             const ok = socket.write(wrapTlsRecord(chunk));
             if (!ok && !clientPaused) {
@@ -275,9 +301,15 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         } else {
           socket.on("data", pushAppDataToDc);
           upstream.on("data", (chunk) => {
+            if (tornDown) return;
             bytesOut += chunk.length;
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
-            if (userStore && user) userStore.addBytes(user, chunk.length);
+            if (userStore && user && !userStore.addBytes(user, chunk.length)) {
+              log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut });
+              if (metrics) metrics.inc("simpleproxy_quota_exceeded_total");
+              teardown();
+              return;
+            }
             armIdle();
             const ok = socket.write(chunk);
             if (!ok && !clientPaused) {

@@ -1,5 +1,5 @@
 // FILE: src/user-store.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Per-user secret management: resolve-by-secret, concurrent-conn cap, expiry, byte-quota
 //   SCOPE: multi-tenant limits over a list of {user, secretHex, maxConns, expiresAt, byteQuota}
@@ -13,12 +13,20 @@
 //   createUserStore - build a stateful per-user admit/release/addBytes guard
 // END_MODULE_MAP
 
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - update(users) for SIGUSR2 hot-reload: swap the user table
+//               in place, preserving active-conn and byte counters by username
+//               (W2-1 runtime swap; previously reload updated cfg.mtprotoUsers but
+//               the live store kept serving the boot-time list forever).
+// END_CHANGE_SUMMARY
+
 // START_CONTRACT: createUserStore
 //   PURPOSE: Build a stateful store that resolves a secret to a user and enforces per-user limits
 //   INPUTS: { users: Array<{ user, secretHex, maxConns: number|null, expiresAt: number|null,
 //                          byteQuota: number|null }> }
 //   OUTPUTS: { resolve(hex): User|null, admit(user): boolean, release(user): void,
-//             addBytes(user, n): boolean, snapshot(): Record }
+//             addBytes(user, n): boolean, snapshot(): Record, update(users): void,
+//             size(): number }
 //   SIDE_EFFECTS: maintains per-user active-conn and byte counters (stateful)
 //   LINKS: M-USER-STORE
 // END_CONTRACT: createUserStore
@@ -27,6 +35,7 @@ export function createUserStore(users = []) {
   const bySecret = new Map(users.map((u) => [u.secretHex.toLowerCase(), u]));
   const active = new Map(); // user -> active connection count
   const bytes = new Map(); // user -> cumulative bytes
+  let currentUsers = users;
 
   const resolve = (hex) => {
     if (typeof hex !== "string") return null;
@@ -61,7 +70,7 @@ export function createUserStore(users = []) {
 
   const snapshot = () => {
     const out = {};
-    for (const u of users) {
+    for (const u of currentUsers) {
       out[u.user] = {
         active: active.get(u.user) ?? 0,
         bytes: bytes.get(u.user) ?? 0,
@@ -73,6 +82,22 @@ export function createUserStore(users = []) {
     return out;
   };
 
-  return { resolve, admit, release, addBytes, snapshot };
+  // Runtime swap for hot-reload (telemt maestro pattern): replace the user table without
+  // discarding counters. Kept usernames preserve their active/byte state across reloads
+  // (a quota must not reset just because MTPROTO_USER_QUOTAS was edited); removed users
+  // drop out of resolution and snapshot, while their in-flight connections release
+  // harmlessly against the stale User objects they already hold.
+  const update = (nextUsers) => {
+    bySecret.clear();
+    for (const u of nextUsers) bySecret.set(u.secretHex.toLowerCase(), u);
+    currentUsers = nextUsers;
+  };
+
+  // Number of configured tenants. Gates strict-mode denial: an EMPTY table under
+  // MTPROTO_USERS_STRICT must not blackhole every secret (nothing to resolve against),
+  // so strict enforcement only applies once at least one tenant exists.
+  const size = () => currentUsers.length;
+
+  return { resolve, admit, release, addBytes, snapshot, update, size };
   // END_BLOCK_STORE
 }

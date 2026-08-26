@@ -1,16 +1,27 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
-//            buffers, bounded masked sessions
+//            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
+//            byte-quota teardown, strict unknown-user denial, CONNECT header slowloris guard
 //   SCOPE: C-1 pendingHandshakes leak (auth-fail / bad-dc paths), B4 buffer caps
-//          (handshake_overflow), B3 mask relay byte cap, MTPROTO_MASK_RELAY_MAX_BYTES config
-//   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG
-//   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG
+//          (handshake_overflow), B3 mask relay byte cap, MTPROTO_MASK_RELAY_MAX_BYTES config;
+//          W2-2 mtproto_quota_exceeded teardown, W2-3 MTPROTO_USERS_STRICT deny-unknown,
+//          W2-4 connect_header_timeout on stalled partial CONNECT headers
+//   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
+//            M-PROXY
+//   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
 //   ROLE: TEST
 //   MAP_MODE: LOCALS
 // END_MODULE_CONTRACT
 //
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - wave-2 regression tests added: quota mid-stream teardown
+//               (mtproto_quota_exceeded + simpleproxy_quota_exceeded_total), strict-mode
+//               unknown-secret denial (mtproto_user_unknown + legacy path preserved),
+//               CONNECT header timeout (408 after cfg.connectHeaderTimeoutMs)
+// END_CHANGE_SUMMARY
+
 // START_MODULE_MAP
 //   sha256 - SHA-256 over concatenated parts (obfuscated2 key derivation helper)
 //   buildClientHandshake - build a valid/wrong obfuscated2 client handshake + crypto state
@@ -19,11 +30,14 @@
 //   buildFakeTlsClientHello - synthetic fake-TLS ClientHello carrying an obfs handshake
 //   startEchoMaskServer - mask upstream echoing received bytes back
 //   startProxy - mux server wiring a real mtproto handler with injectable resolver/metrics
+//   awaitClose - await socket closure (or error) with a deadline
+//   roundTripPayload - full obfuscated2 round trip through the proxy (encrypt -> echo -> decrypt)
 // END_MODULE_MAP
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import { Duplex } from "node:stream";
 import { randomBytes, createHash, createHmac } from "node:crypto";
 import { createMuxServer } from "../src/mux.js";
 import { createMtprotoHandler } from "../src/mtproto-server.js";
@@ -33,6 +47,8 @@ import { createAesCtr } from "../src/mtproto.js";
 import { loadConfig } from "../src/config.js";
 import { wrapTlsRecord } from "../src/faketls.js";
 import { maskConnection } from "../src/mask.js";
+import { createUserStore } from "../src/user-store.js";
+import { createConnectHandler } from "../src/proxy.js";
 
 const PROTO_TAG_ABRIDGED = Buffer.from([0xef, 0xef, 0xef, 0xef]);
 
@@ -449,4 +465,279 @@ test("config: MTPROTO_MASK_RELAY_MAX_BYTES default, override, disable, invalid",
     () => loadConfig({ MTPROTO_MASK_RELAY_MAX_BYTES: "soon" }),
     /INVALID_ENV/
   );
+});
+
+// --- Wave 2 helpers ---
+
+// START_CONTRACT: roundTripPayload
+//   PURPOSE: Full obfuscated2 round trip against a running proxy: handshake -> encrypted
+//            payload -> DC echo -> decrypt, asserting byte equality end-to-end
+//   INPUTS: { addr: {port}, secretBuf: Buffer(32), payload: string, timeoutMs?: number }
+//   OUTPUTS: { Promise<string> - decrypted echo of payload }
+//   SIDE_EFFECTS: opens/closes one TCP connection
+//   LINKS: fn-buildClientHandshake, V-M-MTPROTO-SERVER
+// END_CONTRACT: roundTripPayload
+function roundTripPayload(addr, secretBuf, payload, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const { handshake, stream, encKey, encIv } = buildClientHandshake(secretBuf, PROTO_TAG_ABRIDGED, 1);
+    const sent = stream.encrypt(Buffer.from(payload));
+    const clientDec = createAesCtr(encKey, encIv);
+    const socket = net.connect(addr.port, "127.0.0.1", () => {
+      socket.write(Buffer.concat([handshake, sent]));
+    });
+    let buf = Buffer.alloc(0);
+    const timer = setTimeout(() => reject(new Error(`round-trip timeout, got ${buf.length} bytes`)), timeoutMs);
+    socket.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (buf.length >= payload.length) {
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(clientDec.decrypt(buf.subarray(0, payload.length)).toString());
+      }
+    });
+    socket.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+// Multi-tenant proxy fixture: real mtproto handler behind mux, injectable userStore/log/
+// metrics so markers and counters can be asserted deterministically.
+async function startTenantProxy(cfgOverrides, userStore, logCollector, metrics) {
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 120_000,
+    rules: [],
+    mtprotoSecrets: [],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoPendingMax: 256,
+    ...cfgOverrides,
+  };
+  const handlers = {
+    "http-connect": () => {},
+    "http-other": () => {},
+    "mtproto": createMtprotoHandler(cfg, logCollector, () => ({ host: "127.0.0.1", port: dcAddr.port }), null, null, null, metrics, userStore),
+  };
+  const server = createMuxServer(handlers);
+  await new Promise((resolve) => server.listen(cfg.port, cfg.host, resolve));
+  return { server, fakeDc, addr: server.address() };
+}
+
+test("hardening: per-user byte quota tears the relay down mid-stream (mtproto_quota_exceeded)", async () => {
+  const aliceSecret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const userStore = createUserStore([
+    { user: "alice", secretHex: aliceSecret.toString("hex"), maxConns: null, expiresAt: null, byteQuota: 1024 },
+  ]);
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [aliceSecret.toString("hex")] },
+    userStore,
+    logCollector,
+    metrics
+  );
+
+  try {
+    // One blast of 4 KiB crosses the 1 KiB quota during relay setup -> immediate teardown.
+    const { handshake } = buildClientHandshake(aliceSecret, PROTO_TAG_ABRIDGED, 1);
+    const closed = await new Promise((resolve) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.end(Buffer.concat([handshake, randomBytes(4 * 1024)]));
+      });
+      socket.once("close", () => resolve(true));
+      socket.once("error", () => resolve(true));
+      setTimeout(() => {
+        socket.destroy();
+        resolve(false);
+      }, 4000);
+    });
+
+    assert.equal(closed, true, "quota-exhausted connection must be torn down");
+    assert.ok(
+      logs.some((l) => l.event === "mtproto_quota_exceeded"),
+      "mtproto_quota_exceeded marker must be logged"
+    );
+    assert.equal(
+      metrics.get("simpleproxy_quota_exceeded_total") >= 1,
+      true,
+      "simpleproxy_quota_exceeded_total must count the kick"
+    );
+    assert.equal(
+      userStore.snapshot().alice.bytes >= 1024,
+      true,
+      "bytes must be charged up to (and past) the quota before the kick"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: strict mode denies unknown secrets but keeps listed users working", async () => {
+  const aliceSecret = randomBytes(16);
+  const mallorySecret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  // Only alice exists in the tenant table; mallory's secret passes HMAC (it IS configured)
+  // but resolves to no user record.
+  const userStore = createUserStore([
+    { user: "alice", secretHex: aliceSecret.toString("hex"), maxConns: null, expiresAt: null, byteQuota: null },
+  ]);
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [aliceSecret.toString("hex"), mallorySecret.toString("hex")], mtprotoUsersStrict: true },
+    userStore,
+    logCollector,
+    metrics
+  );
+
+  try {
+    const { handshake } = buildClientHandshake(mallorySecret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(addr.port, "127.0.0.1", () => socket.end(handshake));
+    assert.equal(await awaitClose(socket), true, "unknown secret must be denied in strict mode");
+    assert.ok(
+      logs.some((l) => l.event === "mtproto_user_unknown"),
+      "mtproto_user_unknown marker must be logged"
+    );
+    assert.equal(metrics.get("simpleproxy_user_unknown_total"), 1);
+
+    // Strict mode must not punish legitimate tenants.
+    const echoed = await roundTripPayload(addr, aliceSecret, "strict-alice-ok");
+    assert.equal(echoed, "strict-alice-ok", "listed user must keep working under strict mode");
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: strict mode with an EMPTY tenant table keeps single-tenant secrets working", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  // Store exists (always-built since W2-1) but holds zero tenants; strict flag on.
+  // Nothing to resolve against -> denial must stay gated off (size() === 0).
+  const userStore = createUserStore([]);
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoUsersStrict: true },
+    userStore,
+    logCollector,
+    createMetrics()
+  );
+
+  try {
+    const echoed = await roundTripPayload(addr, secret, "empty-table-ok");
+    assert.equal(echoed, "empty-table-ok", "strict mode without tenants must not blackhole secrets");
+    assert.ok(
+      !logs.some((l) => l.event === "mtproto_user_unknown"),
+      "no unknown-user denials expected with an empty tenant table"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: non-strict mode preserves the legacy unlimited path for unknown secrets", async () => {
+  const aliceSecret = randomBytes(16);
+  const mallorySecret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const userStore = createUserStore([
+    { user: "alice", secretHex: aliceSecret.toString("hex"), maxConns: null, expiresAt: null, byteQuota: null },
+  ]);
+  // No mtprotoUsersStrict -> default false -> mallory takes the legacy unlimited path.
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [aliceSecret.toString("hex"), mallorySecret.toString("hex")] },
+    userStore,
+    logCollector,
+    createMetrics()
+  );
+
+  try {
+    const echoed = await roundTripPayload(addr, mallorySecret, "legacy-mallory-ok");
+    assert.equal(echoed, "legacy-mallory-ok", "unknown secret must still relay when strict mode is off");
+    assert.ok(
+      !logs.some((l) => l.event === "mtproto_user_unknown"),
+      "strict-only marker must stay silent"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: stalled partial CONNECT header is answered 408 and destroyed (W2-4)", async () => {
+  const logs = [];
+  const written = [];
+  const sock = new Duplex({
+    read() {},
+    write(chunk, _enc, cb) {
+      written.push(Buffer.from(chunk));
+      cb();
+    },
+  });
+  sock.remoteAddress = "203.0.113.77";
+
+  const handlers = createConnectHandler(
+    { maxTunnels: 8, connectHeaderTimeoutMs: 50 },
+    () => true, // allow
+    () => true, // auth
+    (event) => logs.push(event)
+  );
+
+  // Incomplete header: method line without the terminating CRLFCRLF.
+  handlers["http-connect"](sock, Buffer.from("CONNECT api.telegram.org:443 HTTP/1.1\r\n"));
+  await new Promise((r) => setTimeout(r, 150));
+
+  assert.equal(sock.destroyed, true, "stalled header socket must be destroyed");
+  assert.ok(
+    Buffer.concat(written).toString("latin1").includes("408"),
+    "server must answer 408 Request Timeout"
+  );
+  assert.ok(logs.includes("connect_header_timeout"), "connect_header_timeout marker must be logged");
+
+  // Regression guard: a COMPLETED header must never hit the timer (auth-fail answers 407
+  // synchronously instead of dialing upstream).
+  const logs2 = [];
+  const written2 = [];
+  const sock2 = new Duplex({
+    read() {},
+    write(chunk, _enc, cb) {
+      written2.push(Buffer.from(chunk));
+      cb();
+    },
+  });
+  sock2.remoteAddress = "203.0.113.78";
+  const handlers2 = createConnectHandler(
+    { maxTunnels: 8, connectHeaderTimeoutMs: 50 },
+    () => true,
+    () => false, // force 407 without touching the network
+    (event) => logs2.push(event)
+  );
+  handlers2["http-connect"](
+    sock2,
+    Buffer.from("CONNECT api.telegram.org:443 HTTP/1.1\r\nHost: api.telegram.org:443\r\n\r\n")
+  );
+  await new Promise((r) => setTimeout(r, 150));
+
+  assert.ok(
+    Buffer.concat(written2).toString("latin1").includes("407"),
+    "complete header must proceed to normal handling (407 here)"
+  );
+  assert.ok(!logs2.includes("connect_header_timeout"), "timer must not fire for complete headers");
 });
