@@ -95,8 +95,10 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_METRICS_HOST` | `0.0.0.0` | Хост, на котором слушает `/metrics`-сервер |
 | `MTPROTO_USER_MAX_CONNS` | — | JSON-карта `{user: N}` — лимит одновременных MTProto-соединений на пользователя |
 | `MTPROTO_USER_EXPIRATIONS` | — | JSON-карта `{user: "ISO-8601" | epochMs}` — срок действия секрета пользователя |
-| `MTPROTO_USER_QUOTAS` | — | JSON-карта `{user: bytes}` — суммарная байтовая квота пользователя |
+| `MTPROTO_USER_QUOTAS` | — | JSON-карта `{user: bytes}` — суммарная байтовая квота пользователя; исчерпание → разрыв соединения прямо в релее (`mtproto_quota_exceeded`) |
+| `MTPROTO_USERS_STRICT` | `false` | Запретить секреты, прошедшие MTProto-HMAC, но отсутствующие в tenant-таблице (`1`/`true`/`yes`/`on`). Пустая таблица = режим не действует |
 | `MTPROTO_BLOCKLIST` | — | Client-IP blocklist: CIDR/голые IP через запятую (IPv4/IPv6). Заблокированный IP → silent destroy на edge |
+| `MTPROTO_MASK_RELAY_MAX_BYTES` | `33554432` | Кап байт на одну маскированную сессию (splice к mask_host); превышение → teardown (`mask_relay_cap`). `0` = выключен |
 
 ## MTProto proxy (официальные клиенты Telegram)
 
@@ -205,8 +207,9 @@ curl -x http://<адрес-и-порт-от-wispbyte> https://api.telegram.org
 **Prometheus-метрики** (`MTPROTO_METRICS_PORT`, off по умолчанию): side-порт `/metrics` отдаёт
 text-exposition (v0.0.4) со счётчиками (`*_http_connections_total`, `*_mtproto_connections_total`,
 `*_bytes_in_total`, `*_bytes_out_total`, `*_replay_attacks_total`, `*_mask_splices_total`,
-`*_pending_caps_total`, `*_rejected_total`) и gauges (`*_active_tunnels`, `*_active_mtproto`,
-`*_pending_mtproto`). Ноль зависимостей — крошечный HTTP-сервер на `node:net`.
+`*_pending_caps_total`, `*_rejected_total`, `*_quota_exceeded_total`, `*_user_unknown_total`)
+и gauges (`*_active_tunnels`, `*_active_mtproto`, `*_pending_mtproto`). Ноль зависимостей —
+крошечный HTTP-сервер на `node:net`.
 
 ```bash
 # scrape
@@ -216,11 +219,25 @@ curl http://<host>:9091/metrics
 
 **Hot-reload конфига (SIGUSR2)**: `kill -USR2 <pid>` перечитывает env и сливает новый конфиг
 в live-объект in-place. Обработчики читают `cfg.*` на каждом соединении, поэтому **ротация
-секретов, смена mask-host/TLS-domain/caps/doppelganger применяются без рестарта**. Подсистемы
-с boot-time state (replay guard, profile manager, metrics-сервер, слушающий порт) помечаются
-как `restart_needed` в логе `[proxy][reload]`. На Windows `SIGUSR2` не доставляется — используйте
-рестарт через панель. При ошибке валидации env логируется `[proxy][reload_fail]` и старый
+секретов, смена mask-host/TLS-domain/caps/doppelganger применяются без рестарта**. Tenant-таблица
+(`MTPROTO_SECRET`/`MTPROTO_USER_*`) и blocklist тоже меняются на лету — счётчики пользователей
+сохраняются (`[proxy][reload] swapped=...`, поле `generation` растёт с каждым reload).
+Подсистемы с boot-time state (replay guard, profile manager, metrics-сервер, слушающий порт,
+включение/выключение MTProto целиком) помечаются как `restart_needed` в логе `[proxy][reload]`.
+На Windows `SIGUSR2` не доставляется — используйте рестарт через панель. При ошибке валидации env
+логируется `[proxy][reload_fail]` и старый
 конфиг сохраняется.
+
+**Live smoke-test** (`scripts/live-smoke.mjs`): прогон против развёрнутого инстанса — TCP,
+CONNECT allow/deny, 405, mask-splice, obfs2/fake-TLS handshake. Режим `--isp-diag` (запускать
+с клиентской сети, например из-под Ростелекома): таблица достижимости DC Telegram
+(IPv4/IPv6, те же адреса, что dialит сам прокси) и серия из 5 таймированных fake-TLS
+handshake'ов к прокси (p50/max, детект reset'ов/тротлинга на плече клиент↔VPS).
+Диагностика печатается как INFO и не влияет на exit-code.
+
+```bash
+node scripts/live-smoke.mjs <host:port> --secret <hex> --isp-diag
+```
 
 ### Multi-tenant: per-user секреты
 
@@ -237,6 +254,17 @@ MTPROTO_USER_QUOTAS='{"alice":104857600}'             # 100 МБ суммарн�
 При handshake прокси находит user по секрету и проверяет: не истёк ли срок, не исчерпана ли
 байтовая квота, не превышен ли лимит одновременных. Отказ → `destroy` + лог
 `[proxy][mtproto_user_reject]`. Без лимитов — обратная совместимость (admit всегда true).
+
+**Строгий режим** (`MTPROTO_USERS_STRICT=1`): секрет, прошедший MTProto-HMAC, но отсутствующий
+в tenant-таблице (например, остаток старого `MTPROTO_SECRET`), отвергается с логом
+`[proxy][mtproto_user_unknown]` вместо ухода в legacy-путь без лимитов. Пустая tenant-таблица
+режим не включает. Квота enforcement работает и **посреди релея**: исчерпание квоты рвёт
+соединение немедленно (`[proxy][mtproto_quota_exceeded]`, метрика
+`simpleproxy_quota_exceeded_total`), а не только на новом handshake.
+
+Hot-reload (`SIGUSR2`) подхватывает изменения tenant-таблицы и blocklist без рестарта:
+счётчики байтов/активных соединений выживающих пользователей сохраняются
+(`[proxy][reload] swapped=userStore`).
 
 ### Этап 3: IPv6 fallback и blocklist
 
@@ -260,9 +288,11 @@ MTPROTO_BLOCKLIST="10.0.0.0/8, 192.168.1.5, 2001:db8::/32"
 ## Ограничения
 
 - Только HTTPS-трафик через `CONNECT` (plain-HTTP не пересылается — `405`).
-- HTTP: только домены `*.telegram.org:443`; остальное — `403`.
+- HTTP: только домены `*.telegram.org:443`; остальное — `403`. Неполный CONNECT-заголовок →
+  `408` по таймауту 10 с (slowloris-защита).
 - MTProto: только `*.telegram.org` DC-IP, порт 443; секреты simple/dd/ee (fake-TLS).
-- Anti-DPI masking — TCP-splice к mask_host без TLS-терминации; Middle-End Pool / SOCKS5-upstream не реализуется (вне скоупа).
+- Anti-DPI masking — TCP-splice к mask_host без TLS-терминации; маскированная сессия ограничена
+  `MTPROTO_MASK_RELAY_MAX_BYTES` (32 МиБ по умолчанию). Middle-End Pool / SOCKS5-upstream не реализуется (вне скоупа).
 - Масштаб: десятки параллельных ботов + сотни MTProto-клиентов комфортно; тысячи упрутся в лимит CPU 35% Wispbyte.
 
 ## Структура
@@ -283,9 +313,9 @@ src/mask.js            — M-MASK: traffic-masking (TCP-splice к mask_host)
 src/replay-guard.js    — M-REPLAY: LRU+TTL replay-защита по digest
 src/tls-profile.js     — M-TLS-PROFILE: capture & replay структуры TLS server-flight
 src/metrics.js         — M-METRICS: Prometheus text-exposition реестр + /metrics side-port
-src/user-store.js      — M-USER-STORE: per-user секреты, cap/expiry/quota (multi-tenant)
+src/user-store.js      — M-USER-STORE: per-user секреты, cap/expiry/quota + update() для hot-reload (multi-tenant)
 src/blocklist.js       — M-BLOCKLIST: client-IP blocklist (CIDR/bare IP, IPv4/IPv6, edge-reject)
-tests/                 — node:test (юнит + e2e, 127 тестов)
+tests/                 — node:test (юнит + e2e, 147 тестов)
 docs/                  — GRACE-документы проекта
 ```
 

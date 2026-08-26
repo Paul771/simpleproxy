@@ -40,6 +40,7 @@
         <scenario-2 kind="success">authUser/authPass читаются из PROXY_USER/PROXY_PASS; заданы оба → auth включена, один → выключена.</scenario-2>
         <scenario-3 kind="failure">Некорректный PORT (не число) → throw INVALID_ENV.</scenario-3>
         <scenario-4 kind="success">MTPROTO_MASK_RELAY_MAX_BYTES: дефолт 32 MiB (33554432), override парсится, 0 = кап выключен, отрицательное/мусор → throw INVALID_ENV.</scenario-4>
+        <scenario-5 kind="success" wave="2">MTPROTO_USERS_STRICT: дефолт false; "1"/"true"/"yes"/"on" → true; прочее → false. Поле mtprotoUsersStrict в конфиге; hot-reload детектирует смену.</scenario-5>
       </scenarios>
       <required-log-markers>
         <marker-1>[config][load][env]</marker-1>
@@ -127,6 +128,7 @@
     <V-M-PROXY MODULE="M-PROXY" PRIORITY="high">
       <test-files>
         <file>tests/tunnel.e2e.test.js</file>
+        <file>tests/hardening.test.js</file>
       </test-files>
       <module-checks>
         <check-1>node --test tests/</check-1>
@@ -137,6 +139,7 @@
         <scenario-2 kind="success">CONNECT example.com → 403 (UC-002); CONNECT с неверной auth → 407 (UC-005).</scenario-2>
         <scenario-3 kind="failure">maxTunnels+1 → 503 (UC-003).</scenario-3>
         <scenario-4 kind="success">В stdout нет ничего кроме [proxy][...] строк (redaction).</scenario-4>
+        <scenario-5 kind="failure" wave="2">Неполный CONNECT-заголовок без продолжения → 408 + destroy после CONNECT_HEADER_TIMEOUT_MS (10с; тестовый override cfg.connectHeaderTimeoutMs); полный заголовок таймер не задевает.</scenario-5>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][connect][DF-1]</marker-1>
@@ -145,6 +148,7 @@
         <marker-4>[proxy][cap_limit][DF-4]</marker-4>
         <marker-5>[proxy][reject_http][UC-4]</marker-5>
         <marker-6>[server][listen][start]</marker-6>
+        <marker-7>[proxy][connect_header_timeout][DF-1]</marker-7>
       </required-log-markers>
       <phase-follow-up>Graceful shutdown по SIGTERM/SIGINT; smoke на Wispbyte с curl -x.</phase-follow-up>
     </V-M-PROXY>
@@ -300,10 +304,14 @@
         <scenario-4 kind="success">bad-dc (resolver → null): 5 проб подряд, слот освобождается каждый раз (gauge → 0).</scenario-4>
         <scenario-5 kind="failure">handshake_overflow: пре-хендшейк буфер &gt; 64 KiB и pendingData &gt; 1 MiB при stalled DC-connect → destroy + лог [proxy][handshake_overflow] с kind=handshake_buf|pending_data.</scenario-5>
         <scenario-6 kind="success">1 MiB fake-TLS relay не порождает process-warning MaxListenersExceededWarning (drain-guard: один listener на направление).</scenario-6>
+        <scenario-7 kind="failure" wave="2">W2-2 quota teardown: user c byteQuota=1024, клиент шлёт 4 KiB после handshake → соединение рвётся, лог [proxy][mtproto_quota_exceeded], счётчик simpleproxy_quota_exceeded_total ≥ 1, snapshot bytes ≥ квоты (charge-then-kick).</scenario-7>
+        <scenario-8 kind="failure" wave="2">W2-3 strict: секрет вне tenant-таблицы при MTPROTO_USERS_STRICT=1 → destroy + [proxy][mtproto_user_unknown] + simpleproxy_user_unknown_total=1; валидный tenant round-trip работает; strict=false → legacy-путь сохранён; пустая таблица + strict → single-tenant работает.</scenario-8>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_pending_cap][DF-4]</marker-1>
         <marker-2>[proxy][handshake_overflow][DF-1]</marker-2>
+        <marker-3>[proxy][mtproto_quota_exceeded][DF-USER]</marker-3>
+        <marker-4>[proxy][mtproto_user_unknown][DF-4]</marker-4>
       </required-log-markers>
     </V-M-HARDEN>
 
@@ -338,9 +346,12 @@
         <scenario-3 kind="failure">expired user (expiresAt в прошлом) → admit false; future expiry → true.</scenario-3>
         <scenario-4 kind="success">byte-quota: addBytes накапливает; admit false при превышении квоты.</scenario-4>
         <scenario-5 kind="success">config: MTPROTO_SECRET=user:secret парсится в mtprotoUsers; MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS (JSON) применяются.</scenario-5>
+        <scenario-6 kind="success" wave="2">W2-1 update(): swap таблицы сохраняет active/bytes по username (квота не сбрасывается reload'ом); удалённый юзер перестаёт резолвиться, его in-flight release не бросает; добавленный стартует с нуля; изменённые лимиты действуют сразу.</scenario-6>
+        <scenario-7 kind="success" wave="2">config: MTPROTO_USERS_STRICT парсится как boolean (дефолт false; "1"/"true" → true).</scenario-7>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_user_reject][DF-4]</marker-1>
+        <marker-2>[proxy][mtproto_user_unknown][DF-4]</marker-2>
       </required-log-markers>
     </V-M-USER-STORE>
 
@@ -355,6 +366,8 @@
         <scenario-1 kind="success">applyConfigUpdate: копирует mutable поля in-place, сохраняет port/host; identical config → пустой change-set.</scenario-1>
         <scenario-2 kind="success">deep equality для массивов/объектов (mtprotoSecrets, mtprotoUsers) — содержимое-равные не считаются changed.</scenario-2>
         <scenario-3 kind="success">rules (allowlist default) не затираются при reload.</scenario-3>
+        <scenario-4 kind="success" wave="2">W2-1: change-set детектирует mtprotoUsers (смена tenant-таблицы) и mtprotoUsersStrict; live-cfg после merge несёт новые значения для runtime-swap.</scenario-4>
+        <scenario-5 kind="success" wave="2">POSIX manual: SIGUSR2 при живых соединениях → [proxy][reload] с generation++ и swapped=userStore[,blocklist]; счётчики квот выживших юзеров сохраняются; включение/выключение MTProto → restart_needed=mtprotoSecrets(topology). На Windows — рестарт через панель.</scenario-5>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][reload][DF-RELOAD]</marker-1>
@@ -388,9 +401,11 @@
       <module-checks>
         <check-1>node scripts/live-smoke.mjs --secret &lt;hex&gt; (против задеплоенного инстанса)</check-1>
         <check-2>node scripts/live-smoke.mjs --secret &lt;hex&gt; --compare-mask (byte-compare mask splice vs origin)</check-2>
+        <check-3 wave="2">node scripts/live-smoke.mjs &lt;host:port&gt; --secret &lt;hex&gt; --isp-diag (с клиентской сети ISP)</check-3>
       </module-checks>
       <scenarios>
         <scenario-1 kind="success">8/8: tcp, connect-telegram 200, connect-denied 403, plain-http 405, plain-mt-reject close, mask-splice байт-в-байт равен origin, obfs2 relay открыт, faketls ServerHello.</scenario-1>
+        <scenario-2 kind="success" wave="2">--isp-diag (W2-5): таблица dc{1..5}-ipv4/ipv6 (адреса = TG_DATACENTERS_V4/V6 из M-MTPROTO), verdict-строка; handshake-timing 5 проб с tcp/serverhello p50/max; reset/timeout → isp-verdict INFO. Диагностика не влияет на exit-code (INFO vs FAIL).</scenario-2>
       </scenarios>
     </V-M-LIVE-SMOKE>
 

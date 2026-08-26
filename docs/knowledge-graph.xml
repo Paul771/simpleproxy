@@ -163,12 +163,12 @@
     </M-METRICS>
 
     <M-USER-STORE NAME="UserStore" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Per-user secret management: resolve-by-secret, concurrent-conn cap, expiry, byte-quota (multi-tenant)</purpose>
+      <purpose>Per-user secret management: resolve-by-secret, concurrent-conn cap, expiry, byte-quota (multi-tenant) + update()/size() runtime swap для hot-reload</purpose>
       <path>src/user-store.js</path>
       <depends>none</depends>
       <verification-ref>V-M-USER-STORE</verification-ref>
       <annotations>
-        <fn-createUserStore PURPOSE="Stateful admit/release/addBytes guard по user-записям" />
+        <fn-createUserStore PURPOSE="Stateful admit/release/addBytes guard по user-записям; update(users) сохраняет счётчики по username; size() гейт strict-режима" />
       </annotations>
     </M-USER-STORE>
 
@@ -181,6 +181,16 @@
         <fn-createBlocklist PURPOSE="Валидировать записи и построить isBlocked(ip) predicate" />
       </annotations>
     </M-BLOCKLIST>
+
+    <M-INDEX NAME="Index" TYPE="ENTRY_POINT" STATUS="implemented">
+      <purpose>Entry point: loadConfig → makeLog → mux(connect + mtproto) → start; bootstrap wiring, tg://proxy links, SIGUSR2 runtime swap (userStore/blocklist, generation counter)</purpose>
+      <path>src/index.js</path>
+      <depends>M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO, M-FAKETLS, M-MASK, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE, M-BLOCKLIST</depends>
+      <verification-ref>V-M-RELOAD</verification-ref>
+      <annotations>
+        <fn-boot PURPOSE="BOOT block (wiring) + HOT_RELOAD block (SIGUSR2 swap, restart-needed detection)" />
+      </annotations>
+    </M-INDEX>
 
     <M-LIVE-SMOKE NAME="LiveSmoke" TYPE="SCRIPT" STATUS="implemented">
       <purpose>Live smoke-тест задеплоенного инстанса: TCP, CONNECT allowlist/denylist, 405, plain-MTProto reject, mask-splice (byte-compare vs origin), obfs2 + fake-TLS handshake</purpose>
@@ -216,6 +226,14 @@
     <CrossLink from="M-MTPROTO-SERVER" to="M-LOG" relation="logs via formatter" />
     <CrossLink from="M-LIVE-SMOKE" to="M-MTPROTO-SERVER" relation="exercises obfs2/fake-TLS handshake live" />
     <CrossLink from="M-LIVE-SMOKE" to="M-MASK" relation="verifies mask-splice byte-equal vs origin" />
+    <CrossLink from="M-INDEX" to="M-MUX" relation="wires handlers and starts the mux server" />
+    <CrossLink from="M-INDEX" to="M-CONFIG" relation="loadConfig + SIGUSR2 applyConfigUpdate runtime swap" />
+    <CrossLink from="M-INDEX" to="M-USER-STORE" relation="builds store (always) and update()s it on reload" />
+    <CrossLink from="M-INDEX" to="M-BLOCKLIST" relation="rebuilds blocklist object on reload (let-binding)" />
+    <CrossLink from="M-INDEX" to="M-METRICS" relation="creates registry, starts /metrics side-port" />
+    <CrossLink from="M-INDEX" to="M-REPLAY" relation="constructs replay guard at boot" />
+    <CrossLink from="M-INDEX" to="M-TLS-PROFILE" relation="constructs profile manager, starts capture" />
+    <CrossLink from="M-INDEX" to="M-MTPROTO-SERVER" relation="createMtprotoHandler wiring into mux" />
 
   </Project>
 </KnowledgeGraph>

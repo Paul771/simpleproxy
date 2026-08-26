@@ -69,7 +69,7 @@
     </UC-006>
     <UC-007>
       <Actor>TelegramClient</Actor>
-      <Action>Официальный клиент Telegram подключается по ссылке tg://proxy?server=...&port=...&secret=...</Action>
+      <Action>Официальный клиент Telegram подключается по ссылке tg://proxy?server=...&amp;port=...&amp;secret=...</Action>
       <Goal>MTProto obfuscated2 handshake валидируется, трафик релеится к DC Telegram; simple, dd и ee (fake-TLS) секреты работают</Goal>
       <Preconditions>MTPROTO_SECRET задан; клиент использует валидный secret</Preconditions>
       <AcceptanceCriteria>handshake с верным секретом → соединение к DC → данные проходят; неверный секрет → маскирование/закрытие; dc_idx → правильный DC; ee (fake-TLS) round-trip</AcceptanceCriteria>
@@ -142,12 +142,30 @@
     <UC-015>
       <Actor>Operator</Actor>
       <Action>Раздаёт прокси нескольким пользователям: MTPROTO_SECRET=user:secret + лимиты/сроки/квоты</Action>
-      <Goal>Per-user: cap одновременных соединений, expiry-срок секрета, cumulative byte-quota</Goal>
+      <Goal>Per-user: cap одновременных соединений, expiry-срок секрета, cumulative byte-quota (enforcement и посреди релея)</Goal>
       <Preconditions>MTPROTO_SECRET в формате user:secret; MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS — JSON-карты</Preconditions>
-      <AcceptanceCriteria>истёкший/превышивший лимит пользователь → destroy + лог [proxy][mtproto_user_reject]; без лимитов → обр. совместимость</AcceptanceCriteria>
+      <AcceptanceCriteria>истёкший/превышивший лимит пользователь → destroy + лог [proxy][mtproto_user_reject]; исчерпание квоты в релее → teardown + [proxy][mtproto_quota_exceeded]; без лимитов → обр. совместимость; MTPROTO_USERS_STRICT=1 → секрет вне tenant-таблицы → [proxy][mtproto_user_unknown]</AcceptanceCriteria>
       <Priority>medium</Priority>
       <RelatedFlows>DF-USER</RelatedFlows>
     </UC-015>
+    <UC-018 wave="2">
+      <Actor>Attacker</Actor>
+      <Action>Шлёт частичный CONNECT-заголовок HTTP-прокси и зависает (slowloris на http-connect ветке mux)</Action>
+      <Goal>Bounded ожидание: неполный заголовок получает 408 и destroy по таймауту вместо вечного удержания сокета</Goal>
+      <Preconditions>CONNECT_HEADER_TIMEOUT_MS=10с (константа; cfg.connectHeaderTimeoutMs для тестов)</Preconditions>
+      <AcceptanceCriteria>stall &gt; таймаута → 408 Request Timeout + [proxy][connect_header_timeout] + destroy; полный заголовок не задевает таймер; MAX_HEADER_BYTES=16KiB остаётся size-bound</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-1</RelatedFlows>
+    </UC-018>
+    <UC-019 wave="2">
+      <Actor>Operator</Actor>
+      <Action>Меняет tenant-таблицу (MTPROTO_SECRET/MTPROTO_USER_*) или blocklist и шлёт SIGUSR2 без рестарта</Action>
+      <Goal>Runtime swap: userStore.update() сохраняет байтовые счётчики/активные соединения выживших юзеров; blocklist пересобирается; generation++ в [proxy][reload]</Goal>
+      <Preconditions>POSIX (Windows — рестарт); userStore строится всегда, включая пустую таблицу</Preconditions>
+      <AcceptanceCriteria>[proxy][reload] содержит swapped=userStore[,blocklist] и растущий generation; квоты не сбрасываются reload'ом; добавление первого юзера работает без рестарта; включение/выключение MTProto целиком → restart_needed=mtprotoSecrets(topology)</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-RELOAD, DF-USER</RelatedFlows>
+    </UC-019>
     <UC-016>
       <Actor>TelegramClient</Actor>
       <Action>Подключается к DC, у которого недоступна предпочитаемая адресная семья (IPv4 или IPv6)</Action>
@@ -185,6 +203,7 @@
     <constraint-4>Прозрачность: HTTP-заголовки внутри TLS и тела запросов/ответов не модифицируются и не логируются.</constraint-4>
     <constraint-5>Порт из env PORT (default 8080), слушать 0.0.0.0; graceful shutdown по SIGTERM/SIGINT.</constraint-5>
     <constraint-6>Secrets (токены ботов, Proxy-Authorization) никогда не попадают в логи.</constraint-6>
+    <constraint-7 wave="2">Bounded memory на 512MB: пре-хендшейк буферы ограничены (64KiB handshake / 1MiB pendingData, [proxy][handshake_overflow]); маскированные сессии — MTPROTO_MASK_RELAY_MAX_BYTES (32 MiB, mask_relay_cap); неполный CONNECT-заголовок — 408 по таймауту; per-user квота рвёт релей mid-stream (mtproto_quota_exceeded).</constraint-7>
   </Constraints>
 
   <Risks>

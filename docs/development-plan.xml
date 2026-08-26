@@ -10,7 +10,7 @@
       <contract>
         <purpose>Читает env и возвращает валидный конфиг прокси</purpose>
         <inputs>
-          <param name="env" type="Record<string, string|undefined>" />
+          <param name="env" type="Record&lt;string, string|undefined>" />
         </inputs>
         <outputs>
           <param name="Config" type="{ port, host, maxTunnels, idleTimeoutMs, authUser?, authPass?, rules, mtproto*, mtprotoBlocklist }" />
@@ -34,7 +34,7 @@
       </observability>
       <verification-ref>V-M-CONFIG</verification-ref>
       <notes>
-        <note-1>Порт из env PORT (default 8080), host 0.0.0.0, maxTunnels 32, idleTimeoutMs 120_000; authUser/authPass из PROXY_USER/PROXY_PASS (оба заданы — auth включена).</note-1>
+        <note-1>Порт из env PORT (default 8080), host 0.0.0.0, maxTunnels 32, idleTimeoutMs 120_000; authUser/authPass из PROXY_USER/PROXY_PASS (оба заданы - auth включена). MTPROTO_MASK_RELAY_MAX_BYTES: дефолт 32 MiB (33_554_432), 0 = кап маскированной сессии выключен. MTPROTO_USERS_STRICT (v1.3.0, дефолт false): deny секретов вне tenant-таблицы; parseBoolEnv ("1"/"true"/"yes"/"on").</note-1>
       </notes>
     </M-CONFIG>
 
@@ -180,7 +180,7 @@
         </inputs>
         <outputs>
           <param name="handlers" type="{ http-connect, http-other }" />
-          <param name="Promise<void>" type="start(): listen + graceful shutdown" />
+          <param name="Promise&lt;void>" type="start(): listen + graceful shutdown" />
         </outputs>
         <errors>
           <error code="none" />
@@ -284,7 +284,7 @@
         <inputs>
           <param name="cfg" type="Config" />
           <param name="log" type="Log" />
-          <param name="resolveDc" type="(dcIdx, opts) => Array<{host,port}> | {host,port} | null" />
+          <param name="resolveDc" type="(dcIdx, opts) => Array&lt;{host,port}> | {host,port} | null" />
         </inputs>
         <outputs>
           <param name="(socket, head) => void" type="Обработчик для mux" />
@@ -296,10 +296,11 @@
       <interface>
         <export-createMtprotoHandler PURPOSE="Создать mtproto-обработчик для mux" />
       </interface>
-      <depends>M-MTPROTO, M-LOG, M-FAKETLS, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
+      <depends>M-MTPROTO, M-LOG, M-FAKETLS, M-REPLAY, M-TLS-PROFILE, M-MASK, M-METRICS, M-USER-STORE</depends>
       <target>
         <source>src/mtproto-server.js</source>
         <tests>tests/mtproto.e2e.test.js</tests>
+        <tests>tests/hardening.test.js</tests>
       </target>
       <observability>
         <log-prefix>[mtproto]</log-prefix>
@@ -308,6 +309,8 @@
       <verification-ref>V-M-MTPROTO</verification-ref>
       <notes>
         <note-1>FAST_MODE: клиент→DC перешифровка (decrypt клиента → encrypt upstream); DC→клиент байт-в-байт. resolveDc может вернуть массив кандидатов — TCP connect-failure → следующий кандидат (лог mtproto_dc_fallback); одиночный {host,port} нормализуется (обр. совместимость).</note-1>
+        <note-2>v1.4.0 hardening: set-once releasePending (нет утечки pendingHandshakes), drain-guard по одному listener на направление релея, detachForHandoff на mask/reject путях, капы HANDSHAKE_BUF_MAX_BYTES=64KiB / PENDING_DATA_MAX_BYTES=1MiB ([proxy][handshake_overflow]).</note-2>
+        <note-3>v1.5.0 wave-2: квота юзера enforcement в I/O-пути — addBytes=false → mtproto_quota_exceeded + teardown (W2-2); strict MTPROTO_USERS_STRICT (size()&gt;0 гейт) → mtproto_user_unknown для секретов вне tenant-таблицы (W2-3).</note-3>
       </notes>
     </M-MTPROTO-SERVER>
 
@@ -376,6 +379,7 @@
       <verification-ref>V-M-MASK</verification-ref>
       <notes>
         <note-1>Чистый TCP-splice (без TLS-терминации); буферизованный ClientHello форвардится upstream первым. Собственный idle-таймер, no-op error handlers.</note-1>
+        <note-2>v1.1.0: bounded masked sessions — chargeMaskBytes считает суммарные байты сессии, превышение cfg.mtprotoMaskRelayMaxBytes → teardown + [proxy][mask_close] reason=mask_relay_cap (анти-OOM от unauthenticated сплайсов; дефолт 32 MiB, 0 = off).</note-2>
       </notes>
     </M-MASK>
 
@@ -478,21 +482,24 @@
 
     <M-USER-STORE NAME="UserStore" TYPE="CORE_LOGIC" LAYER="1" ORDER="9" STATUS="implemented">
       <contract>
-        <purpose>Per-user secret management: resolve-by-secret, concurrent-conn cap, expiry, byte-quota (multi-tenant)</purpose>
+        <purpose>Per-user secret management: resolve-by-secret, concurrent-conn cap, expiry, byte-quota (multi-tenant) + in-place table swap for hot-reload</purpose>
         <inputs>
-          <param name="users" type="Array<{ user, secretHex, maxConns, expiresAt, byteQuota }>" />
+          <param name="users" type="Array&lt;{ user, secretHex, maxConns, expiresAt, byteQuota }>" />
           <param name="hex" type="string" />
           <param name="user" type="User" />
           <param name="n" type="number" />
         </inputs>
         <outputs>
           <param name="User | null" type="resolve" />
-          <param name="boolean" type="admit / addBytes" />
+          <param name="boolean" type="admit / addBytes (addBytes=false → квота исчерпана, charge-then-kick)" />
+          <param name="void" type="release / update(users)" />
+          <param name="number" type="size() — активная длина tenant-таблицы" />
+          <param name="Record" type="snapshot()" />
         </outputs>
         <errors><error code="none" /></errors>
       </contract>
       <interface>
-        <export-createUserStore PURPOSE="Stateful admit/release/addBytes guard" />
+        <export-createUserStore PURPOSE="Stateful admit/release/addBytes guard + update()/size() для runtime swap" />
       </interface>
       <depends>none</depends>
       <target>
@@ -506,6 +513,7 @@
       <verification-ref>V-M-USER-STORE</verification-ref>
       <notes>
         <note-1>MTPROTO_SECRET парсится как user:secret (bare → "default"). MTPROTO_USER_MAX_CONNS/EXPIRATIONS/QUOTAS — JSON-карты. admit без лимитов всегда true (обр. совместимость).</note-1>
+        <note-2>v1.1.0: update(users) меняет таблицу на лету, сохраняя active/bytes по username (квота переживает reload); удалённые юзеры исчезают из resolve/snapshot, их in-flight release безопасен. size() гейтит strict-режим: пустая таблица при MTPROTO_USERS_STRICT=1 не режет single-tenant секреты.</note-2>
       </notes>
     </M-USER-STORE>
 
@@ -540,6 +548,35 @@
         <note-1>node:net.BlockList.check требует family для IPv6 — per-family BlockList, family передаётся явно на add/check. ::ffff: (v4-mapped) нормализуется. config хранит валидированные строки (reload-friendly), runtime-объект строит index.js.</note-1>
       </notes>
     </M-BLOCKLIST>
+
+    <M-INDEX NAME="Index" TYPE="ENTRY_POINT" LAYER="2" ORDER="11" STATUS="implemented">
+      <contract>
+        <purpose>Entry point: loadConfig → makeLog → mux(connect + mtproto) → start; process bootstrap, dependency wiring, tg://proxy link generation</purpose>
+        <inputs>
+          <param name="process.env" type="Record&lt;string, string|undefined>" />
+        </inputs>
+        <outputs>
+          <param name="running server" type="listening mux + опциональный /metrics side-port + SIGUSR2/SIGTERM/SIGINT handlers" />
+        </outputs>
+        <errors><error code="INVALID_ENV - loadConfig failure exits(1)" /></errors>
+      </contract>
+      <interface>
+        <fn-boot PURPOSE="BOOT block: cfg/log/allow/auth/metrics/handlers/server wiring; HOT_RELOAD block: SIGUSR2 runtime swap + restart-needed detection" />
+      </interface>
+      <depends>M-CONFIG, M-LOG, M-ALLOW, M-AUTH, M-PROXY, M-MUX, M-MTPROTO, M-FAKETLS, M-MASK, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE, M-BLOCKLIST</depends>
+      <target>
+        <source>src/index.js</source>
+      </target>
+      <observability>
+        <log-prefix>[proxy]</log-prefix>
+        <critical-block>HOT_RELOAD</critical-block>
+      </observability>
+      <verification-ref>V-M-RELOAD</verification-ref>
+      <notes>
+        <note-1>ROLE ENTRY_POINT, MAP_MODE LOCALS (см. MODULE_CONTRACT в файле). userStore строится ВСЕГДА (в т.ч. из пустого списка) — иначе reload не смог бы добавить первого юзера без рестарта (v1.4.0). blocklist — let-binding: mux-closure читает свежий объект после rebuild.</note-1>
+        <note-2>Печать tg://proxy-ссылок (simple/dd/ee) на listening; Windows: SIGUSR2 недоступен.</note-2>
+      </notes>
+    </M-INDEX>
   </Modules>
 
   <DataFlow>
@@ -586,14 +623,15 @@
     <DF-RELOAD NAME="ConfigHotReload" TRIGGER="Сигнал SIGUSR2 процессу (POSIX); на Windows — no-op">
       <step-1>loadConfig() → при INVALID_ENV лог [proxy][reload_fail], старый конфиг сохраняется</step-1>
       <step-2>applyConfigUpdate(cfg, next): in-place мутация всех полей кроме port/host; handlers читают cfg.* fresh → секреты/маска/caps применяются сразу</step-2>
-      <step-3>поля boot-time state (replay guard, profile manager, metrics server, listen port) → flagged restart_needed</step-3>
-      <evidence>[proxy][reload] { changed, fields, restart_needed }</evidence>
+      <step-3>v1.4.0 runtime swap (W2-1): mtprotoUsers changed → userStore.update(next.mtprotoUsers) со сохранением счётчиков; mtprotoBlocklist changed → rebuild blocklist-объекта (mutable binding в index.js); generation++ в логе</step-3>
+      <step-4>поля boot-time state (replay guard, profile manager, metrics server, listen port) и topology-flip MTProto on/off → flagged restart_needed</step-4>
+      <evidence>[proxy][reload] { generation, changed, fields, swapped, restart_needed }</evidence>
     </DF-RELOAD>
     <DF-USER NAME="PerUserLimits" TRIGGER="MTProto handshake с валидным секретом, сопоставленным user-записи">
-      <step-1>userStore.resolve(secretHex) → User</step-1>
+      <step-1>userStore.resolve(secretHex) → User; strict (MTPROTO_USERS_STRICT=1, size()&gt;0) и user=null → destroy + [proxy][mtproto_user_unknown] + simpleproxy_user_unknown_total (W2-3)</step-1>
       <step-2>admit: expired / over byteQuota / over maxConns → false → destroy + лог [proxy][mtproto_user_reject]</step-2>
-      <step-3>на relay: addBytes(user, len) на каждый chunk; на close: release(user)</step-3>
-      <evidence>[proxy][mtproto_user_reject][DF-4]; per-user snapshot доступен через metrics/тесты</evidence>
+      <step-3>на relay: addBytes(user, len) на каждый chunk; addBytes=false → квота исчерпана посреди релея → teardown + [proxy][mtproto_quota_exceeded] (W2-2); на close: release(user)</step-3>
+      <evidence>[proxy][mtproto_user_reject][DF-4], [proxy][mtproto_user_unknown][DF-4], [proxy][mtproto_quota_exceeded][DF-USER]; per-user snapshot доступен через metrics/тесты</evidence>
     </DF-USER>
     <DF-BLOCK NAME="BlocklistEdge" TRIGGER="TCP-соединение от IP, попавшего в MTPROTO_BLOCKLIST">
       <step-1>mux: isBlocked(remoteAddress) → true</step-1>
@@ -606,6 +644,18 @@
       <step-3>все кандидаты исчерпаны → destroy + лог [proxy][mtproto_upstream_error]</step-3>
       <evidence>[proxy][mtproto_dc_fallback][DF-1]; e2e: dead-первый-кандидат → round-trip через второй</evidence>
     </DF-DC-FALLBACK>
+    <DF-TLS-PROFILE NAME="TlsProfileCaptureReplay" TRIGGER="MTPROTO_TLS_PROFILE_CAPTURE=true и periodic refresh interval (M-M-TLS-PROFILE)">
+      <step-1>profile manager: TLS-connect к MTPROTO_TLS_DOMAIN:443, capture структуры server-flight (records, sizes, ALPN, delays)</step-1>
+      <step-2>refresh каждые MTPROTO_TLS_PROFILE_REFRESH_MS; таймаут захвата MTPROTO_TLS_PROFILE_TIMEOUT_MS</step-2>
+      <step-3>buildServerHello при ee-handshake использует последний профиль вместо синтетики</step-3>
+      <evidence>[proxy][tls_profile][DF-TLS-PROFILE]; tests/tls-profile.test.js</evidence>
+    </DF-TLS-PROFILE>
+    <DF-DOPPELGANGER NAME="DoppelgangerTiming" TRIGGER="ee-handshake при MTPROTO_DOPPELGANGER=true и непустом profile.recordDelays">
+      <step-1>response = buildServerHello(..., profile) → splitTlsRecords(response)</step-1>
+      <step-2>записи отправляются с inter-arrival задержками из профиля (cap MTPROTO_DOPPELGANGER_MAX_DELAY_MS), не burst'ом</step-2>
+      <step-3>нет профиля/выключен → одиночный write (fallback)</step-3>
+      <evidence>[proxy][doppelganger][DF-DOPPELGANGER] { records, delays }</evidence>
+    </DF-DOPPELGANGER>
   </DataFlow>
 
   <ImplementationOrder>
