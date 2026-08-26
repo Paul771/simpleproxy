@@ -1,13 +1,17 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
-//            byte-quota teardown, strict unknown-user denial, CONNECT header slowloris guard
+//            byte-quota teardown, strict unknown-user denial, CONNECT header slowloris guard;
+//            Wave-A DPI-window resilience: MTProto-specific idle/handshake timeout overrides
+//            and handshake-death observability
 //   SCOPE: C-1 pendingHandshakes leak (auth-fail / bad-dc paths), B4 buffer caps
 //          (handshake_overflow), B3 mask relay byte cap, MTPROTO_MASK_RELAY_MAX_BYTES config;
 //          W2-2 mtproto_quota_exceeded teardown, W2-3 MTPROTO_USERS_STRICT deny-unknown,
-//          W2-4 connect_header_timeout on stalled partial CONNECT headers
+//          W2-4 connect_header_timeout on stalled partial CONNECT headers;
+//          A-1 mtprotoIdleTimeoutMs override, A-2 mtprotoHandshakeTimeoutMs +
+//          mtproto_handshake_timeout marker + simpleproxy_handshake_timeouts_total
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
 //            M-PROXY
 //   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
@@ -16,10 +20,10 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.1.0 - wave-2 regression tests added: quota mid-stream teardown
-//               (mtproto_quota_exceeded + simpleproxy_quota_exceeded_total), strict-mode
-//               unknown-secret denial (mtproto_user_unknown + legacy path preserved),
-//               CONNECT header timeout (408 after cfg.connectHeaderTimeoutMs)
+//   LAST_CHANGE: v1.2.0 - wave-A tests added: config parsing of MTPROTO_IDLE_TIMEOUT_MS /
+//               MTPROTO_HANDSHAKE_TIMEOUT_MS (unset -> null inherit), idle override reaps a
+//               stalled relay per override value, handshake timeout logs the marker and bumps
+//               simpleproxy_handshake_timeouts_total
 // END_CHANGE_SUMMARY
 
 // START_MODULE_MAP
@@ -740,4 +744,109 @@ test("hardening: stalled partial CONNECT header is answered 408 and destroyed (W
     "complete header must proceed to normal handling (407 here)"
   );
   assert.ok(!logs2.includes("connect_header_timeout"), "timer must not fire for complete headers");
+});
+
+// --- Wave A: DPI-window resilience ---
+
+test("config: MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS unset -> null, garbage -> INVALID_ENV", () => {
+  const defaults = loadConfig({ MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f" });
+  assert.equal(defaults.mtprotoIdleTimeoutMs, null, "unset idle override must inherit (null)");
+  assert.equal(defaults.mtprotoHandshakeTimeoutMs, null, "unset handshake override must inherit (null)");
+
+  const custom = loadConfig({
+    MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f",
+    MTPROTO_IDLE_TIMEOUT_MS: "300000",
+    MTPROTO_HANDSHAKE_TIMEOUT_MS: "8000",
+  });
+  assert.equal(custom.mtprotoIdleTimeoutMs, 300_000);
+  assert.equal(custom.mtprotoHandshakeTimeoutMs, 8_000);
+
+  for (const bad of ["0", "-5", "soon"]) {
+    assert.throws(
+      () => loadConfig({ MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f", MTPROTO_IDLE_TIMEOUT_MS: bad }),
+      /INVALID_ENV/,
+      `MTPROTO_IDLE_TIMEOUT_MS="${bad}" must be rejected`
+    );
+    assert.throws(
+      () => loadConfig({ MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f", MTPROTO_HANDSHAKE_TIMEOUT_MS: bad }),
+      /INVALID_ENV/,
+      `MTPROTO_HANDSHAKE_TIMEOUT_MS="${bad}" must be rejected`
+    );
+  }
+});
+
+test("hardening: handshake timeout logs marker and counts simpleproxy_handshake_timeouts_total (A-2)", async () => {
+  const secret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  // Silent client: opens the socket and sends nothing — exactly what a DPI drop window
+  // looks like from the server side (flight discarded before reaching us).
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoHandshakeTimeoutMs: 80 },
+    createUserStore([]),
+    logCollector,
+    metrics
+  );
+
+  try {
+    // Junk bytes route through the mux into the mtproto handler (PEEK_LEN=8 satisfied,
+    // classify: not HTTP), but stay far short of the 64-byte handshake -> only the
+    // override can reap this.
+    const socket = net.connect(addr.port, "127.0.0.1", () =>
+      socket.write(Buffer.alloc(16, 0x01))
+    );
+    assert.equal(await awaitClose(socket, 1500), true, "silent socket must be reaped by the override");
+
+    assert.ok(
+      logs.some((l) => l.event === "mtproto_handshake_timeout"),
+      "mtproto_handshake_timeout must be logged on timer fire"
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(metrics.get("simpleproxy_handshake_timeouts_total"), 1);
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: MTPROTO_IDLE_TIMEOUT_MS override reaps a stalled relay per its value (A-1)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoIdleTimeoutMs: 150 },
+    createUserStore([]),
+    logCollector,
+    createMetrics()
+  );
+
+  try {
+    // Establish the relay (handshake + DC connect) and then go silent: no further bytes,
+    // socket kept OPEN (no FIN — a half-closed socket would tear down before the timer).
+    // The shared idleTimeoutMs is 120s here; only the MTProto override may reap this pair.
+    const closed = await new Promise((resolve) => {
+      const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+      const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(handshake));
+      socket.once("close", () => resolve(true));
+      socket.once("error", () => resolve(true));
+      setTimeout(() => {
+        socket.destroy();
+        resolve(false);
+      }, 2000);
+    });
+
+    assert.equal(closed, true, "stalled relay must be reaped by the MTProto-specific override");
+    assert.ok(
+      logs.some((l) => l.event === "mtproto_idle_timeout"),
+      "mtproto_idle_timeout must be logged"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
 });

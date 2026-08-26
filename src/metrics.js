@@ -1,5 +1,5 @@
 // FILE: src/metrics.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Prometheus text-exposition metrics registry + side-port /metrics HTTP server (zero deps)
 //   SCOPE: counter/gauge accounting, Prometheus text rendering, minimal HTTP responder for /metrics
@@ -15,8 +15,8 @@
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.1.0 - METRIC_DEFS += simpleproxy_quota_exceeded_total,
-//                simpleproxy_user_unknown_total (wave-2 multi-tenant observability)
+//   LAST_CHANGE: v1.2.0 - METRIC_DEFS += simpleproxy_handshake_timeouts_total
+//                (DPI-window observability, wave-A)
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -38,6 +38,7 @@ const METRIC_DEFS = [
   { name: "simpleproxy_rejected_total", type: "counter", help: "Connections rejected by the active-connection cap" },
   { name: "simpleproxy_quota_exceeded_total", type: "counter", help: "MTProto relays torn down mid-stream by a per-user byte quota" },
   { name: "simpleproxy_user_unknown_total", type: "counter", help: "fake-TLS handshakes denied because the secret resolved to no user (strict mode)" },
+  { name: "simpleproxy_handshake_timeouts_total", type: "counter", help: "MTProto handshakes that timed out incomplete; bursts correlate with ISP drop windows" },
 ];
 const KNOWN = new Set(METRIC_DEFS.map((d) => d.name));
 // END_BLOCK_METRIC_DEFS

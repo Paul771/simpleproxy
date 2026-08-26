@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.5.0
+// VERSION: 1.6.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,10 +14,11 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.5.0 - wave-2 multi-tenant enforcement: mid-stream per-user byte-quota
-//                teardown (addBytes false -> mtproto_quota_exceeded, W2-2) and strict mode
-//                denying unknown secrets (MTPROTO_USERS_STRICT -> mtproto_user_unknown, W2-3);
-//                tornDown guard at relay data-handler entry
+//   LAST_CHANGE: v1.6.0 - DPI-window resilience (wave-A): MTPROTO_IDLE_TIMEOUT_MS override
+//                so stalled relays are not reaped by the shared 120s tunnel timeout during
+//                ISP drop windows, MTPROTO_HANDSHAKE_TIMEOUT_MS override + explicit
+//                [proxy][mtproto_handshake_timeout] log and simpleproxy_handshake_timeouts_total
+//                counter — mass handshake deaths are the server-side signature of a closed window
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -203,14 +204,18 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         const startedAt = Date.now();
         let idleTimer = null;
         let tornDown = false;
+        // MTProto-specific idle override (wave-A): during ISP drop windows a relay can sit
+        // stalled far longer than the shared tunnel timeout is meant to tolerate; reaping
+        // those pairs forces the client into a reconnect storm. Default: inherit.
+        const idleMs = cfg.mtprotoIdleTimeoutMs ?? cfg.idleTimeoutMs;
 
         const armIdle = () => {
           clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
-            log("mtproto_idle_timeout", "DF-3", dc.host, dc.port, cfg.idleTimeoutMs);
+            log("mtproto_idle_timeout", "DF-3", dc.host, dc.port, idleMs);
             socket.destroy();
             upstream.destroy();
-          }, cfg.idleTimeoutMs);
+          }, idleMs);
           idleTimer.unref?.();
         };
 
@@ -539,8 +544,14 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
 
     const timer = setTimeout(() => {
       socket.removeListener("data", onData);
+      // Silent handshake deaths are the server-side signature of ISP drop windows: the
+      // client's TLS-shaped flight never arrived, so nothing completed. A burst of these
+      // (vs a trickle of scanners) means a window is open — watch
+      // simpleproxy_handshake_timeouts_total to map them from the panel.
+      log("mtproto_handshake_timeout", "DF-1", socket.remoteAddress, { bytes: buf ? buf.length : 0 });
+      if (metrics) metrics.inc("simpleproxy_handshake_timeouts_total");
       socket.destroy();
-    }, HANDSHAKE_TIMEOUT_MS);
+    }, cfg.mtprotoHandshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
     timer.unref?.();
 
     socket.on("data", onData);

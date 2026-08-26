@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.3.0
+// VERSION: 1.4.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -15,9 +15,9 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.3.0 - new env MTPROTO_USERS_STRICT (default false): deny secrets that
-//                pass the MTProto HMAC but resolve to no user record, instead of the
-//                legacy unlimited fallback (W2-3 deny-unknown multi-tenant mode)
+//   LAST_CHANGE: v1.4.0 - new env MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS
+//                (null = inherit shared defaults): MTProto-specific timeouts for ISP
+//                drop-window resilience (wave-A)
 // END_CHANGE_SUMMARY
 
 import { createBlocklist } from "./blocklist.js";
@@ -151,6 +151,21 @@ export function loadConfig(env = process.env) {
     256,
     "MTPROTO_PENDING_MAX"
   );
+  // MTProto-specific timeouts (wave-A, DPI-window resilience). null = inherit the shared
+  // knob (idleTimeoutMs / HANDSHAKE_TIMEOUT_MS=10s in M-MTPROTO-SERVER).
+  //   - Idle override keeps stalled relays alive through ISP drop-window stalls instead of
+  //     forcing a client reconnect storm every 120s.
+  //   - Handshake override exists for tests; in prod the default is fine.
+  const parsePositiveMsOrNull = (value, name) => {
+    if (value === undefined || value === null || value.trim() === "") return null;
+    const n = parseIntEnv(value, 0, name);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`INVALID_ENV: ${name} must be a positive number of milliseconds, got "${value}"`);
+    }
+    return n;
+  };
+  const mtprotoIdleTimeoutMs = parsePositiveMsOrNull(env.MTPROTO_IDLE_TIMEOUT_MS, "MTPROTO_IDLE_TIMEOUT_MS");
+  const mtprotoHandshakeTimeoutMs = parsePositiveMsOrNull(env.MTPROTO_HANDSHAKE_TIMEOUT_MS, "MTPROTO_HANDSHAKE_TIMEOUT_MS");
   // Public host shown in tg://proxy links. Falls back to the listen port's hint.
   const mtprotoHost =
     env.MTPROTO_HOST && env.MTPROTO_HOST.trim() !== "" ? env.MTPROTO_HOST.trim() : "YOUR_HOST_OR_IP";
@@ -258,6 +273,8 @@ export function loadConfig(env = process.env) {
     mtprotoPort,
     mtprotoMaxConnections,
     mtprotoPendingMax,
+    mtprotoIdleTimeoutMs,
+    mtprotoHandshakeTimeoutMs,
     mtprotoHost,
     mtprotoTlsDomain,
     mtprotoTlsAlpn,
