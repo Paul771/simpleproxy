@@ -166,6 +166,15 @@
       <Priority>medium</Priority>
       <RelatedFlows>DF-RELOAD, DF-USER</RelatedFlows>
     </UC-019>
+    <UC-020 wave="A">
+      <Actor>Operator</Actor>
+      <Action>Эксплуатирует прокси под провайдером с DPI-«шторкой» (окнами дропаются TLS-образные пакеты до IP:порта прокси)</Action>
+      <Goal>Минимизация последствий окон: релей не рвётся общим 120s idle-таймером во время затыка; закрытые окна видны серверной телеметрии</Goal>
+      <Preconditions>MTPROTO_IDLE_TIMEOUT_MS &gt; IDLE_TIMEOUT_MS рекомендован; метрики-порт включён для счётчика</Preconditions>
+      <AcceptanceCriteria>stalled relay переживает окно (mtproto_idle_timeout по override, не по общему таймауту); всплеск simpleproxy_handshake_timeouts_total + [proxy][mtproto_handshake_timeout] коррелирует с закрытым окном; повседневная ссылка dd, ee — на чистые периоды</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-3</RelatedFlows>
+    </UC-020>
     <UC-016>
       <Actor>TelegramClient</Actor>
       <Action>Подключается к DC, у которого недоступна предпочитаемая адресная семья (IPv4 или IPv6)</Action>

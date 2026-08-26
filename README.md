@@ -91,6 +91,8 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_DOPPELGANGER` | `false` | Replay inter-arrival delays server-flight при отправке fake ServerHello (требует TLS-профиль) |
 | `MTPROTO_DOPPELGANGER_MAX_DELAY_MS` | `500` | Верхняя граница задержки в doppelganger-режиме, мс |
 | `MTPROTO_PENDING_MAX` | `256` | Лимит сокетов в фазе MTProto-handshake (slowloris-защита) |
+| `MTPROTO_IDLE_TIMEOUT_MS` | = `IDLE_TIMEOUT_MS` | Отдельный idle-таймаут MTProto-релея; ставьте больше общего при DPI-окнах провайдера |
+| `MTPROTO_HANDSHAKE_TIMEOUT_MS` | `10000` | Таймаут незавершённого MTProto-handshake (переопределение для тестов) |
 | `MTPROTO_METRICS_PORT` | `0` | Side-port для Prometheus `/metrics`; `0` = выключен |
 | `MTPROTO_METRICS_HOST` | `0.0.0.0` | Хост, на котором слушает `/metrics`-сервер |
 | `MTPROTO_USER_MAX_CONNS` | — | JSON-карта `{user: N}` — лимит одновременных MTProto-соединений на пользователя |
@@ -207,7 +209,8 @@ curl -x http://<адрес-и-порт-от-wispbyte> https://api.telegram.org
 **Prometheus-метрики** (`MTPROTO_METRICS_PORT`, off по умолчанию): side-порт `/metrics` отдаёт
 text-exposition (v0.0.4) со счётчиками (`*_http_connections_total`, `*_mtproto_connections_total`,
 `*_bytes_in_total`, `*_bytes_out_total`, `*_replay_attacks_total`, `*_mask_splices_total`,
-`*_pending_caps_total`, `*_rejected_total`, `*_quota_exceeded_total`, `*_user_unknown_total`)
+`*_pending_caps_total`, `*_rejected_total`, `*_quota_exceeded_total`, `*_user_unknown_total`,
+`*_handshake_timeouts_total`)
 и gauges (`*_active_tunnels`, `*_active_mtproto`, `*_pending_mtproto`). Ноль зависимостей —
 крошечный HTTP-сервер на `node:net`.
 
@@ -238,6 +241,35 @@ handshake'ов к прокси (p50/max, детект reset'ов/тротлин�
 ```bash
 node scripts/live-smoke.mjs <host:port> --secret <hex> --isp-diag
 ```
+
+### DPI-окна: режим эксплуатации
+
+У части провайдеров (замечено у Ростелекома) действует «шторка»: окнами молча дропаются
+TLS-образные пакеты до IP:порта прокси — fake-TLS (`ee`) соединения и часть транспорта dd
+умирают на входе, чистый obfs2 живёт, CONNECT-туннели не затронуты. Окна длятся минуты,
+чередуются с чистыми периодами. Серверный код против дропа входящих бессилен, но последствия
+минимизируются конфигурацией:
+
+```bash
+# рекомендованный env для работы через DPI-окна:
+IDLE_TIMEOUT_MS=120000            # HTTP-туннели — как обычно
+MTPROTO_IDLE_TIMEOUT_MS=300000    # релей переживает затык окна без reconnect-шторма
+MTPROTO_TLS_PROFILE_CAPTURE=1     # опционально: ServerHello структурно как у rutube.ru
+MTPROTO_DOPPELGANGER=1            # опционально: тайминги flight'а как у rutube.ru
+```
+
+Мониторинг окон с серверной стороны: массовый рост `simpleproxy_handshake_timeouts_total`
+и логов `[proxy][mtproto_handshake_timeout]` = закрытое окно (полёты клиентов режутся до
+нас); одиночные — обычные сканеры. Карта окон с клиента:
+
+```powershell
+while ($true) { $r = node scripts/live-smoke.mjs <host:port> --secret <dd-hex> 2>&1 |
+  Select-String 'faketls'; "$(Get-Date -Format HH:mm:ss) $r"; Start-Sleep 120 }
+```
+
+Повседневная ссылка — **dd**: половина её транспорта не-TLS и выживает в окнах; ee — вторая
+ссылка на чистые периоды. Simple не светите без нужды — он заметнее всего для активного
+зондирования.
 
 ### Multi-tenant: per-user секреты
 

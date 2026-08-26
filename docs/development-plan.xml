@@ -34,7 +34,7 @@
       </observability>
       <verification-ref>V-M-CONFIG</verification-ref>
       <notes>
-        <note-1>Порт из env PORT (default 8080), host 0.0.0.0, maxTunnels 32, idleTimeoutMs 120_000; authUser/authPass из PROXY_USER/PROXY_PASS (оба заданы - auth включена). MTPROTO_MASK_RELAY_MAX_BYTES: дефолт 32 MiB (33_554_432), 0 = кап маскированной сессии выключен. MTPROTO_USERS_STRICT (v1.3.0, дефолт false): deny секретов вне tenant-таблицы; parseBoolEnv ("1"/"true"/"yes"/"on").</note-1>
+        <note-1>Порт из env PORT (default 8080), host 0.0.0.0, maxTunnels 32, idleTimeoutMs 120_000; authUser/authPass из PROXY_USER/PROXY_PASS (оба заданы - auth включена). MTPROTO_MASK_RELAY_MAX_BYTES: дефолт 32 MiB (33_554_432), 0 = кап маскированной сессии выключен. MTPROTO_USERS_STRICT (v1.3.0, дефолт false): deny секретов вне tenant-таблицы; parseBoolEnv ("1"/"true"/"yes"/"on"). MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS (v1.4.0): null = наследовать общие таймауты; положительные мс или INVALID_ENV.</note-1>
       </notes>
     </M-CONFIG>
 
@@ -311,6 +311,7 @@
         <note-1>FAST_MODE: клиент→DC перешифровка (decrypt клиента → encrypt upstream); DC→клиент байт-в-байт. resolveDc может вернуть массив кандидатов — TCP connect-failure → следующий кандидат (лог mtproto_dc_fallback); одиночный {host,port} нормализуется (обр. совместимость).</note-1>
         <note-2>v1.4.0 hardening: set-once releasePending (нет утечки pendingHandshakes), drain-guard по одному listener на направление релея, detachForHandoff на mask/reject путях, капы HANDSHAKE_BUF_MAX_BYTES=64KiB / PENDING_DATA_MAX_BYTES=1MiB ([proxy][handshake_overflow]).</note-2>
         <note-3>v1.5.0 wave-2: квота юзера enforcement в I/O-пути — addBytes=false → mtproto_quota_exceeded + teardown (W2-2); strict MTPROTO_USERS_STRICT (size()&gt;0 гейт) → mtproto_user_unknown для секретов вне tenant-таблицы (W2-3).</note-3>
+        <note-4>v1.6.0 wave-A (DPI-окна): cfg.mtprotoIdleTimeoutMs ?? idleTimeoutMs в armIdle — релей переживает затык окна; таймер handshake логирует [proxy][mtproto_handshake_timeout] {bytes} + simpleproxy_handshake_timeouts_total (массовые всплески = закрытое окно провайдера); оба переопределяются env.</note-4>
       </notes>
     </M-MTPROTO-SERVER>
 
