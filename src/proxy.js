@@ -1,5 +1,5 @@
 // FILE: src/proxy.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: HTTP CONNECT handling on raw sockets: parse CONNECT, auth -> allow -> cap -> tunnel
 //   SCOPE: CONNECT request parsing, rejection of plain HTTP, tunnel capacity tracking
@@ -14,11 +14,23 @@
 //   start - listen and handle SIGTERM/SIGINT gracefully
 // END_MODULE_MAP
 
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.2.0 - CONNECT header slowloris guard (W2-4): an incomplete header block
+//                is answered with 408 and destroyed after CONNECT_HEADER_TIMEOUT_MS
+//                (10s default, cfg.connectHeaderTimeoutMs override); previously such
+//                sockets were held open indefinitely
+// END_CHANGE_SUMMARY
+
 import net from "node:net";
 import { openTunnel } from "./tunnel.js";
 
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 const MAX_HEADER_BYTES = 16 * 1024;
+// Slowloris guard for the HTTP CONNECT path (W2-4): a client that sends a partial header
+// block ("CONNECT api.telegram.org:443 HTTP/1.1" without the final CRLFCRLF) and then stalls
+// must not hold the mux socket forever. Overridable via cfg.connectHeaderTimeoutMs (tests);
+// not exposed as env on purpose — headers are ~100 bytes, 10s is generous even on RT mobile.
+const CONNECT_HEADER_TIMEOUT_MS = 10_000;
 const CRLFCRLF = Buffer.from("\r\n\r\n", "latin1");
 
 // START_CONTRACT: parseConnectRequest
@@ -90,24 +102,35 @@ export function createConnectHandler(cfg, allow, auth, log, metrics = null) {
       return;
     }
     if (parsed.incomplete) {
-      // Wait for the rest of the CONNECT header block.
+      // Wait for the rest of the CONNECT header block, bounded in both size and time.
+      let headerTimer = null;
       const onData = (chunk) => {
         head = Buffer.concat([head, chunk]);
         if (head.length > MAX_HEADER_BYTES) {
+          clearTimeout(headerTimer);
           socket.removeListener("data", onData);
           rejectHttp(socket, 400, "Bad Request");
           return;
         }
         const re = parseConnectRequest(head);
         if (re === null) {
+          clearTimeout(headerTimer);
           socket.removeListener("data", onData);
           rejectHttp(socket, 400, "Bad Request");
         } else if (!re.incomplete) {
+          clearTimeout(headerTimer);
           socket.removeListener("data", onData);
           finishConnect(socket, re, head);
         }
       };
       socket.on("data", onData);
+      headerTimer = setTimeout(() => {
+        socket.removeListener("data", onData);
+        log("connect_header_timeout", "DF-1", socket.remoteAddress);
+        rejectHttp(socket, 408, "Request Timeout");
+      }, cfg.connectHeaderTimeoutMs ?? CONNECT_HEADER_TIMEOUT_MS);
+      headerTimer.unref?.();
+      socket.once("close", () => clearTimeout(headerTimer));
       return;
     }
     finishConnect(socket, parsed, head);
