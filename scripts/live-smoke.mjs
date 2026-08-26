@@ -1,9 +1,11 @@
 // FILE: scripts/live-smoke.mjs
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Live smoke-test suite against a deployed SimpleProxy instance (Wispbyte / any host)
 //   SCOPE: TCP reachability, CONNECT allowlist/denylist, plain-HTTP 405, plain-MTProto reject,
-//          fake-TLS mask splice (byte-compare vs real origin), obfuscated2 + fake-TLS handshake
+//          fake-TLS mask splice (byte-compare vs real origin), obfuscated2 + fake-TLS handshake;
+//          --isp-diag mode: Telegram-DC reachability from the runner's network and a timed
+//          fake-TLS handshake series against the proxy (ISP/DPI diagnostics, e.g. Rostelecom)
 //   DEPENDS: none (node:net, node:crypto)
 //   LINKS: V-M-TUNNEL, V-M-PROXY, V-M-MTPROTO, V-M-MASK, V-M-FAKETLS
 //   ROLE: SCRIPT
@@ -20,7 +22,17 @@
 //   checkMask - unknown-SNI ClientHello is spliced to mask_host (bytes match the real origin)
 //   checkObfs2 - obfuscated2 handshake with the real secret opens the relay
 //   checkFakeTls - fake-TLS (dd) handshake with the real secret gets a ServerHello
+//   timedTcpConnect - TCP connect latency probe with a hard deadline
+//   checkDcReach - Telegram DC IPv4/IPv6:443 reachability from this machine
+//   checkHandshakeTiming - N timed fake-TLS handshakes against the proxy, p50/max report
 // END_MODULE_MAP
+
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - --isp-diag mode (W2-5): Telegram DC reachability table (same
+//                addresses as M-MTPROTO getDcAddressCandidates) and timed fake-TLS
+//                handshake series for diagnosing ISP-side interference (Rostelecom DPI,
+//                IPv6 peering); diagnostic failures are reported as INFO, not FAIL
+// END_CHANGE_SUMMARY
 
 import net from "node:net";
 import crypto from "node:crypto";
@@ -39,18 +51,21 @@ let host = DEFAULT_HOST;
 let port = DEFAULT_PORT;
 let secretHex = process.env.MTPROTO_SECRET || "";
 let compareMask = false;
+let ispDiag = false;
 
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === "--secret") secretHex = args[++i] || "";
   else if (a === "--compare-mask") compareMask = true;
+  else if (a === "--isp-diag" || a === "--rt") ispDiag = true;
   else if (a === "--host") host = args[++i] || host;
   else if (a === "--port") port = Number(args[++i]) || port;
   else if (/^[a-z0-9.-]+:\d+$/.test(a)) [host, port] = [a.slice(0, a.lastIndexOf(":")), Number(a.slice(a.lastIndexOf(":") + 1))];
   else if (a === "-h" || a === "--help") {
-    console.log(`Usage: node scripts/live-smoke.mjs [host:port] [--secret <hex>] [--compare-mask]`);
+    console.log(`Usage: node scripts/live-smoke.mjs [host:port] [--secret <hex>] [--compare-mask] [--isp-diag]`);
     console.log(`  --secret       MTPROTO_SECRET (32 hex; dd/ee prefix and user: prefix are stripped)`);
     console.log(`  --compare-mask byte-compare the mask splice against the real origin (needs outbound 443)`);
+    console.log(`  --isp-diag     ISP/DPI diagnostics: Telegram DC reachability + timed handshakes (run from the client network, e.g. under Rostelecom)`);
     process.exit(0);
   }
 }
@@ -69,6 +84,11 @@ const results = [];
 function report(name, pass, detail) {
   results.push(pass);
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? " — " + detail : ""}`);
+}
+
+// Diagnostic observation: never affects the exit code (unlike report()).
+function info(name, detail) {
+  console.log(`INFO  ${name}${detail ? " — " + detail : ""}`);
 }
 
 function connectOnce(onConnect, onData, onClose, timeoutMs = CONNECT_TIMEOUT_MS) {
@@ -355,6 +375,146 @@ async function checkFakeTls() {
 }
 // END_BLOCK_CHECK_FAKETLS
 
+// START_BLOCK_ISP_DIAG
+// Telegram DC addresses, identical to src/mtproto.js getDcAddressCandidates tables — the
+// diagnostics must probe exactly what the deployed proxy itself dials.
+const TELEGRAM_DCS_V4 = [
+  "149.154.175.50",
+  "149.154.167.51",
+  "149.154.175.100",
+  "149.154.167.91",
+  "149.154.171.5",
+];
+const TELEGRAM_DCS_V6 = [
+  "2001:b28:f23d:f001::a",
+  "2001:b28:f23f:f002::a",
+  "2001:b28:f23d:f003::a",
+  "2001:b28:f23f:f004::a",
+  "2001:b28:f23f:f005::a",
+];
+const DC_PORT = 443;
+const DC_PROBE_TIMEOUT_MS = 3000;
+const HANDSHAKE_SERIES = 5;
+const HANDSHAKE_TIMEOUT_MS = 5000;
+
+function timedTcpConnect(hostAddr, portAddr, timeoutMs = DC_PROBE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const s = net.connect({ host: hostAddr, port: portAddr });
+    let settled = false;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      s.destroy();
+      resolve(r);
+    };
+    const timer = setTimeout(() => done({ ok: false, ms: null, err: "timeout" }), timeoutMs);
+    s.once("connect", () => done({ ok: true, ms: Math.round(performance.now() - t0) }));
+    s.once("error", (e) => done({ ok: false, ms: null, err: e.code || e.message }));
+  });
+}
+
+async function checkDcReach() {
+  console.log("\n--- ISP diag: Telegram DC reachability from this machine ---");
+  let v4ok = 0;
+  for (let i = 0; i < TELEGRAM_DCS_V4.length; i++) {
+    const r = await timedTcpConnect(TELEGRAM_DCS_V4[i], DC_PORT);
+    if (r.ok) v4ok += 1;
+    info(`dc${i + 1}-ipv4`, r.ok ? `${r.ms}ms` : `BLOCKED/UNREACHABLE (${r.err})`);
+  }
+  let v6ok = 0;
+  let v6tested = 0;
+  for (let i = 0; i < TELEGRAM_DCS_V6.length; i++) {
+    const r = await timedTcpConnect(TELEGRAM_DCS_V6[i], DC_PORT);
+    if (r.err === "timeout") {
+      v6tested += 1;
+      info(`dc${i + 1}-ipv6`, "BLOCKED/UNREACHABLE (timeout)");
+    } else if (r.ok) {
+      v6tested += 1;
+      v6ok += 1;
+      info(`dc${i + 1}-ipv6`, `${r.ms}ms`);
+    } else {
+      // ENETUNREACH / EADDRNOTAVAIL / DNS-less IPv6 stack: no verdict, just note it.
+      info(`dc${i + 1}-ipv6`, `not tested (${r.err})`);
+    }
+  }
+  if (v4ok === 0) {
+    info("dc-reach-verdict", "no direct IPv4 route to Telegram DCs — expect degraded/no DIRECT Telegram; proxy relay path is server-side and unaffected");
+  } else if (v6tested > 0 && v6ok === 0) {
+    info("dc-reach-verdict", "IPv6 to Telegram DCs fully blocked — keep MTPROTO_PREFER_IPV6=false on the SERVER");
+  } else {
+    info("dc-reach-verdict", `direct reachability ok (v4 ${v4ok}/5${v6tested > 0 ? `, v6 ${v6ok}/${v6tested}` : ""})`);
+  }
+}
+
+async function checkHandshakeTiming() {
+  if (!/^[0-9a-f]{32}$/.test(secret)) {
+    info("handshake-timing", "skipped (no --secret / MTPROTO_SECRET)");
+    return;
+  }
+  console.log("\n--- ISP diag: fake-TLS handshake series vs proxy ---");
+  const secretBuf = Buffer.from(secret, "hex");
+  const samples = [];
+  let failures = 0;
+  let resets = 0;
+  for (let i = 0; i < HANDSHAKE_SERIES; i++) {
+    const { handshake: obfsHandshake } = buildClientHandshake(secretBuf, PROTO_TAG_ABRIDGED, 2);
+    const { hello: tlsHello } = buildFakeTlsClientHello(secretBuf, obfsHandshake);
+    const r = await new Promise((resolve) => {
+      const t0 = performance.now();
+      const s = net.connect(port, host, () => s.write(tlsHello));
+      let tTcp = null;
+      let settled = false;
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        s.destroy();
+        resolve(val);
+      };
+      const timer = setTimeout(() => finish({ err: "timeout" }), HANDSHAKE_TIMEOUT_MS);
+      s.once("connect", () => { tTcp = Math.round(performance.now() - t0); });
+      s.on("data", (d) => {
+        // ServerHello = first TLS record type 0x16 from the proxy.
+        if (d[0] === 0x16) {
+          finish({ tTcp, tSh: Math.round(performance.now() - t0) });
+        }
+      });
+      s.once("error", (e) => finish({ err: e.code === "ECONNRESET" ? "reset" : "error:" + e.code }));
+      s.once("close", () => finish({ err: "closed-no-serverhello" }));
+    });
+    if (r.tSh != null) samples.push(r);
+    else {
+      failures += 1;
+      if (r.err === "reset") resets += 1;
+      info(`handshake#${i + 1}`, `FAILED (${r.err})`);
+    }
+  }
+  if (samples.length === 0) {
+    info("handshake-timing", `all ${HANDSHAKE_SERIES} handshakes failed — proxy unreachable or DPI kills the flight`);
+    return;
+  }
+  const tcp = samples.map((s) => s.tTcp).sort((a, b) => a - b);
+  const sh = samples.map((s) => s.tSh).sort((a, b) => a - b);
+  const p50 = (arr) => arr[Math.floor(arr.length / 2)];
+  info(
+    "handshake-timing",
+    `${samples.length}/${HANDSHAKE_SERIES} ok | tcp min/p50/max ${tcp[0]}/${p50(tcp)}/${tcp[tcp.length - 1]}ms` +
+      ` | serverhello p50/max ${p50(sh)}/${sh[sh.length - 1]}ms`
+  );
+  if (resets > 0) {
+    info("isp-verdict", `${resets} connection reset(s) mid-handshake — typical sign of active DPI interference on this ISP leg`);
+  } else if (failures > 0) {
+    info("isp-verdict", `${failures} handshake(s) timed out without reset — possible throttling or packet loss on client↔proxy leg`);
+  } else if (p50(sh) > 1500) {
+    info("isp-verdict", `serverhello p50 ${p50(sh)}ms is high (>1.5s) — likely throttling despite success`);
+  } else {
+    info("isp-verdict", "handshake latency healthy; ISP leg looks clean");
+  }
+}
+// END_BLOCK_ISP_DIAG
+
 // START_BLOCK_MAIN
 await checkTcp();
 await checkConnectTelegram();
@@ -364,6 +524,10 @@ await checkPlainMtReject();
 await checkMask();
 await checkObfs2();
 await checkFakeTls();
+if (ispDiag) {
+  await checkDcReach();
+  await checkHandshakeTiming();
+}
 
 const passed = results.filter(Boolean).length;
 console.log(`\n${passed}/${results.length} checks passed`);
