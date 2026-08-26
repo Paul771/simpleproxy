@@ -445,7 +445,8 @@
       </observability>
       <verification-ref>V-M-TLS-PROFILE</verification-ref>
       <notes>
-        <note-1>Raw net.connect (не node:tls) — размеры записей видны. Профиль ~1KB, refresh 10 мин, off по умолчанию, failure → null → синтетический fallback.</note-1>
+        <note-1>Raw net.connect (не node:tls) - разбираются записи целиком. Профиль ~1KB, refresh 10 мин, off по умолчанию, failure → синтетический fallback.</note-1>
+        <note-2>v1.1.0: buildCaptureClientHello переведён на шаблон реального browser-grade hello (CHLO_TEMPLATE_B64, SNI+randomness подменяются доверенным parse/rebuild). Ручная сборка расширений имела два структурных бага (key_share без вектора-длины; supported_groups с типом 0x002a=early_data вместо 0x000a) - все origin отвечали fatal alert и захват никогда не работал.</note-2>
       </notes>
     </M-TLS-PROFILE>
 

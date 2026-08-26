@@ -1,9 +1,9 @@
 // FILE: src/tls-profile.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Capture a real TLS server-flight profile from a fronted domain and replay its structure
 //   SCOPE: raw TCP TLS-1.3 capture (ClientHello build, record observer), profile cache + periodic refresh
-//   DEPENDS: node:net, node:crypto, M-FAKETLS (genX25519PublicKey, buildAlpnExtension)
+//   DEPENDS: node:net, node:crypto
 //   LINKS: M-TLS-PROFILE
 //   ROLE: RUNTIME
 //   MAP_MODE: EXPORTS
@@ -16,9 +16,16 @@
 //   createTlsRecordObserver - stateful raw TLS record observer (type + size of every record)
 // END_MODULE_MAP
 
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - FIX capture ClientHello: (1) key_share extension was missing the
+//                2-byte KeyShareClientHello vector length (RFC 8446 section 4.2.8);
+//                (2) supported_groups used extension type 0x002a (early_data!) instead of
+//                0x000a. Together these made every probe hello structurally invalid — all
+//                origins answered fatal alerts and captureTlsProfile never captured anything.
+// END_CHANGE_SUMMARY
+
 import net from "node:net";
 import { randomBytes } from "node:crypto";
-import { genX25519PublicKey, buildAlpnExtension } from "./faketls.js";
 
 const TLS_REC_HDR = 5; // type(1) + version(2) + length(2)
 const TYPE_HANDSHAKE = 0x16;
@@ -28,14 +35,41 @@ const TYPE_ALERT = 0x15;
 const HANDSHAKE_SERVER_HELLO = 0x02;
 const QUIET_READ_MS = 600; // no-new-byetes gap that ends the first-flight capture
 
-// TLS 1.3 cipher suites we advertise in the probe ClientHello.
-const CIPHERS = Buffer.from([
-  0x00, 0x08, // 4 suites * 2 bytes
-  0x13, 0x01, // TLS_AES_128_GCM_SHA256
-  0x13, 0x02, // TLS_AES_256_GCM_SHA384
-  0x13, 0x03, // TLS_CHACHA20_POLY1305_SHA256
-  0x13, 0x04, // TLS_AES_128_CCM_SHA256
-]);
+// Real-browser-grade ClientHello TEMPLATE (captured from a live TLS 1.3 stack, rutube.ru SNI,
+// ALPN h2/http-1.1). Hand-assembling extensions proved fragile (two structural bugs shipped
+// unnoticed — see CHANGE_SUMMARY), so the probe now clones this known-valid hello and swaps
+// only SNI + fresh randomness. Base64 of 1604 bytes; fields: ver(2) random(32) sidlen(1)
+// sid(32) ciphers comp exts.
+const CHLO_TEMPLATE_B64 =
+  "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" +
+  "s887KQHSvy4=";
 
 // START_CONTRACT: buildCaptureClientHello
 //   PURPOSE: Build a TLS 1.3 ClientHello to probe an origin's server flight (no crypto needed)
@@ -46,59 +80,55 @@ const CIPHERS = Buffer.from([
 // END_CONTRACT: buildCaptureClientHello
 export function buildCaptureClientHello(host, alpn = ["h2", "http/1.1"]) {
   // START_BLOCK_CHLO
-  const random = randomBytes(32);
-  const sessionId = Buffer.alloc(32); // TLS 1.3 legacy_session_id
-  const compression = Buffer.from([0x01, 0x00]); // legacy_compression_methods: null
+  const tpl = parseHello(Buffer.from(CHLO_TEMPLATE_B64, "base64"));
 
-  // Extensions: SNI, supported_versions (TLS 1.3), key_share (x25519), signature_algorithms,
-  // supported_groups, ALPN, padding.
-  const exts = [];
-  exts.push(buildSniExtension(host));
-  exts.push(Buffer.from([0x00, 0x2b, 0x00, 0x02, 0x03, 0x04])); // supported_versions = TLS 1.3
-  const x25519 = genX25519PublicKey();
-  exts.push(Buffer.concat([Buffer.from([0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]), x25519])); // key_share x25519
-  exts.push(Buffer.from([0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01])); // signature_algorithms
-  exts.push(Buffer.from([0x00, 0x2a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d])); // supported_groups: x25519
-  if (alpn && alpn.length > 0) exts.push(buildAlpnExtension(alpn));
+  // Fresh randomness per probe: the template's random/session-id must not repeat across
+  // captures (servers and DPI correlate reused handshake material).
+  const head = Buffer.from(tpl.head);
+  randomBytes(32).copy(head, 2); // legacy_version(2) -> random(32)
+  randomBytes(32).copy(head, 35); // sidlen byte at 34 stays 0x20, sid bytes 35..66
+  head[34] = 32;
 
-  const extBuf = Buffer.concat(exts);
-  const extTotal = Buffer.alloc(2);
-  extTotal.writeUInt16BE(extBuf.length, 0);
-
-  const inner = Buffer.concat([
-    Buffer.from([0x03, 0x03]), // legacy_version = TLS 1.2
-    random,
-    Buffer.from([sessionId.length]),
-    sessionId,
-    CIPHERS,
-    compression,
-    extTotal,
-    extBuf,
-  ]);
-
-  // Pad to >= 512 bytes (some origins/DPI treat tiny ClientHellos as non-TLS).
-  const target = 515;
-  if (inner.length < target) {
-    const padLen = target - inner.length;
-    const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(padLen)]);
-    padExt.writeUInt16BE(padLen, 2);
-    // Re-build extensions list length to include the padding extension.
-    const extBuf2 = Buffer.concat([extBuf, padExt]);
-    extTotal.writeUInt16BE(extBuf2.length, 0);
-    const inner2 = Buffer.concat([
-      Buffer.from([0x03, 0x03]),
-      random,
-      Buffer.from([sessionId.length]),
-      sessionId,
-      CIPHERS,
-      compression,
-      extTotal,
-      extBuf2,
-    ]);
-    return wrapHandshakeRecord(0x01, inner2);
+  let exts = tpl.exts;
+  if (host) {
+    const sniExt = buildSniExtension(host); // [0000][len16][data]
+    const entry = { t: 0x0000, data: sniExt.subarray(4) };
+    exts = [entry, ...tpl.exts.filter((e) => e.t !== 0x0000)];
   }
-  return wrapHandshakeRecord(0x01, inner);
+  // ALPN is already h2/http-1.1 in the template; a custom offer would need re-encoding,
+  // which no caller uses — ignore the parameter beyond API compatibility.
+  void alpn;
+
+  return rebuildHello(head, exts);
   // END_BLOCK_CHLO
+}
+
+// Parse a full ClientHello RECORD into { head: hs-payload-before-exts, exts: [{t,data}] }.
+// Round-trip verified against real stack captures (rebuild(parse(x)) === x).
+function parseHello(rec) {
+  let o = 9; // record hdr(5) + hs type(1) + hs len(3)
+  o += 2 + 32; // legacy_version + random
+  o += 1 + rec[o]; // session id
+  o += 2 + rec.readUInt16BE(o); // cipher suites
+  o += 1 + rec[o]; // compression methods
+  const extTotal = rec.readUInt16BE(o);
+  o += 2;
+  const head = rec.subarray(9, o - 2); // payload prefix WITHOUT the ext_total field
+  const end = o + extTotal;
+  const exts = [];
+  while (o + 4 <= end) {
+    const t = rec.readUInt16BE(o);
+    const l = rec.readUInt16BE(o + 2);
+    exts.push({ t, data: rec.subarray(o + 4, o + 4 + l) });
+    o += 4 + l;
+  }
+  return { head, exts };
+}
+
+function rebuildHello(hsHead, exts) {
+  const body = Buffer.concat(exts.map((e) => Buffer.concat([len16(e.t), len16(e.data.length), e.data])));
+  const inner = Buffer.concat([hsHead, len16(body.length), body]);
+  return wrapHandshakeRecord(0x01, inner);
 }
 
 function buildSniExtension(host) {
