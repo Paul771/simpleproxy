@@ -32,14 +32,14 @@ function hmacSha256(key, msg) {
 }
 
 // Emulate a client building a fake-TLS ClientHello with the HMAC digest.
-function buildClientHello(secret) {
+function buildClientHello(secret, offeredCiphers = [0x13, 0x01]) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
   tsBytes.writeUInt32LE(timestamp, 0);
 
   // Build the ClientHello with a zeroed digest field first.
-  const cipherSuites = Buffer.from([0x00, 0x02, 0x13, 0x01]); // 1 suite: TLS_AES_128_GCM_SHA256
+  const cipherSuites = Buffer.concat([Buffer.from([0x00, offeredCiphers.length]), Buffer.from(offeredCiphers)]);
   const compression = Buffer.from([0x01, 0x00]); // 1 method: null
   // Real Telegram ClientHellos exceed 512 bytes (the proxy rejects smaller as non-TLS).
   // Pad with a TLS padding extension (0x0015) to cross that threshold.
@@ -266,4 +266,39 @@ test("splitTlsRecords: splits concatenated records into individual record buffer
   assert.equal(records[2][0], 0x17);
   // Concatenating the records back must reproduce the original bytes exactly.
   assert.ok(Buffer.concat(records).equals(response));
+});
+
+// --- v1.1.0: profile.cipher replayed only when the client offered it ---
+test("buildServerHello: profile cipher is used only when the client offered it (dd/simple regression)", () => {
+  const secret = randomBytes(16);
+  const profile = {
+    cipher: [0x13, 0x02], // rutube's real suite — NOT in the default client offer
+    alpn: null,
+    ccsCount: 1,
+    appDataSizes: [7331, 281],
+    certLen: 7331,
+    recordDelays: [],
+  };
+
+  // Client offers ONLY 0x1301 (default Telegram-like offer): profile's 0x1302 must NOT leak
+  // into the ServerHello; the default 0x1301 must be selected instead.
+  const built1301 = buildClientHello(secret);
+  const res1301 = validateClientHello(built1301.hello, [secret]);
+  assert.deepEqual(res1301.ciphers.map((c) => c.toString("hex")), ["1301"]);
+  const resp1301 = buildServerHello(secret, res1301.digest, res1301.sessionId, "h2", profile, res1301.ciphers);
+  const sh1301 = splitTlsRecords(resp1301)[0];
+  assert.ok(sh1301.includes(Buffer.from([0x13, 0x01])), "must select the client-offered 0x1301");
+  assert.ok(!sh1301.includes(Buffer.from([0x13, 0x02])), "must not leak the unoffered 0x1302");
+
+  // Client that DOES offer 0x1302 alongside: profile replay becomes eligible.
+  const builtBoth = buildClientHello(secret, [0x13, 0x01, 0x13, 0x02]);
+  const resBoth = validateClientHello(builtBoth.hello, [secret]);
+  assert.deepEqual(resBoth.ciphers.map((c) => c.toString("hex")), ["1301", "1302"]);
+  const respBoth = buildServerHello(secret, resBoth.digest, resBoth.sessionId, "h2", profile, resBoth.ciphers);
+  const shBoth = splitTlsRecords(respBoth)[0];
+  assert.ok(shBoth.includes(Buffer.from([0x13, 0x02])), "profile cipher is eligible when offered");
+
+  // Legacy call shape (no ciphers passed): must stay conservative and use the default.
+  const respLegacy = buildServerHello(secret, res1301.digest, res1301.sessionId, "h2", profile);
+  assert.ok(splitTlsRecords(respLegacy)[0].includes(Buffer.from([0x13, 0x01])));
 });

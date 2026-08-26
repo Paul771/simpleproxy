@@ -216,6 +216,7 @@
         <scenario-7 kind="success">faketls_auth_fail логирует sni, recordLen и digestPrefix (8 hex); handshake-listener снимается до mask.</scenario-7>
         <scenario-5 kind="success">extractSni: парсит SNI из ClientHello с расширением server_name; null без SNI.</scenario-5>
         <scenario-6 kind="success">buildTlsAlert(112) == 15 03 03 00 02 02 70 (unrecognized_name для reject_handshake).</scenario-6>
+        <scenario-8 kind="success" wave="A2">profile.cipher реплеится ТОЛЬКО когда клиент предложил его (validateClientHello извлекает offered ciphers); иначе дефолт 0x1301. Регрессия: безгейтовой реплей 0x1302 рвал dd/simple wrapped-транспорты после ServerHello.</scenario-8>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][faketls_auth_fail][DF-1]</marker-1>

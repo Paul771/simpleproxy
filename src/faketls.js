@@ -1,5 +1,5 @@
 // FILE: src/faketls.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
 //   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers
@@ -19,6 +19,16 @@
 //   buildTlsAlert - build a TLS alert record (used for reject_handshake mode)
 //   splitTlsRecords - split a byte stream into individual TLS records (doppelganger timing replay)
 // END_MODULE_MAP
+
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - FIX ServerHello cipher selection under a captured profile:
+//                profile.cipher was replayed unconditionally, but RFC 8446 requires the
+//                selected suite to be one the CLIENT offered — clients offering only
+//                TLS_AES_128_GCM_SHA256 (0x1301) aborted right after ServerHello once
+//                rutube's 0x1302 started being replayed. validateClientHello now extracts
+//                the offered cipher suites; buildServerHello uses profile.cipher only when
+//                the client offered it, else falls back to the default 0x1301.
+// END_CHANGE_SUMMARY
 
 import { createHmac, randomBytes } from "node:crypto";
 
@@ -68,7 +78,8 @@ export function genX25519PublicKey() {
 // START_CONTRACT: validateClientHello
 //   PURPOSE: Validate a fake-TLS ClientHello against configured secrets via HMAC
 //   INPUTS: { handshake: Buffer - full ClientHello from 0x16 onward, secrets: Buffer[] }
-//   OUTPUTS: { { secret, sessionId, digest } | null }
+//   OUTPUTS: { { secret, sessionId, digest, digestPrefix, ciphers: Buffer[] } | null -
+//              ciphers = suites offered by the client (for profile-replay eligibility) }
 //   SIDE_EFFECTS: none
 //   LINKS: M-FAKETLS
 // END_CONTRACT: validateClientHello
@@ -85,6 +96,17 @@ export function validateClientHello(handshake, secrets) {
   const sidLen = handshake[SESSION_ID_LEN_POS];
   const sessionId = handshake.subarray(SESSION_ID_POS, SESSION_ID_POS + sidLen);
   if (sessionId.length !== sidLen) return null;
+
+  // Offered cipher suites live right after the session id: len(2) + N*2 bytes. Extracted so
+  // buildServerHello may replay a captured profile.cipher only when the client offered it.
+  const csOff = SESSION_ID_POS + sidLen;
+  if (csOff + 2 > handshake.length) return null;
+  const csLen = handshake.readUInt16BE(csOff);
+  if (csLen % 2 !== 0 || csOff + 2 + csLen > handshake.length) return null;
+  const ciphers = [];
+  for (let p = csOff + 2; p + 2 <= csOff + 2 + csLen; p += 2) {
+    ciphers.push(handshake.subarray(p, p + 2));
+  }
 
   // msg = handshake with the digest field zeroed out
   const msg = Buffer.concat([
@@ -108,6 +130,7 @@ export function validateClientHello(handshake, secrets) {
       sessionId: Buffer.from(sessionId),
       digest: Buffer.from(digest),
       digestPrefix: Buffer.from(digest.subarray(0, DIGEST_HALFLEN)),
+      ciphers,
     };
   }
   return null;
@@ -117,19 +140,29 @@ export function validateClientHello(handshake, secrets) {
 // START_CONTRACT: buildServerHello
 //   PURPOSE: Build the fake ServerHello + ChangeCipherSpec + ApplicationData response
 //   INPUTS: { secret: Buffer(16), clientDigest: Buffer(32), sessionId: Buffer, alpn?: string,
-//             profile?: { cipher: Buffer(2), alpn: string|null, ccsCount: number, appDataSizes: number[] } | null }
+//             profile?: { cipher, alpn, ccsCount, appDataSizes } | null,
+//             offeredCiphers?: Buffer[] - suites from validateClientHello (gate profile.cipher) }
 //   OUTPUTS: { Buffer - full response packet }
 //   SIDE_EFFECTS: none
 //   LINKS: M-FAKETLS, M-TLS-PROFILE
 // END_CONTRACT: buildServerHello
-export function buildServerHello(secret, clientDigest, sessionId, alpn = null, profile = null) {
+export function buildServerHello(secret, clientDigest, sessionId, alpn = null, profile = null, offeredCiphers = null) {
   // START_BLOCK_BUILD
   const x25519 = genX25519PublicKey();
-  // When a captured profile is available, replay its structure: real cipher, real ALPN,
-  // the observed CCS count, and 0x17 app-data records with the observed sizes (random content —
-  // we replay the SHAPE, not the encrypted bytes, matching telemt's fidelity approach).
+  // When a captured profile is available, replay its structure: the observed CCS count and
+  // 0x17 app-data record sizes (random content — we replay the SHAPE, not the encrypted
+  // bytes). The CIPHER, however, is replayed only when the client actually offered it:
+  // RFC 8446 requires the selected suite to be one of the client's — answering a foreign
+  // suite (e.g. rutube's 0x1302 to a 0x1301-only client) makes strict clients abort right
+  // after ServerHello. ALPN likewise falls back to our configured value when the profile
+  // captured none.
   const replayAlpn = (profile && profile.alpn) || alpn;
-  const cipher = profile && profile.cipher ? Buffer.from(profile.cipher) : TLS_CIPHERSUITE;
+  const profileCipher = profile && profile.cipher ? Buffer.from(profile.cipher) : null;
+  const profileCipherOffered =
+    profileCipher !== null &&
+    Array.isArray(offeredCiphers) &&
+    offeredCiphers.some((c) => c.length === 2 && c.equals(profileCipher));
+  const cipher = profileCipherOffered ? profileCipher : TLS_CIPHERSUITE;
   const tlsExtensions = Buffer.concat([
     Buffer.from([0x00, 0x2e, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]),
     x25519,

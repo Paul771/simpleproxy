@@ -162,7 +162,9 @@ test("buildServerHello: with a profile replays ccsCount + app-data sizes and kee
     ticketSizes: [80],
     certLen: 300,
   };
-  const response = buildServerHello(secret, clientDigest, sessionId, null, profile);
+  // Client must OFFER the profile cipher for it to be selected (RFC 8446); this test
+  // exercises the eligible path by passing it in offeredCiphers.
+  const response = buildServerHello(secret, clientDigest, sessionId, null, profile, [Buffer.from([0x13, 0x02])]);
 
   // Walk the records: 0x16 ServerHello, 0x14 CCS, then ONE 0x17 fake-cert record sized to certLen.
   const obs = createTlsRecordObserver();

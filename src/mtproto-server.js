@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.6.0
+// VERSION: 1.6.1
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,11 +14,10 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.0 - DPI-window resilience (wave-A): MTPROTO_IDLE_TIMEOUT_MS override
-//                so stalled relays are not reaped by the shared 120s tunnel timeout during
-//                ISP drop windows, MTPROTO_HANDSHAKE_TIMEOUT_MS override + explicit
-//                [proxy][mtproto_handshake_timeout] log and simpleproxy_handshake_timeouts_total
-//                counter — mass handshake deaths are the server-side signature of a closed window
+//   LAST_CHANGE: v1.6.1 - pass validated.ciphers into buildServerHello so a captured
+//                profile.cipher is replayed only when the client offered it (fixes
+//                dd/simple wrapped transports aborting after ServerHello under
+//                MTPROTO_TLS_PROFILE_CAPTURE=1)
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
@@ -478,7 +477,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           ? cfg.mtprotoTlsAlpn[0]
           : null;
         const profile = profileManager ? profileManager.get() : null;
-        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile);
+        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile, validated.ciphers);
 
         // Doppelganger: replay captured inter-arrival delays so the flight is timed like the
         // real origin, not bursty-instant. Only the handshake flight is shaped; steady-state
