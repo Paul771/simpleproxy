@@ -242,6 +242,18 @@ handshake'ов к прокси (p50/max, детект reset'ов/тротлин�
 node scripts/live-smoke.mjs <host:port> --secret <hex> --isp-diag
 ```
 
+**Серийный транспорт-зонд** (`scripts/transport-probe.mjs`): для случаев, когда single-shot
+смок зелёный, а клиент всё равно «плавает». Гоняет N раундов (по умолчанию 5) чередуя
+сырой obfs2, fake-TLS handshake (ServerHello) и **полный fake-TLS relay** (hello → ServerHello
+→ obfs в TLS-записи → relay жив 2с). Каждая итерация — свежий digest: повторное использование
+одного ClientHello триггерит replay-guard на сервере и выглядит как сетевой обрыв (так был
+ложно обвинён DPI при триаже РТ). `--domain` задаёт SNI (по умолчанию извлекается из хвоста
+ee-ссылки); exit-code 0 только если все раунды всех транспортов зелёные.
+
+```bash
+node scripts/transport-probe.mjs <host:port> --secret <ee-ссылка> --rounds 5
+```
+
 ### DPI-окна: режим эксплуатации
 
 У части провайдеров (замечено у Ростелекома) действует «шторка»: окнами молча дропаются

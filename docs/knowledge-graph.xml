@@ -198,9 +198,20 @@
       <depends>node:net, node:crypto</depends>
       <verification-ref>V-M-LIVE-SMOKE</verification-ref>
       <annotations>
-        <fn-main PURPOSE="CLI: node scripts/live-smoke.mjs [host:port] [--secret hex] [--compare-mask]" />
+        <fn-main PURPOSE="CLI: node scripts/live-smoke.mjs [host:port] [--secret hex] [--compare-mask] [--isp-diag]" />
       </annotations>
     </M-LIVE-SMOKE>
+
+    <M-TRANSPORT-PROBE NAME="TransportProbe" TYPE="SCRIPT" STATUS="implemented">
+      <purpose>Серийная диагностика транспортов против задеплоенного инстанса: raw obfuscated2 vs fake-TLS (с SNI/без), хендшейк и выживаемость relay в повторах; свежий digest на итерацию (replay-guard не триггерится)</purpose>
+      <path>scripts/transport-probe.mjs</path>
+      <depends>node:net, node:crypto</depends>
+      <verification-ref>V-M-LIVE-SMOKE</verification-ref>
+      <annotations>
+        <fn-main PURPOSE="CLI: node scripts/transport-probe.mjs [host:port] --secret hex [--rounds N] [--domain host]" />
+        <fn-probeFullRelay PURPOSE="fake-TLS с SNI: ClientHello -&gt; ServerHello -&gt; obfs в appdata -&gt; relay жив 2s" />
+      </annotations>
+    </M-TRANSPORT-PROBE>
 
     <CrossLink from="M-MUX" to="M-PROXY" relation="routes http-connect/http-other" />
     <CrossLink from="M-MUX" to="M-MTPROTO-SERVER" relation="routes mtproto" />

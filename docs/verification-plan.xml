@@ -402,15 +402,18 @@
     <V-M-LIVE-SMOKE MODULE="M-LIVE-SMOKE" PRIORITY="low">
       <test-files>
         <file>scripts/live-smoke.mjs</file>
+        <file>scripts/transport-probe.mjs</file>
       </test-files>
       <module-checks>
         <check-1>node scripts/live-smoke.mjs --secret &lt;hex&gt; (против задеплоенного инстанса)</check-1>
         <check-2>node scripts/live-smoke.mjs --secret &lt;hex&gt; --compare-mask (byte-compare mask splice vs origin)</check-2>
         <check-3 wave="2">node scripts/live-smoke.mjs &lt;host:port&gt; --secret &lt;hex&gt; --isp-diag (с клиентской сети ISP)</check-3>
+        <check-4 wave="D">node scripts/transport-probe.mjs &lt;host:port&gt; --secret &lt;hex&gt; --rounds N (серии raw/fake-TLS + relay)</check-4>
       </module-checks>
       <scenarios>
         <scenario-1 kind="success">8/8: tcp, connect-telegram 200, connect-denied 403, plain-http 405, plain-mt-reject close, mask-splice байт-в-байт равен origin, obfs2 relay открыт, faketls ServerHello.</scenario-1>
         <scenario-2 kind="success" wave="2">--isp-diag (W2-5): таблица dc{1..5}-ipv4/ipv6 (адреса = TG_DATACENTERS_V4/V6 из M-MTPROTO), verdict-строка; handshake-timing 5 проб с tcp/serverhello p50/max; reset/timeout → isp-verdict INFO. Диагностика не влияет на exit-code (INFO vs FAIL).</scenario-2>
+        <scenario-3 kind="success" wave="D">transport-probe: N раундов подряд — raw obfs2 relay-open, fake-TLS handshake serverhello, fake-TLS full relay-open-2s. Свежий digest на итерацию (иначе replay-guard отбрасывает повторы и выглядит как сетевой обрыв — урок из РТ-триажа).</scenario-3>
       </scenarios>
     </V-M-LIVE-SMOKE>
 
