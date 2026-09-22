@@ -1,5 +1,5 @@
 // FILE: src/mtproto.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto proxy obfuscated2 handshake parse/build and DC address mapping (pure logic)
 //   SCOPE: client handshake validation, upstream handshake construction, DC lookup
@@ -15,6 +15,12 @@
 //   getDcAddress - resolve dc_idx to a Telegram datacenter host:port
 //   createAesCtr - AES-256-CTR stream (encrypt/decrypt with state)
 // END_MODULE_MAP
+
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.2.0 - getDcAddressCandidates gains hasIpv6: on an IPv4-only host the IPv6
+//                candidate is omitted, so a transient IPv4 DC failure is not masked by a
+//                guaranteed ENETUNREACH fallback (prod: mtproto_dc_fallback -> ENETUNREACH).
+// END_CHANGE_SUMMARY
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
@@ -190,18 +196,21 @@ export function getDcAddress(dcIdx, { preferIpv6 = false } = {}) {
 
 // START_CONTRACT: getDcAddressCandidates
 //   PURPOSE: Return an ordered list of DC addresses for connect-with-fallback
-//   INPUTS: { dcIdx: number, opts?: { preferIpv6: boolean } }
-//   OUTPUTS: { Array<{ host: string, port: number }> - preferred family first, then the other }
+//   INPUTS: { dcIdx: number, opts?: { preferIpv6: boolean, hasIpv6?: boolean } }
+//   OUTPUTS: { Array<{ host, port }> - preferred family first, then the other; IPv6 omitted when the host has none }
 //   SIDE_EFFECTS: none
 //   LINKS: M-MTPROTO
 // END_CONTRACT: getDcAddressCandidates
-export function getDcAddressCandidates(dcIdx, { preferIpv6 = false } = {}) {
+export function getDcAddressCandidates(dcIdx, { preferIpv6 = false, hasIpv6 = true } = {}) {
   const idx = Math.abs(dcIdx) - 1;
   if (!Number.isInteger(idx) || idx < 0 || idx >= TG_DATACENTERS_V4.length) return [];
   const port = TG_DATACENTER_PORT;
   const v4 = { host: TG_DATACENTERS_V4[idx], port };
   const v6 = { host: TG_DATACENTERS_V6[idx], port };
-  // Only one address family is useful when the operator pinned a family; both lists have an
-  // entry for every valid index, so we always return two candidates ordered by preference.
+  // On a host with no usable IPv6 the v6 candidate is a guaranteed ENETUNREACH dead end: a
+  // transient IPv4 failure would otherwise be "handled" by a useless fallback that then drops
+  // the client. Emit IPv4 only so M-MTPROTO-SERVER's single retry can recover the connection.
+  if (!hasIpv6) return [v4];
+  // Both lists have an entry for every valid index; return two candidates ordered by preference.
   return preferIpv6 ? [v6, v4] : [v4, v6];
 }

@@ -1,13 +1,18 @@
 // FILE: tests/dc-fallback.test.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Unit tests for DC address candidate ordering (IPv4/IPv6 fallback)
-//   SCOPE: getDcAddressCandidates ordering by preferIpv6, invalid idx, fallback completeness
+//   SCOPE: getDcAddressCandidates ordering by preferIpv6, hasIpv6 gate, invalid idx, fallback completeness
 //   DEPENDS: M-MTPROTO
 //   LINKS: V-M-MTPROTO
 //   ROLE: TEST
 //   MAP_MODE: LOCALS
 // END_MODULE_CONTRACT
+
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - hasIpv6=false returns IPv4 only (an IPv4-only host must not fall back to
+//               an unreachable IPv6 candidate).
+// END_CHANGE_SUMMARY
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -38,6 +43,16 @@ test("candidates: negative dc_idx resolves via abs (DC -2 -> DC2)", () => {
   const list = getDcAddressCandidates(-2, { preferIpv6: false });
   assert.equal(list.length, 2);
   assert.equal(list[0].host, "149.154.167.51");
+});
+
+test("candidates: hasIpv6=false returns IPv4 only (no dead-end IPv6 fallback)", () => {
+  const list = getDcAddressCandidates(2, { preferIpv6: false, hasIpv6: false });
+  assert.equal(list.length, 1);
+  assert.equal(list[0].host, "149.154.167.51");
+  // Even with the operator pinned to IPv6, an IPv4-only host must not target an unreachable family.
+  const pinned = getDcAddressCandidates(2, { preferIpv6: true, hasIpv6: false });
+  assert.equal(pinned.length, 1);
+  assert.equal(pinned[0].host, "149.154.167.51");
 });
 
 test("getDcAddress: backward-compatible single-address resolver still works", () => {

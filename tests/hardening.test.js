@@ -87,8 +87,8 @@ function buildClientHandshake(secret, protoTag, dcIdx) {
 }
 
 // --- Fake DC: echoes decrypted payloads back (same shape as the e2e suite) ---
-function startFakeDc() {
-  const server = net.createServer((socket) => {
+function createFakeDcServer() {
+  return net.createServer((socket) => {
     let buf = Buffer.alloc(0);
     let ready = false;
     let tgDec = null;
@@ -121,6 +121,12 @@ function startFakeDc() {
     });
     socket.on("error", () => {});
   });
+}
+
+// Bind a fresh fake DC immediately (random port). createFakeDcServer() is for tests that must
+// control when the DC starts listening (e.g. the DC-retry recovery test).
+function startFakeDc() {
+  const server = createFakeDcServer();
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
 }
 
@@ -854,6 +860,110 @@ test("hardening: post-ServerHello silence is logged with phase=tls-app and count
     fakeDc.closeAllConnections?.();
     server.close();
     fakeDc.close();
+  }
+});
+
+test("hardening: DC retry — the preferred candidate is retried once, then the client is dropped", async () => {
+  const secret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+
+  // Reserve then free a port: nothing listens -> the connect is refused immediately.
+  const dead = net.createServer();
+  await new Promise((r) => dead.listen(0, "127.0.0.1", r));
+  const deadPort = dead.address().port;
+  await new Promise((r) => dead.close(r));
+
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 120_000,
+    rules: [],
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoPendingMax: 256,
+  };
+  const handler = createMtprotoHandler(cfg, logCollector, () => [{ host: "127.0.0.1", port: deadPort }], null, null, null, metrics, null);
+  const server = createMuxServer({ "http-connect": () => {}, "http-other": () => {}, mtproto: handler });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(server.address().port, "127.0.0.1", () => socket.write(handshake));
+    assert.equal(await awaitClose(socket, 3000), true, "client must be dropped after the retry also fails");
+    assert.equal(logs.filter((l) => l.event === "mtproto_dc_retry").length, 1, "exactly one retry");
+    assert.equal(logs.some((l) => l.event === "mtproto_dc_fallback"), false, "no fallback for a single candidate");
+    assert.ok(logs.some((l) => l.event === "mtproto_upstream_error"), "must give up after the retry");
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test("hardening: DC retry — recovers when the preferred candidate becomes reachable", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+
+  const dead = net.createServer();
+  await new Promise((r) => dead.listen(0, "127.0.0.1", r));
+  const port = dead.address().port;
+  await new Promise((r) => dead.close(r));
+
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 120_000,
+    rules: [],
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoPendingMax: 256,
+  };
+  const handler = createMtprotoHandler(cfg, logCollector, () => [{ host: "127.0.0.1", port }], null, null, null, null, null);
+  const server = createMuxServer({ "http-connect": () => {}, "http-other": () => {}, mtproto: handler });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const dcServer = createFakeDcServer();
+
+  try {
+    const { handshake, stream, encKey, encIv } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const payload = "retry-recovered";
+    const sent = stream.encrypt(Buffer.from(payload));
+    const clientDec = createAesCtr(encKey, encIv);
+
+    const resultPromise = new Promise((resolve, reject) => {
+      const socket = net.connect(server.address().port, "127.0.0.1", () => socket.write(Buffer.concat([handshake, sent])));
+      const timer = setTimeout(() => reject(new Error("retry recovery timeout")), 5000);
+      let buf = Buffer.alloc(0);
+      socket.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (buf.length >= payload.length) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(clientDec.decrypt(buf).toString());
+        }
+      });
+      socket.on("error", reject);
+    });
+
+    // The first upstream connect is refused; wait until the proxy schedules its retry, then bind
+    // the DC on the freed port before the retry fires (DC_RETRY_DELAY_MS later).
+    for (let i = 0; i < 100 && !logs.some((l) => l.event === "mtproto_dc_retry"); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(logs.some((l) => l.event === "mtproto_dc_retry"), "retry must be scheduled");
+    await new Promise((r) => dcServer.listen(port, "127.0.0.1", r));
+
+    assert.equal(await resultPromise, payload, "the retried candidate must serve the relay");
+  } finally {
+    dcServer.closeAllConnections?.();
+    dcServer.close();
+    server.closeAllConnections?.();
+    server.close();
   }
 });
 

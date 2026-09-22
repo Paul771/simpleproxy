@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.6.3
+// VERSION: 1.7.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,7 +14,11 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.3 - mtproto_handshake_timeout now reports `phase`; a tls-app timeout
+//   LAST_CHANGE: v1.7.0 - IPv4 DC resilience: detectIpv6Availability() is passed to resolveDc so an
+//                IPv4-only host never wastes a fallback on a guaranteed-ENETUNREACH IPv6 candidate;
+//                and after the candidate list is exhausted the preferred candidate is retried once
+//                (mtproto_dc_retry, 150ms delay, 3s timeout) before dropping the client.
+//   PREVIOUS: v1.6.3 - mtproto_handshake_timeout now reports `phase`; a tls-app timeout
 //                (ServerHello already sent, client silent) increments the dedicated
 //                simpleproxy_faketls_post_hello_timeouts_total in addition to the total. The
 //                post-restart console showed bytes:0 timeouts that were previously ambiguous.
@@ -29,6 +33,7 @@
 // END_CHANGE_SUMMARY
 
 import net from "node:net";
+import os from "node:os";
 import {
   parseClientHandshake,
   buildUpstreamHandshake,
@@ -49,6 +54,11 @@ import { maskConnection } from "./mask.js";
 const HANDSHAKE_LEN = 64;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+// One retry of the preferred DC candidate after the list is exhausted (see START_BLOCK_MT_RELAY):
+// a transient IPv4 failure or a wasted fallback would otherwise drop the client. The retry uses a
+// shorter timeout and a small delay so the extra latency stays bounded.
+const UPSTREAM_RETRY_TIMEOUT_MS = 3_000;
+const DC_RETRY_DELAY_MS = 150;
 // Memory bounds (512MB box): a valid ClientHello record is <= 16 KiB+5 (RFC 8446 §5.1)
 // and the obfuscated2 handshake is 64 bytes, so 64 KiB of pre-handshake bytes is generous;
 // anything beyond that is a probe or an attack, not a client.
@@ -57,6 +67,30 @@ const HANDSHAKE_BUF_MAX_BYTES = 64 * 1024;
 const PENDING_DATA_MAX_BYTES = 1024 * 1024;
 const TLS_START = [0x16, 0x03, 0x01];
 const TLS_ALERT_UNRECOGNIZED_NAME = 112;
+
+// START_CONTRACT: detectIpv6Availability
+//   PURPOSE: Report whether the host has a routable (non-internal, non-link-local) IPv6 address
+//   INPUTS: { none }
+//   OUTPUTS: { boolean - true when an IPv6 candidate is worth attempting }
+//   SIDE_EFFECTS: none
+//   LINKS: M-MTPROTO-SERVER, M-MTPROTO
+// END_CONTRACT: detectIpv6Availability
+function detectIpv6Availability() {
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const addrs of Object.values(ifaces)) {
+      for (const addr of addrs || []) {
+        const isV6 = addr.family === "IPv6" || addr.family === 6;
+        // Skip loopback/link-local (fe80::/10): present on many hosts but never routable to a DC.
+        if (isV6 && !addr.internal && !/^fe80:/i.test(addr.address)) return true;
+      }
+    }
+  } catch {
+    // Detection failure must not disable the fallback: assume IPv6 may be usable.
+    return true;
+  }
+  return false;
+}
 
 // START_CONTRACT: createMtprotoHandler
 //   PURPOSE: Create the mtproto mux handler; validates handshake, connects to DC, relays
@@ -74,6 +108,10 @@ const TLS_ALERT_UNRECOGNIZED_NAME = 112;
 export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidates, replayGuard = null, maskImpl = maskConnection, profileManager = null, metrics = null, userStore = null) {
   let activeConnections = 0;
   let pendingHandshakes = 0; // sockets in handshake phase, before relay is established
+
+  // Detected once: whether this host can reach Telegram over IPv6. On an IPv4-only host the v6
+  // candidate is skipped so a transient IPv4 failure is not masked by a guaranteed ENETUNREACH.
+  const hasIpv6 = detectIpv6Availability();
 
   const syncPending = () => {
     if (metrics) metrics.set("simpleproxy_pending_mtproto", pendingHandshakes);
@@ -175,7 +213,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       }
       // DC resolution with IPv4↔IPv6 fallback: resolveDc may return a single {host,port}
       // (legacy/test resolver) or an ordered candidate array (production). Normalise to a list.
-      const resolved = resolveDc(parsed.dcIdx, { preferIpv6: cfg.mtprotoPreferIpv6 });
+      const resolved = resolveDc(parsed.dcIdx, { preferIpv6: cfg.mtprotoPreferIpv6, hasIpv6 });
       const candidates = Array.isArray(resolved) ? resolved : resolved ? [resolved] : [];
       if (candidates.length === 0) {
         releasePending();
@@ -189,6 +227,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       // Try each DC candidate in order; fall back to the next on TCP connect failure
       // (the failed candidate never received the upstream handshake, so reuse is safe).
       let attempt = 0;
+      let phase = "primary"; // "primary" = walk the candidate list; "retry" = one preferred retry
+      let retriedPreferred = false;
       let relayDc = null;
       let relayUpstream = null;
 
@@ -365,10 +405,11 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         armIdle();
       };
 
-      const tryConnect = () => {
+      const tryConnect = (timeoutMs = UPSTREAM_CONNECT_TIMEOUT_MS) => {
+        if (socket.destroyed) return; // client gone during the retry delay: nothing to serve
         const dc = candidates[attempt];
         const upstream = net.connect({ host: dc.host, port: dc.port });
-        upstream.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS, () => {
+        upstream.setTimeout(timeoutMs, () => {
           upstream.destroy(new Error("upstream connect timeout"));
         });
         let connected = false;
@@ -381,19 +422,37 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
 
         upstream.once("error", (err) => {
           if (connected) return; // post-connect error: startRelay's teardown handles it
-          // TCP connect failure on this candidate — try the next one.
-          attempt += 1;
-          if (attempt < candidates.length) {
-            log("mtproto_dc_fallback", "DF-1", socket.remoteAddress, {
-              failed: `${dc.host}:${dc.port}`,
-              next: `${candidates[attempt].host}:${candidates[attempt].port}`,
-            });
-            tryConnect();
-          } else {
-            releasePending(); // all candidates failed: never entering relay
-            log("mtproto_upstream_error", "DF-1", `${dc.host}:${dc.port}`, err.code || err.message);
-            socket.destroy();
+          // TCP connect failure on this candidate — try the next one (the failed candidate never
+          // received the upstream handshake, so reuse across attempts is safe).
+          if (phase === "primary") {
+            attempt += 1;
+            if (attempt < candidates.length) {
+              log("mtproto_dc_fallback", "DF-1", socket.remoteAddress, {
+                failed: `${dc.host}:${dc.port}`,
+                next: `${candidates[attempt].host}:${candidates[attempt].port}`,
+              });
+              tryConnect();
+              return;
+            }
+            // Candidate list exhausted. Give the preferred candidate one more shot: a transient
+            // IPv4 failure (DPI blip / short stall) or a wasted fallback to an unreachable family
+            // would otherwise drop the client and force a full TLS+obfs reconnect. Delay + shorter
+            // timeout keep the added latency bounded.
+            if (!retriedPreferred) {
+              retriedPreferred = true;
+              phase = "retry";
+              attempt = 0;
+              log("mtproto_dc_retry", "DF-1", socket.remoteAddress, {
+                after: `${dc.host}:${dc.port}`,
+                retry: `${candidates[0].host}:${candidates[0].port}`,
+              });
+              setTimeout(() => tryConnect(UPSTREAM_RETRY_TIMEOUT_MS), DC_RETRY_DELAY_MS).unref?.();
+              return;
+            }
           }
+          releasePending(); // never entering relay
+          log("mtproto_upstream_error", "DF-1", `${dc.host}:${dc.port}`, err.code || err.message);
+          socket.destroy();
         });
       };
       tryConnect();

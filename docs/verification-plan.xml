@@ -427,6 +427,7 @@
       <test-files>
         <file>tests/dc-fallback.test.js</file>
         <file>tests/mtproto.e2e.test.js</file>
+        <file>tests/hardening.test.js</file>
       </test-files>
       <module-checks>
         <check-1>node --test tests/dc-fallback.test.js</check-1>
@@ -435,9 +436,12 @@
         <scenario-1 kind="success">getDcAddressCandidates: preferIpv6=false → [V4, V6]; true → [V6, V4]; invalid idx → [].</scenario-1>
         <scenario-2 kind="success">getDcAddress (single) обратно совместим.</scenario-2>
         <scenario-3 kind="success">e2e: первый кандидат dead-порт, второй fake-DC → round-trip проходит (fallback сработал).</scenario-3>
+        <scenario-4 kind="success" wave="E">hasIpv6=false → только [V4] (даже при preferIpv6=true): на IPv4-only хосте IPv6-кандидат — заведомый ENETUNREACH-тупик.</scenario-4>
+        <scenario-5 kind="success" wave="E">retry: единственный кандидат (dead-порт) → после исчерпания списка ровно одна попытка preferred (лог [proxy][mtproto_dc_retry]), затем [proxy][mtproto_upstream_error] и drop; если порт поднимается в окне retry — round-trip восстанавливается.</scenario-5>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_dc_fallback][DF-1]</marker-1>
+        <marker-2 wave="E">[proxy][mtproto_dc_retry][DF-1] {after, retry} — одна повторная попытка preferred-кандидата перед drop</marker-2>
       </required-log-markers>
     </V-M-DC-FALLBACK>
   </ModuleVerification>
