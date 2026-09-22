@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.6.2
+// VERSION: 1.6.3
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,7 +14,11 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.2 - observability: mtproto_close now carries dc/client/tls so a close can
+//   LAST_CHANGE: v1.6.3 - mtproto_handshake_timeout now reports `phase`; a tls-app timeout
+//                (ServerHello already sent, client silent) increments the dedicated
+//                simpleproxy_faketls_post_hello_timeouts_total in addition to the total. The
+//                post-restart console showed bytes:0 timeouts that were previously ambiguous.
+//   PREVIOUS: v1.6.2 - observability: mtproto_close now carries dc/client/tls so a close can
 //                be attributed to a client + DC (the console showed two interleaved clients whose
 //                closes were previously indistinguishable); mtproto_idle_timeout logs the same
 //                dc/client context plus idle_ms.
@@ -558,8 +562,18 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       // client's TLS-shaped flight never arrived, so nothing completed. A burst of these
       // (vs a trickle of scanners) means a window is open — watch
       // simpleproxy_handshake_timeouts_total to map them from the panel.
-      log("mtproto_handshake_timeout", "DF-1", socket.remoteAddress, { bytes: buf ? buf.length : 0 });
-      if (metrics) metrics.inc("simpleproxy_handshake_timeouts_total");
+      // `phase` disambiguates the two silent states: "plain"/"tls-hello" = the opening flight
+      // never completed, while "tls-app" (+ bytes 0) = we already answered a valid fake-TLS
+      // ClientHello with a ServerHello and the client then went quiet (client abort after
+      // ServerHello, or the ISP dropped the follow-up) — counted separately below.
+      log("mtproto_handshake_timeout", "DF-1", socket.remoteAddress, {
+        bytes: buf ? buf.length : 0,
+        phase,
+      });
+      if (metrics) {
+        metrics.inc("simpleproxy_handshake_timeouts_total");
+        if (phase === "tls-app") metrics.inc("simpleproxy_faketls_post_hello_timeouts_total");
+      }
       socket.destroy();
     }, cfg.mtprotoHandshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS);
     timer.unref?.();

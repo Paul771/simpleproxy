@@ -1,5 +1,5 @@
 // FILE: src/metrics.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Prometheus text-exposition metrics registry + side-port /metrics HTTP server (zero deps)
 //   SCOPE: counter/gauge accounting, Prometheus text rendering, minimal HTTP responder for /metrics
@@ -15,7 +15,11 @@
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.0 - METRIC_DEFS += simpleproxy_handshake_timeouts_total
+//   LAST_CHANGE: v1.3.0 - METRIC_DEFS += simpleproxy_faketls_post_hello_timeouts_total: a
+//                subset of handshake timeouts where a valid fake-TLS ClientHello was answered
+//                with a ServerHello but the client never sent the obfuscated2 handshake
+//                (client abort after ServerHello / ISP dropped the follow-up flight).
+//   PREVIOUS: v1.2.0 - METRIC_DEFS += simpleproxy_handshake_timeouts_total
 //                (DPI-window observability, wave-A)
 // END_CHANGE_SUMMARY
 
@@ -39,6 +43,7 @@ const METRIC_DEFS = [
   { name: "simpleproxy_quota_exceeded_total", type: "counter", help: "MTProto relays torn down mid-stream by a per-user byte quota" },
   { name: "simpleproxy_user_unknown_total", type: "counter", help: "fake-TLS handshakes denied because the secret resolved to no user (strict mode)" },
   { name: "simpleproxy_handshake_timeouts_total", type: "counter", help: "MTProto handshakes that timed out incomplete; bursts correlate with ISP drop windows" },
+  { name: "simpleproxy_faketls_post_hello_timeouts_total", type: "counter", help: "Subset of handshake timeouts: fake-TLS ClientHello answered with ServerHello, client then silent (abort-after-ServerHello / dropped follow-up)" },
 ];
 const KNOWN = new Set(METRIC_DEFS.map((d) => d.name));
 // END_BLOCK_METRIC_DEFS

@@ -58,6 +58,15 @@ test("metrics: render produces Prometheus text exposition with HELP/TYPE", () =>
   assert.ok(lines.some((l) => l === "simpleproxy_replay_attacks_total 1"));
 });
 
+test("metrics: faketls post-hello timeout counter is exposed and increments", () => {
+  const m = createMetrics();
+  assert.equal(m.get("simpleproxy_faketls_post_hello_timeouts_total"), 0);
+  m.inc("simpleproxy_faketls_post_hello_timeouts_total");
+  const lines = m.render().split("\n");
+  assert.ok(lines.some((l) => l === "# TYPE simpleproxy_faketls_post_hello_timeouts_total counter"));
+  assert.ok(lines.some((l) => l === "simpleproxy_faketls_post_hello_timeouts_total 1"));
+});
+
 test("metrics: render ends with a trailing newline", () => {
   const m = createMetrics();
   const text = m.render();

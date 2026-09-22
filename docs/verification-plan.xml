@@ -311,6 +311,7 @@
         <scenario-7 kind="failure" wave="2">W2-2 quota teardown: user c byteQuota=1024, клиент шлёт 4 KiB после handshake → соединение рвётся, лог [proxy][mtproto_quota_exceeded], счётчик simpleproxy_quota_exceeded_total ≥ 1, snapshot bytes ≥ квоты (charge-then-kick).</scenario-7>
         <scenario-8 kind="failure" wave="2">W2-3 strict: секрет вне tenant-таблицы при MTPROTO_USERS_STRICT=1 → destroy + [proxy][mtproto_user_unknown] + simpleproxy_user_unknown_total=1; валидный tenant round-trip работает; strict=false → legacy-путь сохранён; пустая таблица + strict → single-tenant работает.</scenario-8>
         <scenario-9 kind="success" wave="A">A-2 handshake timeout: cfg.mtprotoHandshakeTimeoutMs=80, клиент шлёт 16 мусорных байт (&gt;PEEK_LEN, &lt;HANDSHAKE_LEN) и молчит → reap по override + [proxy][mtproto_handshake_timeout] + simpleproxy_handshake_timeouts_total=1.</scenario-9>
+        <scenario-11 kind="success" wave="E">A-3 post-ServerHello silence: валидный fake-TLS ClientHello (без app-data) → прокси отвечает ServerHello, клиент молчит → лог mtproto_handshake_timeout с phase="tls-app", bytes=0; simpleproxy_handshake_timeouts_total=1 и simpleproxy_faketls_post_hello_timeouts_total=1 (подмножество).</scenario-11>
         <scenario-10 kind="success" wave="A">A-1 idle override: relay установлен (handshake без FIN), клиент замолкает; cfg.mtprotoIdleTimeoutMs=150 при idleTimeoutMs=120000 → закрытие по mtproto_idle_timeout за ~150мс, не по общему таймауту.</scenario-10>
       </scenarios>
       <required-log-markers>
@@ -318,7 +319,7 @@
         <marker-2>[proxy][handshake_overflow][DF-1]</marker-2>
         <marker-3>[proxy][mtproto_quota_exceeded][DF-USER]</marker-3>
         <marker-4>[proxy][mtproto_user_unknown][DF-4]</marker-4>
-        <marker-5>[proxy][mtproto_handshake_timeout][DF-1]</marker-5>
+        <marker-5>[proxy][mtproto_handshake_timeout][DF-1] ... {bytes, phase} (phase=tls-app ⇒ ServerHello отправлен, клиент замолчал)</marker-5>
         <marker-6 wave="E">[proxy][mtproto_close][DF-2] ... {dc, client, tls, bytes_in, bytes_out, duration_ms} (атрибуция close к клиенту+DC); [proxy][mtproto_idle_timeout][DF-3] ... {dc, client, idle_ms}</marker-6>
       </required-log-markers>
     </V-M-HARDEN>
@@ -335,6 +336,7 @@
         <scenario-2 kind="success">render(): каждая метрика имеет # HELP, # TYPE (counter/gauge) и значение; trailing newline.</scenario-2>
         <scenario-3 kind="success">unknown metric inc/set = no-op, get = 0 (нельзя изобрести метрики).</scenario-3>
         <scenario-4 kind="success">e2e: GET /metrics → 200 text/plain; version=0.0.4 со всеми метриками; не-/metrics → 404.</scenario-4>
+        <scenario-5 kind="success" wave="E">simpleproxy_faketls_post_hello_timeouts_total присутствует в рендере (counter, HELP/TYPE) и инкрементится только на tls-app handshake timeout; unknown-имя по-прежнему no-op.</scenario-5>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][metrics_listen][DF-METRICS]</marker-1>

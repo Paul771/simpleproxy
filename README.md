@@ -215,7 +215,7 @@ curl -x http://<адрес-и-порт-от-wispbyte> https://api.telegram.org
 text-exposition (v0.0.4) со счётчиками (`*_http_connections_total`, `*_mtproto_connections_total`,
 `*_bytes_in_total`, `*_bytes_out_total`, `*_replay_attacks_total`, `*_mask_splices_total`,
 `*_pending_caps_total`, `*_rejected_total`, `*_quota_exceeded_total`, `*_user_unknown_total`,
-`*_handshake_timeouts_total`)
+`*_handshake_timeouts_total`, `*_faketls_post_hello_timeouts_total`)
 и gauges (`*_active_tunnels`, `*_active_mtproto`, `*_pending_mtproto`). Ноль зависимостей —
 крошечный HTTP-сервер на `node:net`.
 

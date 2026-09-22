@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -20,7 +20,10 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.0 - wave-A tests added: config parsing of MTPROTO_IDLE_TIMEOUT_MS /
+//   LAST_CHANGE: v1.3.0 - A-3 test: a valid fake-TLS ClientHello answered with ServerHello, then
+//               silent, logs mtproto_handshake_timeout with phase="tls-app" and bumps
+//               simpleproxy_faketls_post_hello_timeouts_total (subset of the total)
+//   PREVIOUS: v1.2.0 - wave-A tests added: config parsing of MTPROTO_IDLE_TIMEOUT_MS /
 //               MTPROTO_HANDSHAKE_TIMEOUT_MS (unset -> null inherit), idle override reaps a
 //               stalled relay per override value, handshake timeout logs the marker and bumps
 //               simpleproxy_handshake_timeouts_total
@@ -804,6 +807,48 @@ test("hardening: handshake timeout logs marker and counts simpleproxy_handshake_
     );
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(metrics.get("simpleproxy_handshake_timeouts_total"), 1);
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: post-ServerHello silence is logged with phase=tls-app and counted separately (A-3)", async () => {
+  const secret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoHandshakeTimeoutMs: 100 },
+    null,
+    logCollector,
+    metrics
+  );
+
+  try {
+    // Send a VALID fake-TLS ClientHello only: the proxy validates it and replies with a
+    // ServerHello; the client then goes silent. This is the bytes:0 state seen in prod.
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, handshake);
+    const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(hello));
+    // Drain the ServerHello: a net.Socket withholds 'close' until its readable side is consumed,
+    // and this client deliberately sends nothing further.
+    socket.on("data", () => {});
+    assert.equal(await awaitClose(socket, 1500), true, "post-hello silence must be reaped by the override");
+
+    const evt = logs.find((l) => l.event === "mtproto_handshake_timeout");
+    assert.ok(evt, "handshake timeout must be logged");
+    assert.equal(evt.detail.phase, "tls-app", "phase marks silence AFTER our ServerHello");
+    assert.equal(evt.detail.bytes, 0);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(metrics.get("simpleproxy_handshake_timeouts_total"), 1);
+    assert.equal(
+      metrics.get("simpleproxy_faketls_post_hello_timeouts_total"),
+      1,
+      "post-hello timeout must bump its dedicated counter"
+    );
   } finally {
     server.closeAllConnections?.();
     fakeDc.closeAllConnections?.();
