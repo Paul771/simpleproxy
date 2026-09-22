@@ -178,6 +178,11 @@ rutube.ru) от «профиль не распарсен». В первом сл
 подставляет configured `h2`; во втором — прежний fallback на `MTPROTO_TLS_ALPN`. Так server-flight
 не несёт ALPN, которого реальный хост не отправляет.
 
+**Защита от вырожденного профиля**: refresh принимает capture только при распарсенном ServerHello
+и `certLen >= 256` (реальный Certificate — сотни байт/B-KB). Ответ-алерт или обрезанный флайт
+отвергается (`[proxy][tls_profile_reject] degenerate_flight`) и **не перезаписывает** предыдущий
+хороший профиль — иначе replay fake-cert схлопывался до 36 байт (record-size tell).
+
 **Doppelganger** (`MTPROTO_DOPPELGANGER=true`, требует TLS-профиль): помимо структуры replay'ятся
 и inter-arrival задержки между записями первого flight — тайминги рукопожатия становятся близки
 к реальному origin (стеady-state relay не затрагивается, задержка ограничена

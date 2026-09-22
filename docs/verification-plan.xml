@@ -285,6 +285,7 @@
         <scenario-4 kind="success">profile=null → синтетика (один CCS + один app-data) — обратная совместимость.</scenario-4>
         <scenario-5 kind="success">createProfileManager: start → capture → get(); stop чистит таймер.</scenario-5>
         <scenario-6 kind="success" wave="E">alpnKnown: origin отвечает ServerHello БЕЗ ALPN → profile.alpn=null, alpnKnown=true (отличает «origin без ALPN» от «профиль не распарсен»); createTlsRecordObserver отдаёт body каждой записи (ServerHello парсится из body, устойчиво к фрагментации записи по чанкам).</scenario-6>
+        <scenario-7 kind="failure" wave="E">degenerate capture: origin отдаёт ServerHello + одну 36-байтную 0x17 (alert/rate-limit) → profile=null + лог [proxy][tls_profile_reject] reason=degenerate_flight; refresh с таким ответом НЕ перезаписывает предыдущий good-профиль (certLen сохраняется). Гейты: serverHelloParsed != null И certLen >= 256.</scenario-7>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][tls_profile][DF-TLS-PROFILE]</marker-1>

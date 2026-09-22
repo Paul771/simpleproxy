@@ -1,5 +1,5 @@
 // FILE: tests/tls-profile.test.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-TLS-PROFILE capture, replay and profile manager
 //   SCOPE: scripted local TLS origin -> capture profile; buildServerHello replay; manager start/get/stop
@@ -8,6 +8,11 @@
 //   ROLE: TEST
 //   MAP_MODE: LOCALS
 // END_MODULE_CONTRACT
+
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - degenerate-capture tests: a tiny single 0x17 flight is rejected (null +
+//               tls_profile_reject), and a degenerate refresh keeps the previous good profile.
+// END_CHANGE_SUMMARY
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -157,6 +162,52 @@ test("captureTlsProfile: alpn=null with alpnKnown=true when the origin negotiate
   } finally {
     origin.closeAllConnections?.();
     origin.close();
+  }
+});
+
+test("captureTlsProfile: rejects a degenerate flight (tiny 0x17) instead of replaying it", async () => {
+  // ServerHello + CCS + one 36-byte 0x17: what an alert / rate-limited response looks like.
+  const flight = buildScriptedFlight({ cipher: Buffer.from([0x13, 0x02]), alpn: null, appDataSizes: [36] });
+  const origin = await startScriptOrigin(flight);
+  const logs = [];
+  const log = (event, ref, src, detail) => logs.push({ event, detail });
+  try {
+    const profile = await captureTlsProfile("127.0.0.1", origin.address().port, { timeoutMs: 3000, log });
+    assert.equal(profile, null, "degenerate flight must not produce a profile");
+    assert.ok(
+      logs.some((l) => l.event === "tls_profile_reject"),
+      "rejection must be logged (else a bad refresh silently replaces a good profile)"
+    );
+  } finally {
+    origin.closeAllConnections?.();
+    origin.close();
+  }
+});
+
+test("createProfileManager: a degenerate refresh keeps the previous good profile", async () => {
+  const good = buildScriptedFlight({ cipher: Buffer.from([0x13, 0x01]), alpn: "h2", appDataSizes: [1500, 200] });
+  const bad = buildScriptedFlight({ cipher: Buffer.from([0x13, 0x01]), alpn: "h2", appDataSizes: [36] });
+  let call = 0;
+  const server = net.createServer((socket) => {
+    const flight = call++ === 0 ? good : bad;
+    socket.on("data", () => { socket.write(flight); socket.end(); });
+    socket.on("error", () => {});
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const mgr = createProfileManager({ host: "127.0.0.1", port: server.address().port, refreshMs: 60_000, timeoutMs: 2000 });
+  try {
+    await mgr.refresh();
+    const first = mgr.get();
+    assert.ok(first, "first (good) capture must populate the profile");
+    assert.equal(first.certLen, 1500);
+    await mgr.refresh();
+    const second = mgr.get();
+    assert.ok(second, "profile must survive a degenerate refresh");
+    assert.equal(second.certLen, 1500, "degenerate refresh must not overwrite the good profile");
+  } finally {
+    mgr.stop();
+    server.closeAllConnections?.();
+    server.close();
   }
 });
 

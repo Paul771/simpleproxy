@@ -1,5 +1,5 @@
 // FILE: src/tls-profile.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Capture a real TLS server-flight profile from a fronted domain and replay its structure
 //   SCOPE: raw TCP TLS-1.3 capture (ClientHello build, record observer), profile cache + periodic refresh
@@ -17,7 +17,13 @@
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.0 - capture robustness + ALPN fidelity: the observer now returns each
+//   LAST_CHANGE: v1.3.0 - reject degenerate captures so a good profile is never overwritten:
+//                buildProfile now requires a parsed ServerHello and certLen >= MIN_PROFILE_CERT_LEN
+//                (256). Prod symptom: a 10-min refresh captured a single 36-byte 0x17 (alert /
+//                rate-limited flight) and replaced the good certLen=4091 profile, shrinking the
+//                replayed fake cert to a 36-byte record-size tell; a rejected capture logs
+//                tls_profile_reject and resolve(null) so the manager keeps the previous profile.
+//   PREVIOUS: v1.2.0 - capture robustness + ALPN fidelity: the observer now returns each
 //                record's body, so captureTlsProfile parses the ServerHello directly from it
 //                instead of the chunk-slicing heuristic that silently dropped cipher/ALPN when
 //                the origin flight was split across TCP segments. buildProfile now records
@@ -40,6 +46,12 @@ const TYPE_APPDATA = 0x17;
 const TYPE_ALERT = 0x15;
 const HANDSHAKE_SERVER_HELLO = 0x02;
 const QUIET_READ_MS = 600; // no-new-byetes gap that ends the first-flight capture
+// A genuine TLS 1.3 server flight carries a Certificate record of at least a few hundred bytes
+// (ECDSA ~500B, RSA ~1-2KB). A flight whose largest 0x17 record is tiny is an alert or a
+// truncated/rate-limited response, NOT a server flight. Observed in prod: a refresh captured a
+// single 36-byte 0x17 and the old code accepted it, replacing a good certLen=4091 profile and
+// shrinking the replayed fake certificate to a 36-byte record-size tell.
+const MIN_PROFILE_CERT_LEN = 256;
 
 // Real-browser-grade ClientHello TEMPLATE (captured from a live TLS 1.3 stack, rutube.ru SNI,
 // ALPN h2/http-1.1). Hand-assembling extensions proved fragile (two structural bugs shipped
@@ -249,13 +261,27 @@ export async function captureTlsProfile(host, port, { timeoutMs = 5000, log } = 
     const records = []; // { type, length } in arrival order
     let serverHelloParsed = null;
 
-    const hardTimer = setTimeout(() => finish(buildProfile(host, serverHelloParsed, records)), timeoutMs);
+    // Build + gate the profile. A rejected capture resolves null so createProfileManager keeps
+    // the previous (good) profile instead of overwriting it with a degenerate flight.
+    const finalize = () => {
+      const profile = buildProfile(host, serverHelloParsed, records);
+      if (profile === null && records.length > 0) {
+        log?.("tls_profile_reject", "DF-TLS-PROFILE", host, {
+          reason: serverHelloParsed === null ? "no_server_hello" : "degenerate_flight",
+          records: records.length,
+          appData: records.filter((r) => r.type === TYPE_APPDATA).length,
+        });
+      }
+      return profile;
+    };
+
+    const hardTimer = setTimeout(() => finish(finalize()), timeoutMs);
     if (typeof hardTimer.unref === "function") hardTimer.unref();
     // Quiet-period: when no new records arrive for QUIET_READ_MS after the first app-data, we have the flight.
     let lastRecordAt = 0;
     const quietTimer = setInterval(() => {
       if (records.length > 0 && lastRecordAt > 0 && Date.now() - lastRecordAt >= QUIET_READ_MS) {
-        finish(buildProfile(host, serverHelloParsed, records));
+        finish(finalize());
       }
     }, 150);
     if (typeof quietTimer.unref === "function") quietTimer.unref();
@@ -278,12 +304,12 @@ export async function captureTlsProfile(host, port, { timeoutMs = 5000, log } = 
             serverHelloParsed = null;
           }
         }
-        if (rec.type === TYPE_ALERT) finish(buildProfile(host, serverHelloParsed, records));
+        if (rec.type === TYPE_ALERT) finish(finalize());
       }
     });
 
     socket.once("error", () => finish(null));
-    socket.once("close", () => finish(buildProfile(host, serverHelloParsed, records)));
+    socket.once("close", () => finish(finalize()));
   });
   // END_BLOCK_CAPTURE
 }
@@ -291,6 +317,10 @@ export async function captureTlsProfile(host, port, { timeoutMs = 5000, log } = 
 // Best-effort: parse the ServerHello out of the most recent feed chunk that contained a 0x16 record.
 function buildProfile(host, serverHelloParsed, records) {
   if (!records || records.length === 0) return null;
+  // Require a parsed ServerHello: without it there is no cipher/ALPN and the observed record
+  // shape may be an error response — the synthetic ServerHello is a safer fallback than a blind
+  // replay of an unparsed flight.
+  if (serverHelloParsed === null) return null;
   let cipher = null;
   let alpn = null;
   if (serverHelloParsed) {
@@ -306,6 +336,9 @@ function buildProfile(host, serverHelloParsed, records) {
   if (appDataSizes.length === 0) return null;
   // Heuristic: the largest 0x17 record in the first flight is usually the Certificate.
   const certLen = appDataSizes.reduce((a, b) => (b > a ? b : a), 0);
+  // Reject degenerate/alert flights (see MIN_PROFILE_CERT_LEN): a real Certificate record is far
+  // larger. This prevents a good profile from being replaced by a truncated one on refresh.
+  if (certLen < MIN_PROFILE_CERT_LEN) return null;
   // Trailing 0x17 records after the bulk are likely NewSessionTicket(s).
   const ticketSizes = appDataSizes.slice(-1)[0] < certLen / 2 ? appDataSizes.slice(-1) : [];
   // Inter-arrival delays between consecutive records in the first flight (ms), for doppelganger.
