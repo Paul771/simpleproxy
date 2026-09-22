@@ -302,3 +302,51 @@ test("buildServerHello: profile cipher is used only when the client offered it (
   const respLegacy = buildServerHello(secret, res1301.digest, res1301.sessionId, "h2", profile);
   assert.ok(splitTlsRecords(respLegacy)[0].includes(Buffer.from([0x13, 0x01])));
 });
+
+// --- v1.2.0: ALPN fidelity under a captured profile ---
+test("buildServerHello: omits ALPN when the captured profile negotiated none (alpnKnown=true)", () => {
+  const secret = randomBytes(16);
+  const profile = {
+    cipher: [0x13, 0x01],
+    alpn: null,
+    alpnKnown: true, // ServerHello parsed; the origin answered WITHOUT ALPN (rutube.ru-like)
+    ccsCount: 1,
+    appDataSizes: [1000],
+    certLen: 1000,
+    recordDelays: [],
+  };
+  // Configured ALPN "h2" must NOT leak in when the profile proves the origin negotiated none.
+  const response = buildServerHello(secret, randomBytes(32), randomBytes(16), "h2", profile, [Buffer.from([0x13, 0x01])]);
+  assert.equal(
+    response.includes(buildAlpnExtension(["h2"])),
+    false,
+    "profile-absent ALPN must be mirrored (extension omitted)"
+  );
+});
+
+test("buildServerHello: replays the profile's ALPN when it negotiated one", () => {
+  const secret = randomBytes(16);
+  const profile = {
+    cipher: null,
+    alpn: "http/1.1",
+    alpnKnown: true,
+    ccsCount: 1,
+    appDataSizes: [500],
+    certLen: 500,
+    recordDelays: [],
+  };
+  const response = buildServerHello(secret, randomBytes(32), randomBytes(16), "h2", profile);
+  assert.ok(response.includes(buildAlpnExtension(["http/1.1"])), "profile ALPN must be replayed");
+  assert.equal(
+    response.includes(buildAlpnExtension(["h2"])),
+    false,
+    "configured ALPN must not be used when the profile has its own"
+  );
+});
+
+test("buildServerHello: legacy profile without alpnKnown still falls back to configured ALPN", () => {
+  const secret = randomBytes(16);
+  const profile = { cipher: null, alpn: null, ccsCount: 1, appDataSizes: [500], certLen: 500, recordDelays: [] };
+  const response = buildServerHello(secret, randomBytes(32), randomBytes(16), "h2", profile);
+  assert.ok(response.includes(buildAlpnExtension(["h2"])), "no alpnKnown -> configured ALPN is used");
+});

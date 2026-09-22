@@ -1,5 +1,5 @@
 // FILE: src/faketls.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
 //   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers
@@ -21,7 +21,12 @@
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.1.0 - FIX ServerHello cipher selection under a captured profile:
+//   LAST_CHANGE: v1.2.0 - ALPN fidelity under a captured profile: when the profile's ServerHello
+//                was parsed and negotiated NO ALPN (profile.alpnKnown === true, alpn === null),
+//                buildServerHello now OMITS the ALPN extension instead of injecting the
+//                configured h2. Mirrors the fronted origin (rutube.ru negotiates no ALPN), so the
+//                fake server flight stops carrying an ALPN the real host never sends.
+//   PREVIOUS: v1.1.0 - FIX ServerHello cipher selection under a captured profile:
 //                profile.cipher was replayed unconditionally, but RFC 8446 requires the
 //                selected suite to be one the CLIENT offered — clients offering only
 //                TLS_AES_128_GCM_SHA256 (0x1301) aborted right after ServerHello once
@@ -140,7 +145,7 @@ export function validateClientHello(handshake, secrets) {
 // START_CONTRACT: buildServerHello
 //   PURPOSE: Build the fake ServerHello + ChangeCipherSpec + ApplicationData response
 //   INPUTS: { secret: Buffer(16), clientDigest: Buffer(32), sessionId: Buffer, alpn?: string,
-//             profile?: { cipher, alpn, ccsCount, appDataSizes } | null,
+//             profile?: { cipher, alpn, alpnKnown, ccsCount, appDataSizes, certLen } | null,
 //             offeredCiphers?: Buffer[] - suites from validateClientHello (gate profile.cipher) }
 //   OUTPUTS: { Buffer - full response packet }
 //   SIDE_EFFECTS: none
@@ -154,9 +159,18 @@ export function buildServerHello(secret, clientDigest, sessionId, alpn = null, p
   // bytes). The CIPHER, however, is replayed only when the client actually offered it:
   // RFC 8446 requires the selected suite to be one of the client's — answering a foreign
   // suite (e.g. rutube's 0x1302 to a 0x1301-only client) makes strict clients abort right
-  // after ServerHello. ALPN likewise falls back to our configured value when the profile
-  // captured none.
-  const replayAlpn = (profile && profile.alpn) || alpn;
+  // after ServerHello.
+  //
+  // ALPN fidelity: when the profile was parsed and recorded a protocol, replay it; when it was
+  // parsed and recorded NONE (profile.alpnKnown === true, alpn === null) OMIT the extension —
+  // the fronted origin itself answered without ALPN (observed for rutube.ru in production), so
+  // injecting the configured h2 would be a server-flight fingerprint mismatch. Only fall back to
+  // the configured ALPN when there is no parsed profile (alpnKnown !== true), which preserves
+  // the profile-less / legacy behaviour.
+  let replayAlpn;
+  if (profile && profile.alpn) replayAlpn = profile.alpn;
+  else if (profile && profile.alpnKnown === true) replayAlpn = null;
+  else replayAlpn = alpn;
   const profileCipher = profile && profile.cipher ? Buffer.from(profile.cipher) : null;
   const profileCipherOffered =
     profileCipher !== null &&

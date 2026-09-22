@@ -173,6 +173,11 @@ record-size fingerprint (JA3/JA4 server-side). Захват — сырой `net.
 flight, профиль ~1 КБ, refresh каждые `MTPROTO_TLS_PROFILE_REFRESH_MS`. При неудаче — fallback
 на синтетический ServerHello (обратная совместимость).
 
+**ALPN fidelity**: профиль фиксирует `alpnKnown` — отличает «origin ответил без ALPN» (например,
+rutube.ru) от «профиль не распарсен». В первом случае fake ServerHello **опускает** ALPN, а не
+подставляет configured `h2`; во втором — прежний fallback на `MTPROTO_TLS_ALPN`. Так server-flight
+не несёт ALPN, которого реальный хост не отправляет.
+
 **Doppelganger** (`MTPROTO_DOPPELGANGER=true`, требует TLS-профиль): помимо структуры replay'ятся
 и inter-arrival задержки между записями первого flight — тайминги рукопожатия становятся близки
 к реальному origin (стеady-state relay не затрагивается, задержка ограничена

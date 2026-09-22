@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.6.1
+// VERSION: 1.6.2
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,7 +14,11 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.1 - pass validated.ciphers into buildServerHello so a captured
+//   LAST_CHANGE: v1.6.2 - observability: mtproto_close now carries dc/client/tls so a close can
+//                be attributed to a client + DC (the console showed two interleaved clients whose
+//                closes were previously indistinguishable); mtproto_idle_timeout logs the same
+//                dc/client context plus idle_ms.
+//   PREVIOUS: v1.6.1 - pass validated.ciphers into buildServerHello so a captured
 //                profile.cipher is replayed only when the client offered it (fixes
 //                dd/simple wrapped transports aborting after ServerHello under
 //                MTPROTO_TLS_PROFILE_CAPTURE=1)
@@ -211,7 +215,11 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         const armIdle = () => {
           clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
-            log("mtproto_idle_timeout", "DF-3", dc.host, dc.port, idleMs);
+            log("mtproto_idle_timeout", "DF-3", dc.host, dc.port, {
+              dc: parsed.dcIdx,
+              client: socket.remoteAddress,
+              idle_ms: idleMs,
+            });
             socket.destroy();
             upstream.destroy();
           }, idleMs);
@@ -226,6 +234,9 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           syncActive();
           if (userStore && user) userStore.release(user);
           log("mtproto_close", "DF-2", dc.host, dc.port, {
+            dc: parsed.dcIdx,
+            client: socket.remoteAddress,
+            tls: isTls ? 1 : 0,
             bytes_in: bytesIn,
             bytes_out: bytesOut,
             duration_ms: Date.now() - startedAt,

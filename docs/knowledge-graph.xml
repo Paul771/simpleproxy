@@ -93,7 +93,7 @@
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (с IPv4↔IPv6 fallback) → relay (FAST_MODE) с backpressure (pause/resume на drain) и буферизацией хвоста при async DC-connect; doppelganger-тайминги, pending-handshake cap, metrics, per-user limits</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (с IPv4↔IPv6 fallback) → relay (FAST_MODE) с backpressure (pause/resume на drain) и буферизацией хвоста при async DC-connect; doppelganger-тайминги, pending-handshake cap, metrics, per-user limits; mtproto_close/idle_timeout логируют dc/client/tls для атрибуции соединений</purpose>
       <path>src/mtproto-server.js</path>
       <depends>M-MTPROTO, M-FAKETLS, M-LOG, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
@@ -103,13 +103,13 @@
     </M-MTPROTO-SERVER>
 
     <M-FAKETLS NAME="FakeTLS" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN, TLS-record framing, SNI-парсинг, TLS-alert</purpose>
+      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN (mirror профиля: при alpnKnown=true и отсутствии ALPN у origin — расширение опускается), TLS-record framing, SNI-парсинг, TLS-alert</purpose>
       <path>src/faketls.js</path>
       <depends>node:crypto</depends>
       <verification-ref>V-M-FAKETLS</verification-ref>
       <annotations>
         <fn-validateClientHello PURPOSE="Валидировать ClientHello по HMAC(secret, msg)" />
-        <fn-buildServerHello PURPOSE="Построить фейковый ServerHello (+ALPN) + CCS + app-data" />
+        <fn-buildServerHello PURPOSE="Построить фейковый ServerHello (+ALPN: replay профиля либо omit при alpnKnown=true без ALPN) + CCS + app-data" />
         <fn-createTlsRecordReader PURPOSE="Stateful парсер TLS-записей (app-data)" />
         <fn-wrapTlsRecord PURPOSE="Обернуть данные в TLS 1.3 app-data запись" />
         <fn-extractSni PURPOSE="Распарсить SNI hostname из ClientHello (null если нет)" />
@@ -145,9 +145,9 @@
       <verification-ref>V-M-TLS-PROFILE</verification-ref>
       <annotations>
         <fn-buildCaptureClientHello PURPOSE="Построить TLS 1.3 ClientHello для probe origin" />
-        <fn-captureTlsProfile PURPOSE="Сырой TCP-capture структуры server-flight (cipher/ALPN/CCS/размеры 0x17/inter-arrival delays)" />
+        <fn-captureTlsProfile PURPOSE="Сырой TCP-capture структуры server-flight (cipher/ALPN/alpnKnown/CCS/размеры 0x17/inter-arrival delays); ServerHello парсится из record-body (устойчиво к фрагментации)" />
         <fn-createProfileManager PURPOSE="Кэш профиля с periodic refresh" />
-        <fn-createTlsRecordObserver PURPOSE="Stateful наблюдатель TLS-записей (type+size)" />
+        <fn-createTlsRecordObserver PURPOSE="Stateful наблюдатель TLS-записей (type+size+body)" />
       </annotations>
     </M-TLS-PROFILE>
 

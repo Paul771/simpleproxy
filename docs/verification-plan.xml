@@ -217,6 +217,7 @@
         <scenario-5 kind="success">extractSni: парсит SNI из ClientHello с расширением server_name; null без SNI.</scenario-5>
         <scenario-6 kind="success">buildTlsAlert(112) == 15 03 03 00 02 02 70 (unrecognized_name для reject_handshake).</scenario-6>
         <scenario-8 kind="success" wave="A2">profile.cipher реплеится ТОЛЬКО когда клиент предложил его (validateClientHello извлекает offered ciphers); иначе дефолт 0x1301. Регрессия: безгейтовой реплей 0x1302 рвал dd/simple wrapped-транспорты после ServerHello.</scenario-8>
+        <scenario-9 kind="success" wave="E">ALPN fidelity: profile.alpnKnown=true и alpn=null (origin без ALPN, как rutube.ru) → buildServerHello ОПУСКАЕТ ALPN-расширение вопреки configured h2; profile.alpn задан → реплеится он; profile без alpnKnown (legacy/литерал) → fallback на configured ALPN.</scenario-9>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][faketls_auth_fail][DF-1]</marker-1>
@@ -279,10 +280,11 @@
       </module-checks>
       <scenarios>
         <scenario-1 kind="success">buildCaptureClientHello: TLS 1.3 ClientHello record, длина &gt;= 512.</scenario-1>
-        <scenario-2 kind="success">captureTlsProfile против script-сервера: cipher, ALPN, ccsCount, appDataSizes извлекаются; пустой origin → null.</scenario-2>
+        <scenario-2 kind="success">captureTlsProfile против script-сервера: cipher, ALPN, alpnKnown, ccsCount, appDataSizes извлекаются; пустой origin → null.</scenario-2>
         <scenario-3 kind="success">buildServerHello с profile: replay cipher/ALPN/ccsCount/размер app-data, digest остаётся валидным.</scenario-3>
         <scenario-4 kind="success">profile=null → синтетика (один CCS + один app-data) — обратная совместимость.</scenario-4>
         <scenario-5 kind="success">createProfileManager: start → capture → get(); stop чистит таймер.</scenario-5>
+        <scenario-6 kind="success" wave="E">alpnKnown: origin отвечает ServerHello БЕЗ ALPN → profile.alpn=null, alpnKnown=true (отличает «origin без ALPN» от «профиль не распарсен»); createTlsRecordObserver отдаёт body каждой записи (ServerHello парсится из body, устойчиво к фрагментации записи по чанкам).</scenario-6>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][tls_profile][DF-TLS-PROFILE]</marker-1>
@@ -317,6 +319,7 @@
         <marker-3>[proxy][mtproto_quota_exceeded][DF-USER]</marker-3>
         <marker-4>[proxy][mtproto_user_unknown][DF-4]</marker-4>
         <marker-5>[proxy][mtproto_handshake_timeout][DF-1]</marker-5>
+        <marker-6 wave="E">[proxy][mtproto_close][DF-2] ... {dc, client, tls, bytes_in, bytes_out, duration_ms} (атрибуция close к клиенту+DC); [proxy][mtproto_idle_timeout][DF-3] ... {dc, client, idle_ms}</marker-6>
       </required-log-markers>
     </V-M-HARDEN>
 

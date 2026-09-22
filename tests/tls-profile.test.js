@@ -104,6 +104,18 @@ test("createTlsRecordObserver: yields type+length for each complete record", () 
   assert.equal(recs[3].length, 20);
 });
 
+test("createTlsRecordObserver: exposes each record's body (used to parse the ServerHello)", () => {
+  const obs = createTlsRecordObserver();
+  const flight = buildScriptedFlight({ cipher: Buffer.from([0x13, 0x01]), alpn: "h2", appDataSizes: [10, 20] });
+  const recs = [];
+  for (let i = 0; i < flight.length; i += 5) {
+    recs.push(...obs.feed(flight.subarray(i, Math.min(i + 5, flight.length))));
+  }
+  assert.ok(recs.every((r) => Buffer.isBuffer(r.body) && r.body.length === r.length), "body must mirror the record payload");
+  assert.equal(recs[0].body[0], 0x02, "ServerHello handshake type is the first body byte");
+  assert.equal(recs.filter((r) => r.type === 0x17)[0].body.length, 10);
+});
+
 test("captureTlsProfile: captures cipher, ALPN, ccsCount and app-data sizes from a scripted origin", async () => {
   const flight = buildScriptedFlight({
     cipher: Buffer.from([0x13, 0x02]), // TLS_AES_256_GCM_SHA384
@@ -117,6 +129,7 @@ test("captureTlsProfile: captures cipher, ALPN, ccsCount and app-data sizes from
     assert.ok(profile, "profile must be captured");
     assert.deepEqual(Array.from(profile.cipher), [0x13, 0x02]);
     assert.equal(profile.alpn, "h2");
+    assert.equal(profile.alpnKnown, true, "parsed ServerHello -> ALPN observation is known");
     assert.equal(profile.ccsCount, 1);
     assert.deepEqual(profile.appDataSizes, [150, 300, 80]);
     // recordDelays: one entry per gap between consecutive records
@@ -126,6 +139,21 @@ test("captureTlsProfile: captures cipher, ALPN, ccsCount and app-data sizes from
     for (const d of profile.recordDelays) {
       assert.ok(Number.isFinite(d) && d >= 0, "delay must be a non-negative finite number");
     }
+  } finally {
+    origin.closeAllConnections?.();
+    origin.close();
+  }
+});
+
+test("captureTlsProfile: alpn=null with alpnKnown=true when the origin negotiates no ALPN", async () => {
+  // rutube.ru-like origin: a valid ServerHello that carries no ALPN extension.
+  const flight = buildScriptedFlight({ cipher: Buffer.from([0x13, 0x02]), alpn: null, appDataSizes: [150, 300] });
+  const origin = await startScriptOrigin(flight);
+  try {
+    const profile = await captureTlsProfile("127.0.0.1", origin.address().port, { timeoutMs: 3000 });
+    assert.ok(profile, "profile must be captured");
+    assert.equal(profile.alpn, null);
+    assert.equal(profile.alpnKnown, true, "parsed ServerHello proves the origin negotiated no ALPN");
   } finally {
     origin.closeAllConnections?.();
     origin.close();

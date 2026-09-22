@@ -1,5 +1,5 @@
 // FILE: src/tls-profile.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Capture a real TLS server-flight profile from a fronted domain and replay its structure
 //   SCOPE: raw TCP TLS-1.3 capture (ClientHello build, record observer), profile cache + periodic refresh
@@ -13,11 +13,17 @@
 //   buildCaptureClientHello - build a TLS 1.3 ClientHello to probe an origin server flight
 //   captureTlsProfile - connect to an origin, capture the server-flight record structure
 //   createProfileManager - cached profile with periodic refresh
-//   createTlsRecordObserver - stateful raw TLS record observer (type + size of every record)
+//   createTlsRecordObserver - stateful raw TLS record observer (type + size + body of every record)
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.1.0 - FIX capture ClientHello: (1) key_share extension was missing the
+//   LAST_CHANGE: v1.2.0 - capture robustness + ALPN fidelity: the observer now returns each
+//                record's body, so captureTlsProfile parses the ServerHello directly from it
+//                instead of the chunk-slicing heuristic that silently dropped cipher/ALPN when
+//                the origin flight was split across TCP segments. buildProfile now records
+//                alpnKnown so M-FAKETLS can mirror an origin that negotiated NO ALPN (rutube.ru
+//                in prod) instead of injecting the configured h2.
+//   PREVIOUS: v1.1.0 - FIX capture ClientHello: (1) key_share extension was missing the
 //                2-byte KeyShareClientHello vector length (RFC 8446 section 4.2.8);
 //                (2) supported_groups used extension type 0x002a (early_data!) instead of
 //                0x000a. Together these made every probe hello structurally invalid — all
@@ -154,9 +160,10 @@ function wrapHandshakeRecord(hsType, inner) {
 }
 
 // START_CONTRACT: createTlsRecordObserver
-//   PURPOSE: Stateful raw TLS record observer: records type + length of every record seen
-//   INPUTS: { none } -> { feed(chunk: Buffer): { type, length }[] }
-//   OUTPUTS: { { feed } - returns array of { type, length } for each fully-seen record }
+//   PURPOSE: Stateful raw TLS record observer: records type + length + body of every record seen
+//   INPUTS: { none } -> { feed(chunk: Buffer): { type, length, body }[] }
+//   OUTPUTS: { { feed } - returns array of { type, length, body } for each fully-seen record
+//              (body = copy of the record payload, used to parse the ServerHello reliably) }
 //   SIDE_EFFECTS: maintains internal buffer/state
 //   LINKS: M-TLS-PROFILE
 // END_CONTRACT: createTlsRecordObserver
@@ -172,7 +179,7 @@ export function createTlsRecordObserver() {
         const type = buf[0];
         const length = buf.readUInt16BE(3);
         if (buf.length < TLS_REC_HDR + length) break;
-        out.push({ type, length });
+        out.push({ type, length, body: Buffer.from(buf.subarray(TLS_REC_HDR, TLS_REC_HDR + length)) });
         buf = buf.subarray(TLS_REC_HDR + length);
       }
       return out;
@@ -219,7 +226,8 @@ function parseServerHello(recordBody) {
 // START_CONTRACT: captureTlsProfile
 //   PURPOSE: Connect to an origin, probe it with a TLS 1.3 ClientHello, capture the server-flight shape
 //   INPUTS: { host: string, port: number, timeoutMs?: number, log?: Log }
-//   OUTPUTS: { Profile | null - { host, capturedAt, cipher, alpn, ccsCount, appDataSizes, ticketSizes, certLen } }
+//   OUTPUTS: { Profile | null - { host, capturedAt, cipher, alpn, alpnKnown, ccsCount,
+//              appDataSizes, ticketSizes, certLen, recordDelays } }
 //   SIDE_EFFECTS: opens a TCP connection; reads bytes; closes it
 //   LINKS: M-TLS-PROFILE
 // END_CONTRACT: captureTlsProfile
@@ -258,13 +266,17 @@ export async function captureTlsProfile(host, port, { timeoutMs = 5000, log } = 
 
     socket.on("data", (chunk) => {
       for (const rec of observer.feed(chunk)) {
-        records.push({ ...rec, ts: Date.now() });
+        records.push({ type: rec.type, length: rec.length, ts: Date.now() });
         lastRecordAt = Date.now();
         if (rec.type === TYPE_HANDSHAKE && serverHelloParsed === null) {
-          // record body starts after the 5-byte record header; the observer gives us length only,
-          // so we re-slice from the observer's internal buffer is not possible. Re-parse via a
-          // dedicated small parse using a second pass: keep the last handshake record body.
-          serverHelloParsed = tryParseServerHelloFromFeed(chunk, rec);
+          // Parse the ServerHello straight from the observer's record body: this is robust to the
+          // record spanning multiple TCP chunks. The previous chunk-slicing heuristic silently
+          // lost cipher+ALPN whenever the origin flight was fragmented, which weakened replay.
+          try {
+            serverHelloParsed = parseServerHello(rec.body);
+          } catch {
+            serverHelloParsed = null;
+          }
         }
         if (rec.type === TYPE_ALERT) finish(buildProfile(host, serverHelloParsed, records));
       }
@@ -277,17 +289,6 @@ export async function captureTlsProfile(host, port, { timeoutMs = 5000, log } = 
 }
 
 // Best-effort: parse the ServerHello out of the most recent feed chunk that contained a 0x16 record.
-function tryParseServerHelloFromFeed(chunk, rec) {
-  if (rec.type !== TYPE_HANDSHAKE) return null;
-  // The record may not be fully contained in this single chunk; find the 0x16 0x03 0x03 header.
-  const idx = chunk.indexOf(Buffer.from([0x16, 0x03, 0x03]), 0);
-  if (idx === -1) return null;
-  const bodyStart = idx + TLS_REC_HDR;
-  const body = chunk.subarray(bodyStart, bodyStart + rec.length);
-  if (body.length < rec.length) return null; // incomplete in this chunk
-  return parseServerHello(body);
-}
-
 function buildProfile(host, serverHelloParsed, records) {
   if (!records || records.length === 0) return null;
   let cipher = null;
@@ -317,6 +318,10 @@ function buildProfile(host, serverHelloParsed, records) {
     capturedAt: Date.now(),
     cipher,
     alpn,
+    // True only when the ServerHello was actually observed AND parsed: distinguishes "the origin
+    // negotiated no ALPN" (alpn=null, alpnKnown=true -> replay must omit ALPN) from "no profile
+    // information" (alpnKnown=false -> fall back to the configured ALPN).
+    alpnKnown: serverHelloParsed !== null,
     ccsCount,
     appDataSizes,
     ticketSizes,
@@ -348,8 +353,11 @@ export function createProfileManager({ host, port = 443, refreshMs = 600_000, ti
         log?.("tls_profile", "DF-TLS-PROFILE", host, {
           cipher: captured.cipher?.toString("hex"),
           alpn: captured.alpn,
+          alpnKnown: captured.alpnKnown,
           ccsCount: captured.ccsCount,
           appDataRecords: captured.appDataSizes.length,
+          certLen: captured.certLen,
+          delays: captured.recordDelays.length,
         });
       } else {
         log?.("tls_profile", "DF-TLS-PROFILE", host, { status: "failed" });
