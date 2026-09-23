@@ -90,6 +90,7 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_TLS_PROFILE_TIMEOUT_MS` | `5000` | Таймаут захвата TLS-профиля, мс |
 | `MTPROTO_DOPPELGANGER` | `false` | Replay inter-arrival delays server-flight при отправке fake ServerHello (требует TLS-профиль) |
 | `MTPROTO_DOPPELGANGER_MAX_DELAY_MS` | `500` | Верхняя граница задержки в doppelganger-режиме, мс |
+| `MTPROTO_DOPPELGANGER_LOG_MS` | `5000` | Мин. интервал между строками `[proxy][doppelganger]`; `0` = лог на каждое соединение (иначе поле `suppressed` в строке = сколько событий пропущено) |
 | `MTPROTO_PENDING_MAX` | `256` | Лимит сокетов в фазе MTProto-handshake (slowloris-защита) |
 | `MTPROTO_IDLE_TIMEOUT_MS` | = `IDLE_TIMEOUT_MS` | Отдельный idle-таймаут MTProto-релея; ставьте больше общего при DPI-окнах провайдера |
 | `MTPROTO_HANDSHAKE_TIMEOUT_MS` | `10000` | Таймаут незавершённого MTProto-handshake (переопределение для тестов) |
@@ -237,6 +238,12 @@ curl http://<host>:9091/metrics
 увидеть по нему рестарт процесса (`uptime_s` сбросился), тихий простой (нет строк) и давление
 пула (`active` подбирается к `MTPROTO_MAX_CONNECTIONS`). Интервал задаётся при старте →
 смена `MTPROTO_HEARTBEAT_MS` через SIGUSR2 помечается `restart_needed`.
+
+**Коалесинг doppelganger-лога** (`MTPROTO_DOPPELGANGER_LOG_MS`, дефолт 5000): `[proxy][doppelganger]`
+эмитится не чаще одного раза за окно, а поле `suppressed` показывает, сколько событий было
+пропущено с прошлой строки (накопленное значение переносится, поэтому всплеск не теряется — просто
+репортится следующей строкой). Раньше строка шла на **каждое** fake-TLS соединение — именно этот
+объём забивал журнал и гонял сокет панели в реконнект-петлю. `0` возвращает старое поведение.
 
 **Лимит соединений** (`MTPROTO_MAX_CONNECTIONS`, дефолт **256**): один клиент Telegram держит
 ~8–10 сокетов, поэтому старый дефолт 64 позволял шторму переподключений (или нескольким

@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.9.0
+// VERSION: 1.10.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
 //            periodic [proxy][heartbeat] liveness line
@@ -15,7 +15,11 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.9.0 - periodic [proxy][heartbeat] line (cfg.mtprotoHeartbeatMs, default 60s,
+//   LAST_CHANGE: v1.10.0 - coalesce the [proxy][doppelganger] line (cfg.mtprotoDoppelgangerLogMs,
+//                default 5s, 0 = per-connection): at most one line per interval plus a
+//                `suppressed` count of skipped occurrences. A busy fake-TLS client logged a line
+//                per connection, which flooded the journal and churned the panel's stdout socket.
+//   PREVIOUS: v1.9.0 - periodic [proxy][heartbeat] line (cfg.mtprotoHeartbeatMs, default 60s,
 //                0 = off) reporting uptime_s + active/pending/total. Makes restarts, idle gaps
 //                and pool pressure visible in a journal that replays stdout without timestamps.
 //   PREVIOUS: v1.8.0 - client-abort guard during the DC connect window: a client that dies while
@@ -67,6 +71,9 @@ const HANDSHAKE_LEN = 64;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 // Default period of the [proxy][heartbeat] liveness line (overridable via MTPROTO_HEARTBEAT_MS).
 const HEARTBEAT_INTERVAL_MS = 60_000;
+// Default minimum spacing between [proxy][doppelganger] lines (overridable via
+// MTPROTO_DOPPELGANGER_LOG_MS; 0 restores one line per connection).
+const DOPPELGANGER_LOG_INTERVAL_MS = 5_000;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 // One retry of the preferred DC candidate after the list is exhausted (see START_BLOCK_MT_RELAY):
 // a transient IPv4 failure or a wasted fallback would otherwise drop the client. The retry uses a
@@ -154,6 +161,28 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     heartbeatTimer.unref?.();
   }
   // END_BLOCK_MT_HEARTBEAT
+
+  // START_BLOCK_MT_DOPPELGANGER_LOG
+  // Doppelganger log coalescing (shared across connections): at most one line per interval, with
+  // a `suppressed` count of occurrences skipped since the previous line. A busy fake-TLS client
+  // otherwise logs one line per connection, which floods the journal and churns the panel's
+  // stdout socket — the panel then stalls and replays its whole buffer on reconnect. The count is
+  // carried forward until it is emitted, so a burst is never lost, only reported later.
+  // interval <= 0 restores the old log-every-event behaviour.
+  let dgLoggedAt = 0;
+  let dgSuppressed = 0;
+  const logDoppelganger = (addr, records, delays) => {
+    const interval = cfg.mtprotoDoppelgangerLogMs ?? DOPPELGANGER_LOG_INTERVAL_MS;
+    const now = Date.now();
+    if (interval <= 0 || now - dgLoggedAt >= interval) {
+      dgLoggedAt = now;
+      log("doppelganger", "DF-DOPPELGANGER", addr, { records, delays, suppressed: dgSuppressed });
+      dgSuppressed = 0;
+    } else {
+      dgSuppressed += 1;
+    }
+  };
+  // END_BLOCK_MT_DOPPELGANGER_LOG
 
   // START_BLOCK_ROUTE_UNKNOWN
   // Behaviour on unknown SNI / failed fake-TLS auth (telemt-inspired anti-DPI).
@@ -637,10 +666,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             const d = delays[Math.min(idx, delays.length - 1)];
             setTimeout(() => sendNext(idx + 1), Math.min(d, cfg.mtprotoDoppelgangerMaxDelayMs)).unref?.();
           };
-          log("doppelganger", "DF-DOPPELGANGER", socket.remoteAddress, {
-            records: records.length,
-            delays: delays.length,
-          });
+          logDoppelganger(socket.remoteAddress, records.length, delays.length);
           sendNext(0);
         } else {
           socket.write(response);

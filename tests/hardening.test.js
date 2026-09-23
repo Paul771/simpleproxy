@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.5.0
+// VERSION: 1.6.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -15,7 +15,9 @@
 //          A-4 client abort during the DC connect window must not start a relay (no active-slot
 //          leak, no spurious dc_fallback/upstream_error) — injectable connectImpl;
 //          A-5 periodic [proxy][heartbeat] liveness line (uptime_s + active/pending/total);
-//          config: MTPROTO_MAX_CONNECTIONS default 256 + MTPROTO_HEARTBEAT_MS parse/disable
+//          config: MTPROTO_MAX_CONNECTIONS default 256 + MTPROTO_HEARTBEAT_MS parse/disable;
+//          A-6 [proxy][doppelganger] coalescing with a suppressed counter + config
+//          MTPROTO_DOPPELGANGER_LOG_MS
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
 //            M-PROXY
 //   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
@@ -24,7 +26,8 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.5.0 - A-5 heartbeat test + config test for the raised MTPROTO_MAX_CONNECTIONS
+//   LAST_CHANGE: v1.6.0 - A-6 doppelganger coalescing test + config MTPROTO_DOPPELGANGER_LOG_MS
+//   PREVIOUS: v1.5.0 - A-5 heartbeat test + config test for the raised MTPROTO_MAX_CONNECTIONS
 //               default (256) and MTPROTO_HEARTBEAT_MS (override / 0-disables / invalid)
 //   PREVIOUS: v1.4.0 - A-4 test: with an injected DC connector, a client that dies while the
 //               DC dial is pending must never be handed a relay — asserts no mtproto_connect,
@@ -1164,5 +1167,99 @@ test("hardening: periodic [proxy][heartbeat] reports uptime and live counters (A
     fakeDc.closeAllConnections?.();
     server.close();
     fakeDc.close();
+  }
+});
+
+test("config: MTPROTO_DOPPELGANGER_LOG_MS default/override/0/invalid", () => {
+  const base = "25a36e7142e90fa52c2f29e276392a7f";
+  assert.equal(loadConfig({ MTPROTO_SECRET: base }).mtprotoDoppelgangerLogMs, 5_000, "default must be 5s");
+
+  assert.equal(
+    loadConfig({ MTPROTO_SECRET: base, MTPROTO_DOPPELGANGER_LOG_MS: "250" }).mtprotoDoppelgangerLogMs,
+    250
+  );
+  assert.equal(
+    loadConfig({ MTPROTO_SECRET: base, MTPROTO_DOPPELGANGER_LOG_MS: "0" }).mtprotoDoppelgangerLogMs,
+    0,
+    "0 must restore per-connection logging"
+  );
+  for (const bad of ["-1", "soon"]) {
+    assert.throws(
+      () => loadConfig({ MTPROTO_SECRET: base, MTPROTO_DOPPELGANGER_LOG_MS: bad }),
+      /INVALID_ENV/,
+      `MTPROTO_DOPPELGANGER_LOG_MS="${bad}" must be rejected`
+    );
+  }
+});
+
+test("hardening: [proxy][doppelganger] is coalesced with a suppressed counter (A-6)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 120_000,
+    rules: [],
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoPendingMax: 256,
+    mtprotoDoppelganger: true,
+    mtprotoDoppelgangerLogMs: 60_000,
+  };
+  // Minimal captured profile: only recordDelays is needed to enter the doppelganger branch;
+  // buildServerHello tolerates the missing cipher/certLen (falls back to its defaults).
+  const profile = { recordDelays: [5, 5, 5] };
+  const handler = createMtprotoHandler(
+    cfg,
+    logCollector,
+    () => null,
+    null,
+    null,
+    { get: () => profile },
+    null,
+    null,
+    null
+  );
+  const server = createMuxServer({ "http-connect": () => {}, "http-other": () => {}, mtproto: handler });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  const sockets = [];
+  const sendHello = () => {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, handshake);
+    const s = net.connect(server.address().port, "127.0.0.1", () => s.write(hello));
+    s.on("data", () => {});
+    s.on("error", () => {});
+    sockets.push(s);
+  };
+
+  try {
+    // Long window: 4 rapid handshakes collapse into a single emitted line.
+    for (let i = 0; i < 4; i++) sendHello();
+    await new Promise((r) => setTimeout(r, 80));
+    const firstWave = logs.filter((l) => l.event === "doppelganger");
+    assert.equal(firstWave.length, 1, "rapid events must coalesce into one line");
+    assert.equal(firstWave[0].ref, "DF-DOPPELGANGER");
+    assert.equal(firstWave[0].detail.suppressed, 0);
+
+    // 0 disables coalescing (read live from cfg): the accumulated suppressed count is flushed on
+    // the next line, then reset. Deterministic without relying on wall-clock timing.
+    cfg.mtprotoDoppelgangerLogMs = 0;
+    for (let i = 0; i < 3; i++) sendHello();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const all = logs.filter((l) => l.event === "doppelganger");
+    assert.ok(all.length >= 4, `expected >=4 doppelganger lines, got ${all.length}`);
+    assert.ok(
+      all.some((l) => l.detail.suppressed >= 3),
+      "the accumulated suppressed count must be reported on the next line"
+    );
+  } finally {
+    for (const s of sockets) s.destroy();
+    server.closeAllConnections?.();
+    server.close();
   }
 });

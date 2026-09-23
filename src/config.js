@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.5.0
+// VERSION: 1.6.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -15,7 +15,9 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.5.0 - MTPROTO_MAX_CONNECTIONS default 64 -> 256 (a client opens ~8-10
+//   LAST_CHANGE: v1.6.0 - new MTPROTO_DOPPELGANGER_LOG_MS (default 5000, 0 = per-connection):
+//                coalescing window for the [proxy][doppelganger] line
+//   PREVIOUS: v1.5.0 - MTPROTO_MAX_CONNECTIONS default 64 -> 256 (a client opens ~8-10
 //                sockets, so 64 let a storm lock everyone out); new MTPROTO_HEARTBEAT_MS
 //                (default 60000, 0 disables) drives the periodic [proxy][heartbeat] line
 //   PREVIOUS: v1.4.0 - new env MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS
@@ -87,7 +89,7 @@ function parseExpiry(value) {
 //                          mtprotoUnknownSniAction, mtprotoReplayWindow, mtprotoReplayTtlMs,
 //                          mtprotoDigestFreshnessMs, mtprotoPreferIpv6,
 //                          mtprotoTlsProfileCapture, mtprotoTlsProfileRefreshMs, mtprotoTlsProfileTimeoutMs,
-//                          mtprotoDoppelganger, mtprotoDoppelgangerMaxDelayMs,
+//                          mtprotoDoppelganger, mtprotoDoppelgangerMaxDelayMs, mtprotoDoppelgangerLogMs,
 //                          mtprotoMetricsPort, mtprotoMetricsHost } }
 //   SIDE_EFFECTS: none
 //   LINKS: M-CONFIG
@@ -243,6 +245,14 @@ export function loadConfig(env = process.env) {
     500,
     "MTPROTO_DOPPELGANGER_MAX_DELAY_MS"
   );
+  // Coalescing window for the [proxy][doppelganger] line: minimum ms between lines (0 = one line
+  // per connection, i.e. the old behaviour). Keeps a busy fake-TLS client from flooding the
+  // journal and churning the panel stdout socket.
+  const mtprotoDoppelgangerLogMs = parsePortEnv(
+    env.MTPROTO_DOPPELGANGER_LOG_MS,
+    5_000,
+    "MTPROTO_DOPPELGANGER_LOG_MS"
+  );
 
   // --- Observability: Prometheus metrics side-port (off by default = 0). ---
   const mtprotoMetricsPort = parsePortEnv(env.MTPROTO_METRICS_PORT, 0, "MTPROTO_METRICS_PORT");
@@ -302,6 +312,7 @@ export function loadConfig(env = process.env) {
     mtprotoTlsProfileTimeoutMs,
     mtprotoDoppelganger,
     mtprotoDoppelgangerMaxDelayMs,
+    mtprotoDoppelgangerLogMs,
     mtprotoMetricsPort,
     mtprotoMetricsHost,
     mtprotoBlocklist,
