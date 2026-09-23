@@ -1,7 +1,8 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.8.0
+// VERSION: 1.9.0
 // START_MODULE_CONTRACT
-//   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
+//   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
+//            periodic [proxy][heartbeat] liveness line
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
 //   DEPENDS: M-MTPROTO, M-FAKETLS, M-LOG
 //   LINKS: M-MTPROTO
@@ -14,7 +15,10 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.8.0 - client-abort guard during the DC connect window: a client that dies while
+//   LAST_CHANGE: v1.9.0 - periodic [proxy][heartbeat] line (cfg.mtprotoHeartbeatMs, default 60s,
+//                0 = off) reporting uptime_s + active/pending/total. Makes restarts, idle gaps
+//                and pool pressure visible in a journal that replays stdout without timestamps.
+//   PREVIOUS: v1.8.0 - client-abort guard during the DC connect window: a client that dies while
 //                a DC connect is in flight now aborts that connect and is never handed a relay.
 //                Pre-fix, startRelay() ran on the destroyed socket, leaking an active-connection
 //                slot (reaped only by the idle timeout -> mtproto_cap exhaustion under a client
@@ -61,6 +65,8 @@ import { maskConnection } from "./mask.js";
 
 const HANDSHAKE_LEN = 64;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+// Default period of the [proxy][heartbeat] liveness line (overridable via MTPROTO_HEARTBEAT_MS).
+const HEARTBEAT_INTERVAL_MS = 60_000;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 // One retry of the preferred DC candidate after the list is exhausted (see START_BLOCK_MT_RELAY):
 // a transient IPv4 failure or a wasted fallback would otherwise drop the client. The retry uses a
@@ -117,6 +123,7 @@ function detectIpv6Availability() {
 export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidates, replayGuard = null, maskImpl = maskConnection, profileManager = null, metrics = null, userStore = null, connectImpl = net.connect) {
   let activeConnections = 0;
   let pendingHandshakes = 0; // sockets in handshake phase, before relay is established
+  let totalConnections = 0; // cumulative connections that passed the cap checks
 
   // Detected once: whether this host can reach Telegram over IPv6. On an IPv4-only host the v6
   // candidate is skipped so a transient IPv4 failure is not masked by a guaranteed ENETUNREACH.
@@ -128,6 +135,25 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
   const syncActive = () => {
     if (metrics) metrics.set("simpleproxy_active_mtproto", activeConnections);
   };
+
+  // START_BLOCK_MT_HEARTBEAT
+  // Periodic liveness line: uptime + live counters. The Wispbyte journal only replays buffered
+  // stdout and carries no timestamps, so a redeploy/restart, a silent idle gap, or pool pressure
+  // (active approaching mtprotoMaxConnections) is otherwise invisible. 0 (or a negative override)
+  // disables it. unref so a handler kept alive only by this timer never blocks process exit.
+  const heartbeatMs = cfg.mtprotoHeartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+  if (heartbeatMs > 0) {
+    const heartbeatTimer = setInterval(() => {
+      log("heartbeat", "DF-HEARTBEAT", "mtproto", {
+        uptime_s: Math.round(process.uptime()),
+        active: activeConnections,
+        pending: pendingHandshakes,
+        total: totalConnections,
+      });
+    }, heartbeatMs);
+    heartbeatTimer.unref?.();
+  }
+  // END_BLOCK_MT_HEARTBEAT
 
   // START_BLOCK_ROUTE_UNKNOWN
   // Behaviour on unknown SNI / failed fake-TLS auth (telemt-inspired anti-DPI).
@@ -164,6 +190,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       socket.destroy();
       return;
     }
+    totalConnections += 1; // counted once the caps admitted this socket
     pendingHandshakes += 1;
     syncPending();
 

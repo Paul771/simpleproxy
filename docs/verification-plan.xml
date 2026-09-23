@@ -42,6 +42,7 @@
         <scenario-4 kind="success">MTPROTO_MASK_RELAY_MAX_BYTES: дефолт 32 MiB (33554432), override парсится, 0 = кап выключен, отрицательное/мусор → throw INVALID_ENV.</scenario-4>
         <scenario-5 kind="success" wave="2">MTPROTO_USERS_STRICT: дефолт false; "1"/"true"/"yes"/"on" → true; прочее → false. Поле mtprotoUsersStrict в конфиге; hot-reload детектирует смену.</scenario-5>
         <scenario-6 kind="success" wave="A">MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS: unset → null (наследование общего таймаута); валидное число парсится; "0"/отрицательное/мусор → throw INVALID_ENV.</scenario-6>
+        <scenario-7 kind="success" wave="A">MTPROTO_MAX_CONNECTIONS: дефолт 256; override парсится; MTPROTO_HEARTBEAT_MS: дефолт 60000, override парсится, "0" = heartbeat выключен, отрицательное/мусор → throw INVALID_ENV.</scenario-7>
       </scenarios>
       <required-log-markers>
         <marker-1>[config][load][env]</marker-1>
@@ -315,6 +316,7 @@
         <scenario-11 kind="success" wave="E">A-3 post-ServerHello silence: валидный fake-TLS ClientHello (без app-data) → прокси отвечает ServerHello, клиент молчит → лог mtproto_handshake_timeout с phase="tls-app", bytes=0; simpleproxy_handshake_timeouts_total=1 и simpleproxy_faketls_post_hello_timeouts_total=1 (подмножество).</scenario-11>
         <scenario-10 kind="success" wave="A">A-1 idle override: relay установлен (handshake без FIN), клиент замолкает; cfg.mtprotoIdleTimeoutMs=150 при idleTimeoutMs=120000 → закрытие по mtproto_idle_timeout за ~150мс, не по общему таймауту.</scenario-10>
         <scenario-12 kind="success" wave="A">A-4 abort в окне DC-connect: injectable connectImpl отдаёт unconnected Socket; клиент умирает пока dial pending (gauge simpleproxy_pending_mtproto → 0 по close), затем эмулируется 'connect' → relay НЕ стартует: нет [proxy][mtproto_connect], active gauge=0, нет mtproto_dc_fallback/upstream_error (нет утечки active-слота в mtproto_cap).</scenario-12>
+        <scenario-13 kind="success" wave="A">A-5 heartbeat: cfg.mtprotoHeartbeatMs=40, удерживается активный relay → лог [proxy][heartbeat][DF-HEARTBEAT] mtproto {uptime_s, active:1, pending, total≥1}; 0 = heartbeat выключен.</scenario-13>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_pending_cap][DF-4]</marker-1>
@@ -323,6 +325,7 @@
         <marker-4>[proxy][mtproto_user_unknown][DF-4]</marker-4>
         <marker-5>[proxy][mtproto_handshake_timeout][DF-1] ... {bytes, phase} (phase=tls-app ⇒ ServerHello отправлен, клиент замолчал)</marker-5>
         <marker-6 wave="E">[proxy][mtproto_close][DF-2] ... {dc, client, tls, bytes_in, bytes_out, duration_ms} (атрибуция close к клиенту+DC); [proxy][mtproto_idle_timeout][DF-3] ... {dc, client, idle_ms}</marker-6>
+        <marker-7 wave="A">[proxy][heartbeat][DF-HEARTBEAT] mtproto {uptime_s, active, pending, total} — периодический liveness-лог (рестарт/простой/давление пула)</marker-7>
       </required-log-markers>
     </V-M-HARDEN>
 

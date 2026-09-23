@@ -66,7 +66,7 @@ test("MTProto: MTPROTO_SECRET parses into lowercase hex secrets; unset disables"
   const disabled = loadConfig({});
   assert.deepEqual(disabled.mtprotoSecrets, []);
   assert.equal(disabled.mtprotoPort, 0);
-  assert.equal(disabled.mtprotoMaxConnections, 64);
+  assert.equal(disabled.mtprotoMaxConnections, 256);
 
   const cfg = loadConfig({
     MTPROTO_SECRET: "ABCDEF0123456789ABCDEF0123456789,00112233445566778899aabbccddeeff",

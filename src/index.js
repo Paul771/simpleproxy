@@ -1,5 +1,5 @@
 // FILE: src/index.js
-// VERSION: 1.4.0
+// VERSION: 1.5.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Entry point: loadConfig -> makeLog -> mux(connect + mtproto) -> start
 //   SCOPE: process bootstrap, dependency wiring, tg://proxy link generation
@@ -10,7 +10,9 @@
 // END_MODULE_CONTRACT
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.4.0 - W2-1 runtime swap on SIGUSR2: userStore.update() and blocklist
+//   LAST_CHANGE: v1.5.0 - mtprotoHeartbeatMs added to RESTART_FIELDS: the heartbeat interval is
+//                fixed at handler construction, so a reload must flag it restart_needed
+//   PREVIOUS: v1.4.0 - W2-1 runtime swap on SIGUSR2: userStore.update() and blocklist
 //                rebuild when mtprotoUsers/mtprotoBlocklist change (previously both stayed
 //                boot-time stale), generation counter in reload log, MTProto enable/disable
 //                topology flip flagged as restart_needed
@@ -147,6 +149,7 @@ const RESTART_FIELDS = new Set([
   "mtprotoTlsProfileCapture",
   "mtprotoTlsProfileRefreshMs",
   "mtprotoTlsProfileTimeoutMs",
+  "mtprotoHeartbeatMs",
 ]);
 process.on("SIGUSR2", () => {
   let next;

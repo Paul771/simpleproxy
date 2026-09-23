@@ -74,7 +74,7 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `PROXY_PASS` | — | Пароль basic auth |
 | `MTPROTO_SECRET` | — | MTProto-секреты, 32 hex (16 байт); несколько через запятую. Формат `user:secret` (или просто `secret` → пользователь `default`). **Не задан → MTProto выключен** |
 | `MTPROTO_PORT` | `0` | Отдельный порт для MTProto; `0` = мультиплексировать с HTTP на `PORT` |
-| `MTPROTO_MAX_CONNECTIONS` | `64` | Лимит одновременных MTProto-соединений |
+| `MTPROTO_MAX_CONNECTIONS` | `256` | Лимит одновременных MTProto-соединений (один клиент держит ~8–10; при сомнениях поднимайте) |
 | `MTPROTO_HOST` | `YOUR_HOST_OR_IP` | Публичный адрес сервера для подстановки в `tg://proxy`-ссылки (домен или IP) |
 | `MTPROTO_TLS_DOMAIN` | `www.google.com` | Домен для fake-TLS (ee) маскировки; подставляется в ee-ссылку как SNI. См. примечание ниже про выбор домена |
 | `MTPROTO_MASK_HOST` | = `MTPROTO_TLS_DOMAIN` | Реальный upstream для traffic-masking при unknown SNI / неверном секрете |
@@ -93,6 +93,7 @@ requests.get("https://api.telegram.org/bot<token>/getMe", proxies={"https": prox
 | `MTPROTO_PENDING_MAX` | `256` | Лимит сокетов в фазе MTProto-handshake (slowloris-защита) |
 | `MTPROTO_IDLE_TIMEOUT_MS` | = `IDLE_TIMEOUT_MS` | Отдельный idle-таймаут MTProto-релея; ставьте больше общего при DPI-окнах провайдера |
 | `MTPROTO_HANDSHAKE_TIMEOUT_MS` | `10000` | Таймаут незавершённого MTProto-handshake (переопределение для тестов) |
+| `MTPROTO_HEARTBEAT_MS` | `60000` | Период liveness-лога `[proxy][heartbeat]` (`uptime_s`/`active`/`pending`/`total`); `0` = выключен |
 | `MTPROTO_METRICS_PORT` | `0` | Side-port для Prometheus `/metrics`; `0` = выключен |
 | `MTPROTO_METRICS_HOST` | `0.0.0.0` | Хост, на котором слушает `/metrics`-сервер |
 | `MTPROTO_USER_MAX_CONNS` | — | JSON-карта `{user: N}` — лимит одновременных MTProto-соединений на пользователя |
@@ -230,13 +231,26 @@ curl http://<host>:9091/metrics
 # в prometheus.yml: scrape http://<host>:9091/metrics
 ```
 
+**Heartbeat** (`MTPROTO_HEARTBEAT_MS`, дефолт 60000, 0 = выкл): раз в минуту строка
+`[proxy][heartbeat] DF-HEARTBEAT mtproto {"uptime_s":N,"active":A,"pending":P,"total":T}`.
+Журнал Wispbyte переигрывает stdout без таймстампов, поэтому heartbeat — единственный способ
+увидеть по нему рестарт процесса (`uptime_s` сбросился), тихий простой (нет строк) и давление
+пула (`active` подбирается к `MTPROTO_MAX_CONNECTIONS`). Интервал задаётся при старте →
+смена `MTPROTO_HEARTBEAT_MS` через SIGUSR2 помечается `restart_needed`.
+
+**Лимит соединений** (`MTPROTO_MAX_CONNECTIONS`, дефолт **256**): один клиент Telegram держит
+~8–10 сокетов, поэтому старый дефолт 64 позволял шторму переподключений (или нескольким
+пользователям) забить пул и заблокировать всех (`[proxy][mtproto_cap]`). Дефолт согласован с
+`MTPROTO_PENDING_MAX`. Память на relay незначительна — при сомнениях поднимайте, а не снижайте.
+
 **Hot-reload конфига (SIGUSR2)**: `kill -USR2 <pid>` перечитывает env и сливает новый конфиг
 в live-объект in-place. Обработчики читают `cfg.*` на каждом соединении, поэтому **ротация
 секретов, смена mask-host/TLS-domain/caps/doppelganger применяются без рестарта**. Tenant-таблица
 (`MTPROTO_SECRET`/`MTPROTO_USER_*`) и blocklist тоже меняются на лету — счётчики пользователей
 сохраняются (`[proxy][reload] swapped=...`, поле `generation` растёт с каждым reload).
 Подсистемы с boot-time state (replay guard, profile manager, metrics-сервер, слушающий порт,
-включение/выключение MTProto целиком) помечаются как `restart_needed` в логе `[proxy][reload]`.
+интервал heartbeat, включение/выключение MTProto целиком) помечаются как `restart_needed`
+в логе `[proxy][reload]`.
 На Windows `SIGUSR2` не доставляется — используйте рестарт через панель. При ошибке валидации env
 логируется `[proxy][reload_fail]` и старый
 конфиг сохраняется.

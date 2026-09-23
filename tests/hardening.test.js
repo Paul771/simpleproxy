@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.4.0
+// VERSION: 1.5.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -13,7 +13,9 @@
 //            A-1 mtprotoIdleTimeoutMs override, A-2 mtprotoHandshakeTimeoutMs +
 //          mtproto_handshake_timeout marker + simpleproxy_handshake_timeouts_total;
 //          A-4 client abort during the DC connect window must not start a relay (no active-slot
-//          leak, no spurious dc_fallback/upstream_error) — injectable connectImpl
+//          leak, no spurious dc_fallback/upstream_error) — injectable connectImpl;
+//          A-5 periodic [proxy][heartbeat] liveness line (uptime_s + active/pending/total);
+//          config: MTPROTO_MAX_CONNECTIONS default 256 + MTPROTO_HEARTBEAT_MS parse/disable
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
 //            M-PROXY
 //   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
@@ -22,7 +24,9 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.4.0 - A-4 test: with an injected DC connector, a client that dies while the
+//   LAST_CHANGE: v1.5.0 - A-5 heartbeat test + config test for the raised MTPROTO_MAX_CONNECTIONS
+//               default (256) and MTPROTO_HEARTBEAT_MS (override / 0-disables / invalid)
+//   PREVIOUS: v1.4.0 - A-4 test: with an injected DC connector, a client that dies while the
 //               DC dial is pending must never be handed a relay — asserts no mtproto_connect,
 //               active gauge stays 0, and no spurious dc_fallback/upstream_error
 //   PREVIOUS: v1.3.0 - A-3 test: a valid fake-TLS ClientHello answered with ServerHello, then
@@ -1094,5 +1098,71 @@ test("hardening: a client that dies during the DC connect window is never handed
   } finally {
     server.closeAllConnections?.();
     server.close();
+  }
+});
+
+test("config: MTPROTO_MAX_CONNECTIONS defaults to 256; MTPROTO_HEARTBEAT_MS parses, 0 disables, garbage rejects", () => {
+  const defaults = loadConfig({ MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f" });
+  assert.equal(defaults.mtprotoMaxConnections, 256, "raised default must be 256");
+  assert.equal(defaults.mtprotoHeartbeatMs, 60_000, "heartbeat default must be 60s");
+
+  const custom = loadConfig({
+    MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f",
+    MTPROTO_MAX_CONNECTIONS: "64",
+    MTPROTO_HEARTBEAT_MS: "5000",
+  });
+  assert.equal(custom.mtprotoMaxConnections, 64);
+  assert.equal(custom.mtprotoHeartbeatMs, 5_000);
+
+  const off = loadConfig({ MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f", MTPROTO_HEARTBEAT_MS: "0" });
+  assert.equal(off.mtprotoHeartbeatMs, 0, "0 must disable the heartbeat");
+
+  for (const bad of ["-5", "soon"]) {
+    assert.throws(
+      () => loadConfig({ MTPROTO_SECRET: "25a36e7142e90fa52c2f29e276392a7f", MTPROTO_HEARTBEAT_MS: bad }),
+      /INVALID_ENV/,
+      `MTPROTO_HEARTBEAT_MS="${bad}" must be rejected`
+    );
+  }
+});
+
+test("hardening: periodic [proxy][heartbeat] reports uptime and live counters (A-5)", async () => {
+  const secret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoHeartbeatMs: 40 },
+    createUserStore([]),
+    logCollector,
+    metrics
+  );
+
+  let client = null;
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    client = net.connect(addr.port, "127.0.0.1", () => client.write(handshake));
+
+    // Hold a relay open so the heartbeat has live counters to report.
+    for (let i = 0; i < 200 && metrics.get("simpleproxy_active_mtproto") !== 1; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(metrics.get("simpleproxy_active_mtproto"), 1, "relay must be active before the heartbeat");
+
+    for (let i = 0; i < 200 && !logs.some((l) => l.event === "heartbeat"); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const hb = logs.find((l) => l.event === "heartbeat");
+    assert.ok(hb, "heartbeat marker must be logged");
+    assert.equal(hb.ref, "DF-HEARTBEAT");
+    assert.equal(typeof hb.detail.uptime_s, "number");
+    assert.equal(hb.detail.active, 1, "heartbeat must report the live active count");
+    assert.ok(hb.detail.total >= 1, "heartbeat must report the cumulative connection count");
+  } finally {
+    client?.destroy();
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
   }
 });

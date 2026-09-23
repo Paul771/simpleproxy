@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.4.0
+// VERSION: 1.5.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -15,7 +15,10 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.4.0 - new env MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS
+//   LAST_CHANGE: v1.5.0 - MTPROTO_MAX_CONNECTIONS default 64 -> 256 (a client opens ~8-10
+//                sockets, so 64 let a storm lock everyone out); new MTPROTO_HEARTBEAT_MS
+//                (default 60000, 0 disables) drives the periodic [proxy][heartbeat] line
+//   PREVIOUS: v1.4.0 - new env MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS
 //                (null = inherit shared defaults): MTProto-specific timeouts for ISP
 //                drop-window resilience (wave-A)
 // END_CHANGE_SUMMARY
@@ -78,7 +81,7 @@ function parseExpiry(value) {
 //   PURPOSE: Read env and return validated config
 //   INPUTS: { env: Record<string, string | undefined> - environment (default process.env) }
 //   OUTPUTS: { Config - { port, host, maxTunnels, idleTimeoutMs, authUser, authPass, creds, rules,
-//                          mtprotoSecrets, mtprotoPort, mtprotoMaxConnections, mtprotoHost,
+//                          mtprotoSecrets, mtprotoPort, mtprotoMaxConnections, mtprotoHeartbeatMs, mtprotoHost,
 //                          mtprotoTlsDomain, mtprotoTlsAlpn, mtprotoMaskHost, mtprotoMaskPort,
 //                          mtprotoMaskRelayMaxBytes,
 //                          mtprotoUnknownSniAction, mtprotoReplayWindow, mtprotoReplayTtlMs,
@@ -140,11 +143,18 @@ export function loadConfig(env = process.env) {
   const mtprotoUsersStrict = parseBoolEnv(env.MTPROTO_USERS_STRICT, false);
 
   const mtprotoPort = parseIntEnv(env.MTPROTO_PORT, 0, "MTPROTO_PORT");
+  // Concurrent-relay cap. Default raised 64 -> 256: a Telegram client opens ~8-10 sockets, so a
+  // handful of tenants (or one reconnect storm) can fill 64 and then everyone gets mtproto_cap.
+  // Memory per relay is tiny, and this now matches MTPROTO_PENDING_MAX.
   const mtprotoMaxConnections = parseIntEnv(
     env.MTPROTO_MAX_CONNECTIONS,
-    64,
+    256,
     "MTPROTO_MAX_CONNECTIONS"
   );
+  // Heartbeat: periodic [proxy][heartbeat] liveness line (uptime + active/pending/total). The
+  // panel journal only ever replays buffered stdout and carries no timestamps, so this is how a
+  // redeploy/restart, an idle gap, or pool pressure becomes visible. 0 disables.
+  const mtprotoHeartbeatMs = parsePortEnv(env.MTPROTO_HEARTBEAT_MS, 60_000, "MTPROTO_HEARTBEAT_MS");
   // Slowloris guard: cap sockets still in the MTProto handshake phase (before relay).
   const mtprotoPendingMax = parseIntEnv(
     env.MTPROTO_PENDING_MAX,
@@ -272,6 +282,7 @@ export function loadConfig(env = process.env) {
     mtprotoUsersStrict,
     mtprotoPort,
     mtprotoMaxConnections,
+    mtprotoHeartbeatMs,
     mtprotoPendingMax,
     mtprotoIdleTimeoutMs,
     mtprotoHandshakeTimeoutMs,
