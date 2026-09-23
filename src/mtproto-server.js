@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.7.0
+// VERSION: 1.8.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
@@ -14,7 +14,15 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.7.0 - IPv4 DC resilience: detectIpv6Availability() is passed to resolveDc so an
+//   LAST_CHANGE: v1.8.0 - client-abort guard during the DC connect window: a client that dies while
+//                a DC connect is in flight now aborts that connect and is never handed a relay.
+//                Pre-fix, startRelay() ran on the destroyed socket, leaking an active-connection
+//                slot (reaped only by the idle timeout -> mtproto_cap exhaustion under a client
+//                reconnect storm) and a failed candidate produced a spurious
+//                mtproto_dc_fallback/retry + mtproto_upstream_error for a peer that was gone.
+//                Mirrors M-MASK v1.0.1 (client_close aborts the pending splice). connectImpl is
+//                injectable so the race is asserted deterministically.
+//   PREVIOUS: v1.7.0 - IPv4 DC resilience: detectIpv6Availability() is passed to resolveDc so an
 //                IPv4-only host never wastes a fallback on a guaranteed-ENETUNREACH IPv6 candidate;
 //                and after the candidate list is exhausted the preferred candidate is retried once
 //                (mtproto_dc_retry, 150ms delay, 3s timeout) before dropping the client.
@@ -100,12 +108,13 @@ function detectIpv6Availability() {
 //             profileManager?: { get(): Profile | null } | null - TLS profile capture & replay,
 //             metrics?: { inc(name, n?): void, set(name, v): void } | null - Prometheus registry,
 //             userStore?: { resolve(hex): User|null, admit(user): boolean, release(user): void,
-//                           addBytes(user, n): boolean } | null - per-user limits }
+//                           addBytes(user, n): boolean } | null - per-user limits,
+//             connectImpl?: (opts: {host,port}) => net.Socket - DC connector (injectable for tests) }
 //   OUTPUTS: { (socket, head) => void }
 //   SIDE_EFFECTS: none
 //   LINKS: M-MTPROTO, M-TLS-PROFILE, M-USER-STORE
 // END_CONTRACT: createMtprotoHandler
-export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidates, replayGuard = null, maskImpl = maskConnection, profileManager = null, metrics = null, userStore = null) {
+export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidates, replayGuard = null, maskImpl = maskConnection, profileManager = null, metrics = null, userStore = null, connectImpl = net.connect) {
   let activeConnections = 0;
   let pendingHandshakes = 0; // sockets in handshake phase, before relay is established
 
@@ -231,6 +240,12 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       let retriedPreferred = false;
       let relayDc = null;
       let relayUpstream = null;
+      // In-flight DC connect during the candidate walk. A client that aborts while the connect is
+      // pending must tear this down: otherwise startRelay() would run on a dead socket and hold an
+      // active-connection slot until the idle timeout (mtproto_cap exhaustion under a reconnect
+      // storm), and a failed candidate would trigger a pointless fallback/retry for a gone peer.
+      // Mirrors M-MASK v1.0.1, where a client_close aborts the pending mask splice.
+      let connecting = null;
 
       const startRelay = (dc, upstream) => {
         relayDc = dc;
@@ -408,7 +423,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       const tryConnect = (timeoutMs = UPSTREAM_CONNECT_TIMEOUT_MS) => {
         if (socket.destroyed) return; // client gone during the retry delay: nothing to serve
         const dc = candidates[attempt];
-        const upstream = net.connect({ host: dc.host, port: dc.port });
+        const upstream = connectImpl({ host: dc.host, port: dc.port });
+        connecting = upstream;
         upstream.setTimeout(timeoutMs, () => {
           upstream.destroy(new Error("upstream connect timeout"));
         });
@@ -416,12 +432,27 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
 
         upstream.once("connect", () => {
           connected = true;
+          if (connecting === upstream) connecting = null;
           upstream.setTimeout(0);
+          // Client vanished during the connect window (abort / reconnect storm): a relay on a
+          // destroyed socket would leak an active slot + an idle DC socket. Skip it entirely.
+          if (socket.destroyed) {
+            releasePending();
+            upstream.destroy();
+            return;
+          }
           startRelay(dc, upstream);
         });
 
         upstream.once("error", (err) => {
           if (connected) return; // post-connect error: startRelay's teardown handles it
+          if (connecting === upstream) connecting = null;
+          // Client gone: never chase fallback/retry for a peer that no longer exists — that would
+          // walk and log the candidate list (dc_fallback / upstream_error) for a dead client.
+          if (socket.destroyed) {
+            releasePending();
+            return;
+          }
           // TCP connect failure on this candidate — try the next one (the failed candidate never
           // received the upstream handshake, so reuse across attempts is safe).
           if (phase === "primary") {
@@ -456,7 +487,20 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         });
       };
       tryConnect();
-      socket.once("error", () => relayUpstream && relayUpstream.destroy());
+      // Abort an in-flight DC connect when the client dies during the connect window. The error
+      // path is handled explicitly because a socket error does not always reach the relay's
+      // teardown (relayUpstream stays null while a candidate is still connecting).
+      const abortConnecting = () => {
+        if (connecting) {
+          connecting.destroy();
+          connecting = null;
+        }
+      };
+      socket.once("close", abortConnecting);
+      socket.once("error", () => {
+        abortConnecting();
+        if (relayUpstream) relayUpstream.destroy();
+      });
       // END_BLOCK_MT_RELAY
     };
 

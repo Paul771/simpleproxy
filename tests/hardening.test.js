@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.3.0
+// VERSION: 1.4.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -10,8 +10,10 @@
 //          (handshake_overflow), B3 mask relay byte cap, MTPROTO_MASK_RELAY_MAX_BYTES config;
 //          W2-2 mtproto_quota_exceeded teardown, W2-3 MTPROTO_USERS_STRICT deny-unknown,
 //          W2-4 connect_header_timeout on stalled partial CONNECT headers;
-//          A-1 mtprotoIdleTimeoutMs override, A-2 mtprotoHandshakeTimeoutMs +
-//          mtproto_handshake_timeout marker + simpleproxy_handshake_timeouts_total
+//            A-1 mtprotoIdleTimeoutMs override, A-2 mtprotoHandshakeTimeoutMs +
+//          mtproto_handshake_timeout marker + simpleproxy_handshake_timeouts_total;
+//          A-4 client abort during the DC connect window must not start a relay (no active-slot
+//          leak, no spurious dc_fallback/upstream_error) — injectable connectImpl
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
 //            M-PROXY
 //   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
@@ -20,7 +22,10 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.3.0 - A-3 test: a valid fake-TLS ClientHello answered with ServerHello, then
+//   LAST_CHANGE: v1.4.0 - A-4 test: with an injected DC connector, a client that dies while the
+//               DC dial is pending must never be handed a relay — asserts no mtproto_connect,
+//               active gauge stays 0, and no spurious dc_fallback/upstream_error
+//   PREVIOUS: v1.3.0 - A-3 test: a valid fake-TLS ClientHello answered with ServerHello, then
 //               silent, logs mtproto_handshake_timeout with phase="tls-app" and bumps
 //               simpleproxy_faketls_post_hello_timeouts_total (subset of the total)
 //   PREVIOUS: v1.2.0 - wave-A tests added: config parsing of MTPROTO_IDLE_TIMEOUT_MS /
@@ -559,10 +564,12 @@ test("hardening: per-user byte quota tears the relay down mid-stream (mtproto_qu
 
   try {
     // One blast of 4 KiB crosses the 1 KiB quota during relay setup -> immediate teardown.
+    // Keep the socket OPEN (write, not end): a client that is already gone at DC-connect time is
+    // now never handed a relay (A-4), so ending here would race the quota charge against the close.
     const { handshake } = buildClientHandshake(aliceSecret, PROTO_TAG_ABRIDGED, 1);
     const closed = await new Promise((resolve) => {
       const socket = net.connect(addr.port, "127.0.0.1", () => {
-        socket.end(Buffer.concat([handshake, randomBytes(4 * 1024)]));
+        socket.write(Buffer.concat([handshake, randomBytes(4 * 1024)]));
       });
       socket.once("close", () => resolve(true));
       socket.once("error", () => resolve(true));
@@ -1003,5 +1010,89 @@ test("hardening: MTPROTO_IDLE_TIMEOUT_MS override reaps a stalled relay per its 
     fakeDc.closeAllConnections?.();
     server.close();
     fakeDc.close();
+  }
+});
+
+test("hardening: a client that dies during the DC connect window is never handed a relay (A-4)", async () => {
+  const secret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+
+  // Injectable DC connector: hands back an unconnected Socket whose 'connect' the test fires
+  // manually, so the "client aborts while the DC dial is in flight" race is fully deterministic.
+  let pending = null;
+  const connectImpl = () => {
+    pending = new net.Socket();
+    return pending;
+  };
+
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 120_000,
+    rules: [],
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoPendingMax: 256,
+  };
+  const handler = createMtprotoHandler(
+    cfg,
+    logCollector,
+    () => [{ host: "127.0.0.1", port: 443 }],
+    null,
+    null,
+    null,
+    metrics,
+    null,
+    connectImpl
+  );
+  const server = createMuxServer({ "http-connect": () => {}, "http-other": () => {}, mtproto: handler });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const client = net.connect(server.address().port, "127.0.0.1", () => client.write(handshake));
+
+    // Wait until the proxy has dialed the DC (connectImpl invoked) with the handshake slot held.
+    for (let i = 0; i < 200 && (!pending || metrics.get("simpleproxy_pending_mtproto") !== 1); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.ok(pending, "proxy must dial the DC during the handshake");
+    assert.equal(metrics.get("simpleproxy_pending_mtproto"), 1, "handshake slot must be held while dialing");
+
+    // Kill the client while the DC dial is still pending; wait until the proxy has observed it
+    // (pending slot released on client close). Only then let the DC "connect".
+    client.destroy();
+    await awaitClose(client);
+    for (let i = 0; i < 200 && metrics.get("simpleproxy_pending_mtproto") !== 0; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(
+      metrics.get("simpleproxy_pending_mtproto"),
+      0,
+      "client close must release the handshake slot"
+    );
+
+    pending.emit("connect");
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(
+      logs.some((l) => l.event === "mtproto_connect"),
+      false,
+      "a relay must not start for a client that is already gone"
+    );
+    assert.equal(
+      metrics.get("simpleproxy_active_mtproto"),
+      0,
+      "no active-connection slot may be leaked for a gone client"
+    );
+    assert.equal(logs.some((l) => l.event === "mtproto_dc_fallback"), false, "no spurious fallback");
+    assert.equal(logs.some((l) => l.event === "mtproto_upstream_error"), false, "no spurious upstream error");
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
   }
 });

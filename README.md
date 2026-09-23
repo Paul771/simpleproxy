@@ -327,7 +327,7 @@ Hot-reload (`SIGUSR2`) подхватывает изменения tenant-таб
 следующего (лог `[proxy][mtproto_dc_fallback]`); все исчерпаны → `[proxy][mtproto_upstream_error]`.
 DC-таблицы (IPv4/IPv6) сверены с эталонным `mtprotoproxy.py`.
 
-Две поправки для устойчивости:
+Три поправки для устойчивости:
 - **IPv6 только если он реально есть** — при старте определяется наличие routable IPv6
   (non-internal, non-link-local); на IPv4-only хосте IPv6-кандидат не добавляется, иначе
   транзиентный сбой IPv4 «обрабатывался» бы заведомым `ENETUNREACH`-тупиком.
@@ -335,6 +335,11 @@ DC-таблицы (IPv4/IPv6) сверены с эталонным `mtprotoproxy
   кандидат (лог `[proxy][mtproto_dc_retry]`, задержка 150 мс, таймаут 3 с); неудачные кандидаты не
   получали upstream-handshake, поэтому повтор безопасен. Спасает от транзиентных сбоев без полного
   TLS+obfs переподключения клиента.
+- **Abort в окне DC-connect** — если клиент умирает, пока идёт dial к DC, незавершённый connect
+  прерывается и relay не стартует: иначе сокет на мёртвом клиенте держал бы active-слот до
+  idle-timeout (риск упереться в `MTPROTO_MAX_CONNECTIONS` при reconnect-storm), а сбойный кандидат
+  порождал бы ложные `[proxy][mtproto_dc_fallback]`/`[proxy][mtproto_upstream_error]` для уже
+  ушедшего клиента.
 
 **Client-IP blocklist** (`MTPROTO_BLOCKLIST`) — отсечение сканеров на edge: подключение с IP,
 попавшего в список (CIDR или голый IP, IPv4/IPv6, IPv4-mapped `::ffff:` нормализуется),

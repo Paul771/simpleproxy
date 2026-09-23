@@ -314,6 +314,7 @@
         <scenario-9 kind="success" wave="A">A-2 handshake timeout: cfg.mtprotoHandshakeTimeoutMs=80, клиент шлёт 16 мусорных байт (&gt;PEEK_LEN, &lt;HANDSHAKE_LEN) и молчит → reap по override + [proxy][mtproto_handshake_timeout] + simpleproxy_handshake_timeouts_total=1.</scenario-9>
         <scenario-11 kind="success" wave="E">A-3 post-ServerHello silence: валидный fake-TLS ClientHello (без app-data) → прокси отвечает ServerHello, клиент молчит → лог mtproto_handshake_timeout с phase="tls-app", bytes=0; simpleproxy_handshake_timeouts_total=1 и simpleproxy_faketls_post_hello_timeouts_total=1 (подмножество).</scenario-11>
         <scenario-10 kind="success" wave="A">A-1 idle override: relay установлен (handshake без FIN), клиент замолкает; cfg.mtprotoIdleTimeoutMs=150 при idleTimeoutMs=120000 → закрытие по mtproto_idle_timeout за ~150мс, не по общему таймауту.</scenario-10>
+        <scenario-12 kind="success" wave="A">A-4 abort в окне DC-connect: injectable connectImpl отдаёт unconnected Socket; клиент умирает пока dial pending (gauge simpleproxy_pending_mtproto → 0 по close), затем эмулируется 'connect' → relay НЕ стартует: нет [proxy][mtproto_connect], active gauge=0, нет mtproto_dc_fallback/upstream_error (нет утечки active-слота в mtproto_cap).</scenario-12>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_pending_cap][DF-4]</marker-1>
