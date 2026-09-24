@@ -303,7 +303,10 @@ MTPROTO_DOPPELGANGER=1            # опционально: тайминги fli
 
 Мониторинг окон с серверной стороны: массовый рост `simpleproxy_handshake_timeouts_total`
 и логов `[proxy][mtproto_handshake_timeout]` = закрытое окно (полёты клиентов режутся до
-нас); одиночные — обычные сканеры. Карта окон с клиента:
+нас); одиночные — обычные сканеры. В фазе `tls-hello` строка таймаута дополнительно несёт
+`recordLen`/`hsLen`: `bytes` меньше `9 + hsLen` — клиент не дописал hello (режется сеть),
+`bytes` больше `9 + hsLen`, но меньше `5 + recordLen` — клиент завысил длину TLS-записи
+(такие обслуживаются: граница берётся по длине handshake-сообщения). Карта окон с клиента:
 
 ```powershell
 while ($true) { $r = node scripts/live-smoke.mjs <host:port> --secret <dd-hex> 2>&1 |
@@ -396,7 +399,7 @@ src/tunnel.js          — M-TUNNEL: байтовый туннель, idle-та�
 src/proxy.js           — M-PROXY: парсер CONNECT, auth→allow→cap→tunnel, metrics counters
 src/mux.js             — M-MUX: определение протокола по первым байтам, маршрутизация
 src/mtproto.js         — M-MTPROTO: obfuscated2 handshake (parse/build), DC mapping (IPv4+IPv6)
-src/faketls.js         — M-FAKETLS: fake-TLS (ee) handshake, ServerHello+ALPN, SNI-парсинг, TLS alert
+src/faketls.js         — M-FAKETLS: fake-TLS (ee) handshake, ServerHello+ALPN, SNI-парсинг, TLS alert, граница ClientHello
 src/mtproto-server.js  — MTProto-обработчик: plain + fake-TLS → DC → relay; routeUnknown (mask/reject/drop) + replay + metrics + per-user
 src/mask.js            — M-MASK: traffic-masking (TCP-splice к mask_host)
 src/replay-guard.js    — M-REPLAY: LRU+TTL replay-защита по digest

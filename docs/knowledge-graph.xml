@@ -93,7 +93,7 @@
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (IPv4↔IPv6 fallback с учётом наличия IPv6 у хоста + одна retry-попытка preferred-кандидата) → relay (FAST_MODE) с backpressure (pause/resume на drain) и буферизацией хвоста при async DC-connect; doppelganger-тайминги, pending-handshake cap, metrics, per-user limits; abort клиента в окне async DC-connect прерывает незавершённый connect и relay не стартует (нет утечки active-слота до idle-timeout и ложных dc_fallback/retry/upstream_error); периодический [proxy][heartbeat] (uptime_s + active/pending/total) делает рестарты, простои и давление пула видимыми; [proxy][doppelganger] коалесцируется (один лог на интервал + счётчик suppressed), чтобы не забивать журнал/панель; mtproto_close/idle_timeout логируют dc/client/tls для атрибуции соединений</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (IPv4↔IPv6 fallback с учётом наличия IPv6 у хоста + одна retry-попытка preferred-кандидата) → relay (FAST_MODE) с backpressure (pause/resume на drain) и буферизацией хвоста при async DC-connect; граница fake-TLS ClientHello определяется resolveClientHelloEnd (длина handshake-сообщения, затем record-framing как фолбэк), поэтому клиент с завышенной длиной TLS-записи обслуживается, а не виснет до таймаута; doppelganger-тайминги, pending-handshake cap, metrics, per-user limits; abort клиента в окне async DC-connect прерывает незавершённый connect и relay не стартует (нет утечки active-слота до idle-timeout и ложных dc_fallback/retry/upstream_error); периодический [proxy][heartbeat] (uptime_s + active/pending/total) делает рестарты, простои и давление пула видимыми; [proxy][doppelganger] коалесцируется (один лог на интервал + счётчик suppressed), чтобы не забивать журнал/панель; mtproto_close/idle_timeout логируют dc/client/tls для атрибуции соединений, mtproto_handshake_timeout в фазе tls-hello дополнительно несёт recordLen/hsLen</purpose>
       <path>src/mtproto-server.js</path>
       <depends>M-MTPROTO, M-FAKETLS, M-LOG, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
@@ -103,7 +103,7 @@
     </M-MTPROTO-SERVER>
 
     <M-FAKETLS NAME="FakeTLS" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN (mirror профиля: при alpnKnown=true и отсутствии ALPN у origin — расширение опускается), TLS-record framing, SNI-парсинг, TLS-alert</purpose>
+      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN (mirror профиля: при alpnKnown=true и отсутствии ALPN у origin — расширение опускается), TLS-record framing, SNI-парсинг, TLS-alert, resolveClientHelloEnd (граница ClientHello по длине handshake-сообщения — длина TLS-записи не авторитетна и может завышаться клиентом)</purpose>
       <path>src/faketls.js</path>
       <depends>node:crypto</depends>
       <verification-ref>V-M-FAKETLS</verification-ref>
@@ -115,6 +115,7 @@
         <fn-extractSni PURPOSE="Распарсить SNI hostname из ClientHello (null если нет)" />
         <fn-buildTlsAlert PURPOSE="Построить fatal TLS alert (reject_handshake)" />
         <fn-buildAlpnExtension PURPOSE="Построить ALPN-расширение для ServerHello" />
+        <fn-resolveClientHelloEnd PURPOSE="Определить конец ClientHello (0 = ждать ещё байты): длина handshake-сообщения приоритетнее завышенной длины TLS-записи" />
       </annotations>
     </M-FAKETLS>
 

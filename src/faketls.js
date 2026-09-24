@@ -1,5 +1,5 @@
 // FILE: src/faketls.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
 //   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers
@@ -18,10 +18,21 @@
 //   extractSni - parse the SNI hostname from a TLS ClientHello (null if absent)
 //   buildTlsAlert - build a TLS alert record (used for reject_handshake mode)
 //   splitTlsRecords - split a byte stream into individual TLS records (doppelganger timing replay)
+//   resolveClientHelloEnd - resolve where the ClientHello ends (0 = need more bytes), trusting the
+//                           handshake-message length over an overstated TLS record length
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.0 - ALPN fidelity under a captured profile: when the profile's ServerHello
+//   LAST_CHANGE: v1.3.0 - resolveClientHelloEnd: the ClientHello extent now comes from the
+//                handshake message's own 3-byte length (offset 6) and no longer requires the TLS
+//                record length to be satisfiable. Prod 14:43: a client sent the same 1298 bytes on
+//                every attempt and sat in phase="tls-hello" until the handshake timeout, because
+//                the server waited for a record length the client never delivered — no validation,
+//                no ServerHello, endless retries. validateClientHello correspondingly stops
+//                treating an overstated record length as a structural failure (it is only a >=512
+//                shape gate now); a truncated message still fails the HMAC. An incomplete message
+//                still returns 0, so a genuinely fragmented hello keeps waiting.
+//   PREVIOUS: v1.2.0 - ALPN fidelity under a captured profile: when the profile's ServerHello
 //                was parsed and negotiated NO ALPN (profile.alpnKnown === true, alpn === null),
 //                buildServerHello now OMITS the ALPN extension instead of injecting the
 //                configured h2. Mirrors the fronted origin (rutube.ru negotiates no ALPN), so the
@@ -48,6 +59,8 @@ const TLS_VERS = Buffer.from([0x03, 0x03]);
 const TLS_CIPHERSUITE = Buffer.from([0x13, 0x01]); // TLS_AES_128_GCM_SHA256
 const TLS_CHANGE_CIPHER = Buffer.from([0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
 const TLS_APP_HDR = Buffer.from([0x17, 0x03, 0x03]);
+// Real Telegram ClientHellos always exceed 512 bytes; anything smaller is not a client hello.
+const CLIENT_HELLO_MIN_RECORD = 512;
 
 function hmacSha256(key, msg) {
   return createHmac("sha256", key).update(msg).digest();
@@ -82,19 +95,24 @@ export function genX25519PublicKey() {
 
 // START_CONTRACT: validateClientHello
 //   PURPOSE: Validate a fake-TLS ClientHello against configured secrets via HMAC
-//   INPUTS: { handshake: Buffer - full ClientHello from 0x16 onward, secrets: Buffer[] }
+//   INPUTS: { handshake: Buffer - ClientHello from 0x16 onward, framed by resolveClientHelloEnd
+//             (the TLS record length is a >=512 shape gate only, never a completeness check),
+//             secrets: Buffer[] }
 //   OUTPUTS: { { secret, sessionId, digest, digestPrefix, ciphers: Buffer[] } | null -
 //              ciphers = suites offered by the client (for profile-replay eligibility) }
 //   SIDE_EFFECTS: none
-//   LINKS: M-FAKETLS
+//   LINKS: M-FAKETLS, fn-resolveClientHelloEnd
 // END_CONTRACT: validateClientHello
 export function validateClientHello(handshake, secrets) {
   // START_BLOCK_VALIDATE
   if (handshake.length < SESSION_ID_POS + 1) return null;
   if (handshake[0] !== 0x16 || handshake[1] !== 0x03 || handshake[2] !== 0x01) return null;
   const recordLen = handshake.readUInt16BE(3);
-  if (recordLen < 512) return null;
-  if (handshake.length < 5 + recordLen) return null;
+  if (recordLen < CLIENT_HELLO_MIN_RECORD) return null;
+  // The record length is only a shape gate here, never a completeness requirement: the caller
+  // hands over the ClientHello exactly as resolved by resolveClientHelloEnd (which may trust the
+  // handshake-message length when the record length overstates the bytes received). Every field
+  // read below is bounds-checked, and a truncated message simply fails the HMAC.
   if (handshake[5] !== 0x01) return null; // ClientHello handshake type
 
   const digest = handshake.subarray(DIGEST_POS, DIGEST_POS + DIGEST_LEN);
@@ -140,6 +158,32 @@ export function validateClientHello(handshake, secrets) {
   }
   return null;
   // END_BLOCK_VALIDATE
+}
+
+// START_CONTRACT: resolveClientHelloEnd
+//   PURPOSE: Resolve the offset at which a fake-TLS ClientHello ends inside the received buffer
+//   INPUTS: { buf: Buffer - bytes received from the client, starting at 0x16 0x03 0x01 }
+//   OUTPUTS: { number - end offset of the ClientHello, or 0 when more bytes are needed }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, M-MTPROTO-SERVER
+// END_CONTRACT: resolveClientHelloEnd
+export function resolveClientHelloEnd(buf) {
+  // START_BLOCK_CLIENT_HELLO_EXTENT
+  if (buf.length < 5) return 0;
+  if (buf[0] !== 0x16 || buf[1] !== 0x03 || buf[2] !== 0x01) return 0;
+  const recordEnd = 5 + buf.readUInt16BE(3);
+  // Without a parsable ClientHello handshake header the record framing is all there is.
+  if (buf.length < 9 || buf[5] !== 0x01) return buf.length >= recordEnd ? recordEnd : 0;
+  // The ClientHello handshake message carries its own 3-byte length at offset 6, and that is the
+  // extent the HMAC covers. It is authoritative over the TLS record length, which fake-TLS
+  // clients do not always fill exactly: a client that declared 64 bytes more than it wrote would
+  // otherwise stall in phase="tls-hello" until the handshake timeout, never receiving a
+  // ServerHello. An incomplete message still returns 0, so a genuinely fragmented hello keeps
+  // waiting instead of being answered from partial bytes.
+  const messageEnd = 9 + buf.readUIntBE(6, 3);
+  if (messageEnd < 5 + CLIENT_HELLO_MIN_RECORD) return buf.length >= recordEnd ? recordEnd : 0;
+  return buf.length >= messageEnd ? messageEnd : 0;
+  // END_BLOCK_CLIENT_HELLO_EXTENT
 }
 
 // START_CONTRACT: buildServerHello

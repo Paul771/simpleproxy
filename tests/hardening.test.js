@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.6.0
+// VERSION: 1.7.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -26,7 +26,11 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.0 - A-6 doppelganger coalescing test + config MTPROTO_DOPPELGANGER_LOG_MS
+//   LAST_CHANGE: v1.7.0 - A-7/A-8: a fake-TLS ClientHello whose TLS record length overstates the
+//               message is still served end-to-end (echo + mtproto_connect tls=1, no handshake
+//               timeout), and a genuinely truncated hello still waits and logs the declared
+//               recordLen/hsLen in mtproto_handshake_timeout (phase=tls-hello)
+//   PREVIOUS: v1.6.0 - A-6 doppelganger coalescing test + config MTPROTO_DOPPELGANGER_LOG_MS
 //   PREVIOUS: v1.5.0 - A-5 heartbeat test + config test for the raised MTPROTO_MAX_CONNECTIONS
 //               default (256) and MTPROTO_HEARTBEAT_MS (override / 0-disables / invalid)
 //   PREVIOUS: v1.4.0 - A-4 test: with an injected DC connector, a client that dies while the
@@ -64,7 +68,7 @@ import { makeLog } from "../src/log.js";
 import { createMetrics } from "../src/metrics.js";
 import { createAesCtr } from "../src/mtproto.js";
 import { loadConfig } from "../src/config.js";
-import { wrapTlsRecord } from "../src/faketls.js";
+import { wrapTlsRecord, createTlsRecordReader } from "../src/faketls.js";
 import { maskConnection } from "../src/mask.js";
 import { createUserStore } from "../src/user-store.js";
 import { createConnectHandler } from "../src/proxy.js";
@@ -150,7 +154,11 @@ function hmacSha256(key, msg) {
   return createHmac("sha256", key).update(msg).digest();
 }
 
-function buildFakeTlsClientHello(secret, obfsHandshake) {
+// recordLenPad inflates the TLS record-length field without writing those bytes, so the hello
+// carries a length that overstates the message (the digest signs the inflated buffer, exactly as
+// such a client would sign what it wrote). obfsHandshake is returned to the caller, which wraps
+// it into an app-data record itself.
+function buildFakeTlsClientHello(secret, obfsHandshake, recordLenPad = 0) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
@@ -178,7 +186,7 @@ function buildFakeTlsClientHello(secret, obfsHandshake) {
   hsLenBuf.writeUIntBE(inner.length, 0, 3);
   const handshakeMsg = Buffer.concat([Buffer.from([0x01]), hsLenBuf, inner]);
   const recordLenBuf = Buffer.alloc(2);
-  recordLenBuf.writeUInt16BE(handshakeMsg.length, 0);
+  recordLenBuf.writeUInt16BE(handshakeMsg.length + recordLenPad, 0);
   let hello = Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), recordLenBuf, handshakeMsg]);
 
   const msg = Buffer.concat([
@@ -1261,5 +1269,119 @@ test("hardening: [proxy][doppelganger] is coalesced with a suppressed counter (A
     for (const s of sockets) s.destroy();
     server.closeAllConnections?.();
     server.close();
+  }
+});
+
+// --- ClientHello extent: a record length that overstates the message must not deadlock ---
+
+test("hardening: fake-TLS hello whose record length overstates the message is still served (A-7)", async () => {
+  const secret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  // 5-arg collector: mtproto_connect carries the DC address before its detail object.
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  // Handshake timeout is deliberately short: before the fix this client sat in phase="tls-hello"
+  // for the whole timeout and was dropped without ever receiving a ServerHello (prod, 14:43).
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoHandshakeTimeoutMs: 1_000 },
+    null,
+    logCollector,
+    metrics
+  );
+
+  try {
+    const { handshake, stream, encKey, encIv } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, handshake, 64);
+    const payload = Buffer.from("lying-record-length");
+    const clientDec = createAesCtr(encKey, encIv);
+    const reader = createTlsRecordReader();
+    const appRecords = [];
+
+    const echoed = await new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`no echo, app records=${appRecords.length}`)),
+        5_000
+      );
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(
+          Buffer.concat([hello, wrapTlsRecord(handshake), wrapTlsRecord(stream.encrypt(payload))])
+        );
+      });
+      socket.on("data", (d) => {
+        for (const rec of reader.feed(d)) appRecords.push(rec);
+        // appRecords[0] is the fake certificate; the MTProto stream follows it.
+        const streamBytes = Buffer.concat(appRecords.slice(1));
+        if (streamBytes.length >= payload.length) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(clientDec.decrypt(streamBytes.subarray(0, payload.length)).toString());
+        }
+      });
+      socket.on("error", (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
+
+    assert.equal(echoed, payload.toString(), "the relay must carry the MTProto stream end to end");
+    const connect = logs.find((l) => l.event === "mtproto_connect");
+    assert.ok(connect, "the client must reach the DC (relay started)");
+    assert.equal(connect.detail.tls, 1, "the served connection is fake-TLS");
+    assert.equal(
+      logs.filter((l) => l.event === "mtproto_handshake_timeout").length,
+      0,
+      "no handshake timeout: the hello was answered from the bytes that arrived"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: a stalled ClientHello logs the declared recordLen and hsLen (A-8)", async () => {
+  const secret = randomBytes(16);
+  const metrics = createMetrics();
+  const logs = [];
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoHandshakeTimeoutMs: 150 },
+    null,
+    logCollector,
+    metrics
+  );
+
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, handshake);
+    // A genuinely truncated message: both framings are incomplete, so the parser must keep
+    // waiting (never answer a partial hello) and the marker must explain what it was waiting for.
+    const prefix = hello.subarray(0, 200);
+    const closed = await new Promise((resolve) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(prefix));
+      socket.on("data", () => {});
+      socket.once("close", () => resolve(true));
+      socket.once("error", () => resolve(true));
+      setTimeout(() => resolve(false), 2000);
+    });
+    assert.equal(closed, true, "the stalled hello must be reaped by the handshake timeout");
+
+    const evt = logs.find((l) => l.event === "mtproto_handshake_timeout");
+    assert.ok(evt, "handshake timeout must be logged");
+    assert.equal(evt.detail.phase, "tls-hello");
+    assert.equal(evt.detail.bytes, prefix.length);
+    assert.equal(evt.detail.recordLen, hello.readUInt16BE(3), "the declared record length is logged");
+    assert.equal(evt.detail.hsLen, hello.readUIntBE(6, 3), "the declared message length is logged");
+    assert.equal(
+      logs.filter((l) => l.event === "mtproto_connect").length,
+      0,
+      "an incomplete hello must never be answered or relayed"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
   }
 });

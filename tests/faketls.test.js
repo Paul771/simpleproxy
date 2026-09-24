@@ -1,5 +1,5 @@
 // FILE: tests/faketls.test.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-FAKETLS ClientHello validation, ServerHello build, TLS record framing
 //   SCOPE: HMAC digest round-trip, record reader/writer, wrong-secret rejection
@@ -22,6 +22,7 @@ import {
   buildTlsAlert,
   buildAlpnExtension,
   splitTlsRecords,
+  resolveClientHelloEnd,
 } from "../src/faketls.js";
 
 const DIGEST_POS = 11;
@@ -32,7 +33,10 @@ function hmacSha256(key, msg) {
 }
 
 // Emulate a client building a fake-TLS ClientHello with the HMAC digest.
-function buildClientHello(secret, offeredCiphers = [0x13, 0x01]) {
+// recordLenPad inflates the TLS record-length field WITHOUT writing those bytes: it models a
+// client whose length field overstates the message it actually sends (the digest is computed
+// over the inflated buffer, exactly as such a client would sign what it wrote).
+function buildClientHello(secret, offeredCiphers = [0x13, 0x01], recordLenPad = 0) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
@@ -68,7 +72,7 @@ function buildClientHello(secret, offeredCiphers = [0x13, 0x01]) {
 
   // TLS record header: 0x16 0x03 0x01 + u16(recordLen) + handshakeMsg
   const recordLenBuf = Buffer.alloc(2);
-  recordLenBuf.writeUInt16BE(handshakeMsg.length, 0);
+  recordLenBuf.writeUInt16BE(handshakeMsg.length + recordLenPad, 0);
   let hello = Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), recordLenBuf, handshakeMsg]);
 
   // Compute digest: msg = hello with digest field zeroed; digest = hmac XOR (zeros(28) || ts)
@@ -349,4 +353,42 @@ test("buildServerHello: legacy profile without alpnKnown still falls back to con
   const profile = { cipher: null, alpn: null, ccsCount: 1, appDataSizes: [500], certLen: 500, recordDelays: [] };
   const response = buildServerHello(secret, randomBytes(32), randomBytes(16), "h2", profile);
   assert.ok(response.includes(buildAlpnExtension(["h2"])), "no alpnKnown -> configured ALPN is used");
+});
+
+// --- ClientHello extent: the record-length field is not trusted when it overstates the message ---
+test("resolveClientHelloEnd: returns the record end when the record framing is satisfied", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret);
+  const recordLen = hello.readUInt16BE(3);
+  assert.equal(resolveClientHelloEnd(hello), 5 + recordLen);
+  assert.equal(
+    resolveClientHelloEnd(hello.subarray(0, 5 + recordLen - 1)),
+    0,
+    "a record missing one byte must still wait, not be answered from a truncated hello"
+  );
+});
+
+test("resolveClientHelloEnd: falls back to the handshake-message length when the record length lies", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 64);
+  const recordLen = hello.readUInt16BE(3);
+  const hsLen = hello.readUIntBE(6, 3);
+  assert.ok(9 + hsLen < 5 + recordLen, "fixture must model an overstated record length");
+  // The whole message is present even though the record promises 64 bytes more.
+  assert.equal(resolveClientHelloEnd(hello), 9 + hsLen);
+  assert.equal(
+    resolveClientHelloEnd(hello.subarray(0, 9 + hsLen - 1)),
+    0,
+    "an incomplete message must still wait"
+  );
+});
+
+test("resolveClientHelloEnd: non-ClientHello or too-short buffers need more bytes", () => {
+  assert.equal(resolveClientHelloEnd(Buffer.alloc(4)), 0);
+  assert.equal(resolveClientHelloEnd(Buffer.alloc(64)), 0, "no 0x16 0x03 0x01 start");
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret);
+  const notAHello = Buffer.from(hello);
+  notAHello[5] = 0x02; // ServerHello: the handshake framing cannot be trusted
+  assert.equal(resolveClientHelloEnd(notAHello.subarray(0, 200)), 0);
 });

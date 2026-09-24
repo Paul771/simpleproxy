@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.10.0
+// VERSION: 1.11.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
 //            periodic [proxy][heartbeat] liveness line
@@ -15,7 +15,16 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.10.0 - coalesce the [proxy][doppelganger] line (cfg.mtprotoDoppelgangerLogMs,
+//   LAST_CHANGE: v1.11.0 - the fake-TLS ClientHello extent comes from resolveClientHelloEnd
+//                (handshake-message length) instead of requiring the declared TLS record length
+//                to be satisfiable, with the record framing kept as a second attempt for clients
+//                that sign the padded record. Prod 14:43: a client delivered the same 1298 bytes
+//                on every attempt and stalled in phase="tls-hello" until the timeout — no
+//                validation, no ServerHello, endless reconnects across all ee links. A genuinely
+//                fragmented hello still waits (resolver returns 0), so no partial hello is served.
+//                mtproto_handshake_timeout now also logs recordLen/hsLen in phase=tls-hello, so a
+//                future stall is self-explanatory without packet captures.
+//   PREVIOUS: v1.10.0 - coalesce the [proxy][doppelganger] line (cfg.mtprotoDoppelgangerLogMs,
 //                default 5s, 0 = per-connection): at most one line per interval plus a
 //                `suppressed` count of skipped occurrences. A busy fake-TLS client logged a line
 //                per connection, which flooded the journal and churned the panel's stdout socket.
@@ -64,6 +73,7 @@ import {
   buildTlsAlert,
   extractSni,
   splitTlsRecords,
+  resolveClientHelloEnd,
 } from "./faketls.js";
 import { maskConnection } from "./mask.js";
 
@@ -614,10 +624,24 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           socket.destroy();
           return;
         }
-        if (buf.length < 5 + recordLen) return;
-        const clientHello = buf.subarray(0, 5 + recordLen);
-        buf = buf.subarray(5 + recordLen);
-        const validated = validateClientHello(clientHello, secrets);
+        // The record length may overstate what the client actually wrote (prod: a client sent the
+        // same 1298 bytes on every attempt and stalled in phase="tls-hello" until the timeout).
+        // resolveClientHelloEnd trusts the ClientHello's own handshake-message length in that
+        // case, and returns 0 while the message itself is still incomplete — so a genuinely
+        // fragmented hello keeps waiting instead of being answered from partial bytes.
+        const recordEnd = 5 + recordLen;
+        let helloEnd = resolveClientHelloEnd(buf);
+        if (helloEnd === 0) return;
+        let clientHello = buf.subarray(0, helloEnd);
+        let validated = validateClientHello(clientHello, secrets);
+        if (!validated && helloEnd !== recordEnd && buf.length >= recordEnd) {
+          // Other clients sign the whole TLS record, padding included, so their record length
+          // exceeds the handshake message. Try that framing before treating the hello as foreign.
+          helloEnd = recordEnd;
+          clientHello = buf.subarray(0, helloEnd);
+          validated = validateClientHello(clientHello, secrets);
+        }
+        buf = buf.subarray(helloEnd);
         if (!validated) {
           // Non-keyed client (crawler / wrong secret): mask or reject instead of a bare RST,
           // so port 443 is wire-indistinguishable from a real web server.
@@ -722,10 +746,16 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       // never completed, while "tls-app" (+ bytes 0) = we already answered a valid fake-TLS
       // ClientHello with a ServerHello and the client then went quiet (client abort after
       // ServerHello, or the ISP dropped the follow-up) — counted separately below.
-      log("mtproto_handshake_timeout", "DF-1", socket.remoteAddress, {
-        bytes: buf ? buf.length : 0,
-        phase,
-      });
+      // In "tls-hello" the declared lengths are logged as well: they separate "the client is
+      // still mid-flight" (recordLen/hsLen beyond `bytes`) from "the ClientHello message is
+      // complete but its record length overstates it" (the exact prod stall that resolveClientHelloEnd
+      // now recovers from) without needing packet captures.
+      const detail = { bytes: buf ? buf.length : 0, phase };
+      if (phase === "tls-hello" && detail.bytes >= 5) {
+        detail.recordLen = buf.readUInt16BE(3);
+        if (detail.bytes >= 9 && buf[5] === 0x01) detail.hsLen = buf.readUIntBE(6, 3);
+      }
+      log("mtproto_handshake_timeout", "DF-1", socket.remoteAddress, detail);
       if (metrics) {
         metrics.inc("simpleproxy_handshake_timeouts_total");
         if (phase === "tls-app") metrics.inc("simpleproxy_faketls_post_hello_timeouts_total");
