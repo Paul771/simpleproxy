@@ -1,5 +1,5 @@
 // FILE: src/faketls.js
-// VERSION: 1.3.0
+// VERSION: 1.4.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
 //   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers
@@ -20,10 +20,18 @@
 //   splitTlsRecords - split a byte stream into individual TLS records (doppelganger timing replay)
 //   resolveClientHelloEnd - resolve where the ClientHello ends (0 = need more bytes), trusting the
 //                           handshake-message length over an overstated TLS record length
+//   resolveFakeCertLen - fake-certificate length for the server flight (captured size, capped)
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.3.0 - resolveClientHelloEnd: the ClientHello extent now comes from the
+//   LAST_CHANGE: v1.4.0 - resolveFakeCertLen(profile, cap): the fake certificate length is
+//                resolved once, by the caller, so MTPROTO_FAKE_TLS_CERT_LEN_MAX can shrink the
+//                ServerHello flight to fit a path MTU (a mobile link whose MTU is below the
+//                captured 4091-byte certificate loses the flight tail and the client hangs in
+//                "Connecting"), and the number reported in the journal is exactly what went on
+//                the wire. buildServerHello takes the resolved length; cap 0 keeps the captured
+//                size, so the default behaviour is unchanged.
+//   PREVIOUS: v1.3.0 - resolveClientHelloEnd: the ClientHello extent now comes from the
 //                handshake message's own 3-byte length (offset 6) and no longer requires the TLS
 //                record length to be satisfiable. Prod 14:43: a client sent the same 1298 bytes on
 //                every attempt and sat in phase="tls-hello" until the handshake timeout, because
@@ -186,16 +194,32 @@ export function resolveClientHelloEnd(buf) {
   // END_BLOCK_CLIENT_HELLO_EXTENT
 }
 
+// START_CONTRACT: resolveFakeCertLen
+//   PURPOSE: Resolve the byte length of the fake certificate in the ServerHello flight
+//   INPUTS: { profile: { certLen } | null - captured profile, cap: number - 0/absent = no cap }
+//   OUTPUTS: { number - fake certificate length in bytes }
+//   SIDE_EFFECTS: reads Math.random only when no captured profile supplies certLen
+//   LINKS: M-FAKETLS, M-MTPROTO-SERVER
+// END_CONTRACT: resolveFakeCertLen
+export function resolveFakeCertLen(profile, cap = 0) {
+  const base = profile && profile.certLen ? profile.certLen : 1024 + Math.floor(Math.random() * 3072);
+  // The captured size mirrors the fronted origin, which on a mobile path with a ~1300-byte MTU can
+  // be larger than the whole flight may take; a cap trades that fidelity for reachability.
+  return cap > 0 && base > cap ? cap : base;
+}
+
 // START_CONTRACT: buildServerHello
 //   PURPOSE: Build the fake ServerHello + ChangeCipherSpec + ApplicationData response
 //   INPUTS: { secret: Buffer(16), clientDigest: Buffer(32), sessionId: Buffer, alpn?: string,
 //             profile?: { cipher, alpn, alpnKnown, ccsCount, appDataSizes, certLen } | null,
-//             offeredCiphers?: Buffer[] - suites from validateClientHello (gate profile.cipher) }
+//             offeredCiphers?: Buffer[] - suites from validateClientHello (gate profile.cipher),
+//             certLen?: number - explicit fake-certificate length; 0/omitted = derive via
+//                         resolveFakeCertLen(profile) (callers apply cfg caps themselves) }
 //   OUTPUTS: { Buffer - full response packet }
 //   SIDE_EFFECTS: none
-//   LINKS: M-FAKETLS, M-TLS-PROFILE
+//   LINKS: M-FAKETLS, M-TLS-PROFILE, fn-resolveFakeCertLen
 // END_CONTRACT: buildServerHello
-export function buildServerHello(secret, clientDigest, sessionId, alpn = null, profile = null, offeredCiphers = null) {
+export function buildServerHello(secret, clientDigest, sessionId, alpn = null, profile = null, offeredCiphers = null, certLen = 0) {
   // START_BLOCK_BUILD
   const x25519 = genX25519PublicKey();
   // When a captured profile is available, replay its structure: the observed CCS count and
@@ -254,7 +278,7 @@ export function buildServerHello(secret, clientDigest, sessionId, alpn = null, p
   const ccsCount = profile && profile.ccsCount ? profile.ccsCount : 1;
   for (let i = 0; i < ccsCount; i++) flightParts.push(TLS_CHANGE_CIPHER);
 
-  const fakeCertLen = profile && profile.certLen ? profile.certLen : 1024 + Math.floor(Math.random() * 3072);
+  const fakeCertLen = certLen > 0 ? certLen : resolveFakeCertLen(profile);
   const httpData = randomBytes(fakeCertLen);
   const httpLenBuf = Buffer.alloc(2);
   httpLenBuf.writeUInt16BE(httpData.length, 0);

@@ -1,5 +1,5 @@
 // FILE: src/mtproto.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto proxy obfuscated2 handshake parse/build and DC address mapping (pure logic)
 //   SCOPE: client handshake validation, upstream handshake construction, DC lookup
@@ -14,10 +14,15 @@
 //   buildUpstreamHandshake - construct the 64-byte handshake sent to a Telegram DC
 //   getDcAddress - resolve dc_idx to a Telegram datacenter host:port
 //   createAesCtr - AES-256-CTR stream (encrypt/decrypt with state)
+//   describeProtoTag - name the transport (abridged | intermediate | secure) behind a proto tag
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.0 - getDcAddressCandidates gains hasIpv6: on an IPv4-only host the IPv6
+//   LAST_CHANGE: v1.3.0 - describeProtoTag: names the transport behind the decrypted proto tag.
+//                The simple and dd links share the same key bytes (the dd/ee prefixes are
+//                client-side transport routing), so `tls` alone cannot tell them apart in the
+//                journal; proto can (simple=abridged, dd=secure, ee=any proto with tls:1).
+//   PREVIOUS: v1.2.0 - getDcAddressCandidates gains hasIpv6: on an IPv4-only host the IPv6
 //                candidate is omitted, so a transient IPv4 DC failure is not masked by a
 //                guaranteed ENETUNREACH fallback (prod: mtproto_dc_fallback -> ENETUNREACH).
 // END_CHANGE_SUMMARY
@@ -95,6 +100,20 @@ function sha256(...parts) {
 
 function reverse(buf) {
   return Buffer.from(buf).reverse();
+}
+
+// START_CONTRACT: describeProtoTag
+//   PURPOSE: Name the obfuscated2 transport encoded in a 4-byte proto tag
+//   INPUTS: { protoTag: Buffer - the decrypted handshake's proto tag (4 bytes) }
+//   OUTPUTS: { "abridged" | "intermediate" | "secure" | null - null for an unknown/short tag }
+//   SIDE_EFFECTS: none
+//   LINKS: M-MTPROTO, M-MTPROTO-SERVER
+// END_CONTRACT: describeProtoTag
+export function describeProtoTag(protoTag) {
+  if (PROTO_TAG_ABRIDGED.equals(protoTag)) return "abridged";
+  if (PROTO_TAG_INTERMEDIATE.equals(protoTag)) return "intermediate";
+  if (PROTO_TAG_SECURE.equals(protoTag)) return "secure";
+  return null;
 }
 
 // START_CONTRACT: parseClientHandshake

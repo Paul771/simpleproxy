@@ -1,5 +1,5 @@
 // FILE: tests/faketls.test.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-FAKETLS ClientHello validation, ServerHello build, TLS record framing
 //   SCOPE: HMAC digest round-trip, record reader/writer, wrong-secret rejection
@@ -391,4 +391,39 @@ test("resolveClientHelloEnd: non-ClientHello or too-short buffers need more byte
   const notAHello = Buffer.from(hello);
   notAHello[5] = 0x02; // ServerHello: the handshake framing cannot be trusted
   assert.equal(resolveClientHelloEnd(notAHello.subarray(0, 200)), 0);
+});
+
+// --- certLenCap: keep the server flight under a small path MTU ---
+
+// The fake certificate is the LAST record of the flight (SH, then CCS xN, then one 0x17).
+function fakeCertLen(response) {
+  const records = splitTlsRecords(response);
+  const cert = records[records.length - 1];
+  assert.equal(cert[0], 0x17, "the trailing app-data record is the fake certificate");
+  return cert.readUInt16BE(3);
+}
+
+test("buildServerHello: certLenCap truncates the captured certificate, cap 0 keeps it", () => {
+  const secret = randomBytes(16);
+  const profile = {
+    cipher: null,
+    alpn: null,
+    alpnKnown: true,
+    ccsCount: 1,
+    appDataSizes: [4091],
+    certLen: 4091,
+    recordDelays: [],
+  };
+  const capped = buildServerHello(secret, randomBytes(32), randomBytes(16), null, profile, null, 1200);
+  assert.equal(fakeCertLen(capped), 1200, "cap wins over the captured certLen");
+  const uncapped = buildServerHello(secret, randomBytes(32), randomBytes(16), null, profile, null, 0);
+  assert.equal(fakeCertLen(uncapped), 4091, "cap 0/omitted = replay the captured size");
+});
+
+test("buildServerHello: certLenCap also bounds the random certificate without a profile", () => {
+  const secret = randomBytes(16);
+  for (let i = 0; i < 5; i++) {
+    const response = buildServerHello(secret, randomBytes(32), randomBytes(16), null, null, null, 900);
+    assert.equal(fakeCertLen(response), 900, "the random 1024-4095 certificate must respect the cap");
+  }
 });

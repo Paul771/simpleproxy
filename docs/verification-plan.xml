@@ -44,6 +44,7 @@
         <scenario-6 kind="success" wave="A">MTPROTO_IDLE_TIMEOUT_MS / MTPROTO_HANDSHAKE_TIMEOUT_MS: unset → null (наследование общего таймаута); валидное число парсится; "0"/отрицательное/мусор → throw INVALID_ENV.</scenario-6>
         <scenario-7 kind="success" wave="A">MTPROTO_MAX_CONNECTIONS: дефолт 256; override парсится; MTPROTO_HEARTBEAT_MS: дефолт 60000, override парсится, "0" = heartbeat выключен, отрицательное/мусор → throw INVALID_ENV.</scenario-7>
         <scenario-8 kind="success" wave="A">MTPROTO_DOPPELGANGER_LOG_MS: дефолт 5000; override парсится; "0" = лог на каждое соединение; отрицательное/мусор → throw INVALID_ENV.</scenario-8>
+        <scenario-9 kind="success" wave="A">MTPROTO_FAKE_TLS_CERT_LEN_MAX: дефолт 0 (cap выключен, размер из профиля реплеится как есть); override парсится; "0" = без cap; отрицательное/мусор → throw INVALID_ENV.</scenario-9>
       </scenarios>
       <required-log-markers>
         <marker-1>[config][load][env]</marker-1>
@@ -189,6 +190,7 @@
         <scenario-4 kind="success">E2E (fake-DC): полный handshake клиент→прокси→DC, данные round-trip; неверный secret → закрытие; bad DC → закрытие.</scenario-4>
         <scenario-5 kind="success">Лог [proxy][mtproto_link] с tg://proxy-ссылками при старте (smoke).</scenario-5>
         <scenario-6 kind="success">1 MiB fake-TLS payload round-trips без потерь (SHA-256 целостность) — backpressure + буферизация хвоста при async DC-connect.</scenario-6>
+        <scenario-7 kind="success" wave="A">describeProtoTag: ef/ee/dd → abridged/intermediate/secure; неизвестный или короткий тег → null. Транспорт обязателен в логах connect/close: simple и dd делят одни байты секрета, поэтому по tls их не различить.</scenario-7>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_connect][DF-1]</marker-1>
@@ -221,10 +223,12 @@
         <scenario-8 kind="success" wave="A2">profile.cipher реплеится ТОЛЬКО когда клиент предложил его (validateClientHello извлекает offered ciphers); иначе дефолт 0x1301. Регрессия: безгейтовой реплей 0x1302 рвал dd/simple wrapped-транспорты после ServerHello.</scenario-8>
         <scenario-9 kind="success" wave="E">ALPN fidelity: profile.alpnKnown=true и alpn=null (origin без ALPN, как rutube.ru) → buildServerHello ОПУСКАЕТ ALPN-расширение вопреки configured h2; profile.alpn задан → реплеится он; profile без alpnKnown (legacy/литерал) → fallback на configured ALPN.</scenario-9>
         <scenario-10 kind="success" wave="A">resolveClientHelloEnd: честный record length → конец записи; завышенный record length при полном handshake-сообщении → 9+hsLen (prod 14:43: клиент присылал одни и те же 1298 байт и висел в tls-hello); неполное сообщение / нет ClientHello-заголовка → 0 (ждём остальные байты, partial hello не обслуживается).</scenario-10>
+        <scenario-11 kind="success" wave="A">certLenCap: профиль с certLen=4091 и cap=1200 → фейковый сертификат 1200 байт; cap=0 → 4091 (реплей захвата); без профиля cap=900 → 900 на каждой попытке (random 1024-4095 усекается).</scenario-11>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][faketls_auth_fail][DF-1]</marker-1>
         <marker-2>[proxy][mtproto_connect][DF-1] tls=1</marker-2>
+        <marker-5>[proxy][doppelganger][DF-DOPPELGANGER] ... certLen — фактический размер фейкового сертификата (виден эффект MTPROTO_FAKE_TLS_CERT_LEN_MAX)</marker-5>
         <marker-3>[proxy][faketls_unknown_sni][DF-MASK]</marker-3>
         <marker-4>[proxy][faketls_replay][DF-MASK]</marker-4>
       </required-log-markers>
@@ -322,6 +326,7 @@
         <scenario-14 kind="success" wave="A">A-6 doppelganger coalescing: fake профиль + cfg.mtprotoDoppelgangerLogMs=60000, 4 быстрых fake-TLS hello → ровно 1 лог [proxy][doppelganger] (suppressed=0); затем cfg.mtprotoDoppelgangerLogMs=0 → следующие события логируются, первая строка несёт накопленный suppressed≥3.</scenario-14>
         <scenario-15 kind="success" wave="A">A-7 ClientHello с завышенной длиной TLS-записи: клиент шлёт полный hello (recordLen на 64 байта больше реального) + обфус-рукопожатие + payload → relay поднимается, payload проходит round-trip до fake-DC, лог [proxy][mtproto_connect] tls=1, ни одного mtproto_handshake_timeout.</scenario-15>
         <scenario-16 kind="failure" wave="A">A-8 усечённый ClientHello: клиент отправляет только 200 байт hello и молчит → reap по handshake timeout, лог [proxy][mtproto_handshake_timeout] с phase=tls-hello, bytes=200 и объявленными recordLen/hsLen; relay не поднимается (partial hello не обслуживается).</scenario-16>
+        <scenario-17 kind="success" wave="A">A-9 атрибуция ссылки: два round-trip (secure-транспорт = dd, abridged = simple) → [proxy][mtproto_connect] и [proxy][mtproto_close] несут proto=secure/abridged по порядку и secret="s0" (индекс сработавшего секрета, не значение) при tls=0.</scenario-17>
       </scenarios>
       <required-log-markers>
         <marker-1>[proxy][mtproto_pending_cap][DF-4]</marker-1>
@@ -329,9 +334,9 @@
         <marker-3>[proxy][mtproto_quota_exceeded][DF-USER]</marker-3>
         <marker-4>[proxy][mtproto_user_unknown][DF-4]</marker-4>
         <marker-5>[proxy][mtproto_handshake_timeout][DF-1] ... {bytes, phase} (phase=tls-app ⇒ ServerHello отправлен, клиент замолчал; phase=tls-hello ⇒ дополнительно recordLen/hsLen — «клиент ещё не дописал hello» vs «длина записи завышена, но сообщение целое»)</marker-5>
-        <marker-6 wave="E">[proxy][mtproto_close][DF-2] ... {dc, client, tls, bytes_in, bytes_out, duration_ms} (атрибуция close к клиенту+DC); [proxy][mtproto_idle_timeout][DF-3] ... {dc, client, idle_ms}</marker-6>
+        <marker-6 wave="E">[proxy][mtproto_close][DF-2] ... {dc, client, tls, secret, proto, bytes_in, bytes_out, duration_ms} (атрибуция close к клиенту+DC+ссылке: secret=индекс, proto=abridged|intermediate|secure); [proxy][mtproto_idle_timeout][DF-3] ... {dc, client, idle_ms}</marker-6>
         <marker-7 wave="A">[proxy][heartbeat][DF-HEARTBEAT] mtproto {uptime_s, active, pending, total} — периодический liveness-лог (рестарт/простой/давление пула)</marker-7>
-        <marker-8 wave="A">[proxy][doppelganger][DF-DOPPELGANGER] ... {records, delays, suppressed} — коалесцированный лог (один на интервал MTPROTO_DOPPELGANGER_LOG_MS, suppressed = пропущено с прошлой строки)</marker-8>
+        <marker-8 wave="A">[proxy][doppelganger][DF-DOPPELGANGER] ... {records, delays, certLen, suppressed} — коалесцированный лог (один на интервал MTPROTO_DOPPELGANGER_LOG_MS, suppressed = пропущено с прошлой строки, certLen = фактический размер фейкового сертификата флайта)</marker-8>
       </required-log-markers>
     </V-M-HARDEN>
 

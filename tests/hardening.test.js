@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.7.0
+// VERSION: 1.8.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -26,7 +26,10 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.7.0 - A-7/A-8: a fake-TLS ClientHello whose TLS record length overstates the
+//   LAST_CHANGE: v1.8.0 - A-9: connect/close identify the matched secret by index (s0) and the
+//               transport (abridged for the simple link, secure for dd) — the only way to tell a
+//               stalled dd link from a working simple one in the journal
+//   PREVIOUS: v1.7.0 - A-7/A-8: a fake-TLS ClientHello whose TLS record length overstates the
 //               message is still served end-to-end (echo + mtproto_connect tls=1, no handshake
 //               timeout), and a genuinely truncated hello still waits and logs the declared
 //               recordLen/hsLen in mtproto_handshake_timeout (phase=tls-hello)
@@ -74,6 +77,7 @@ import { createUserStore } from "../src/user-store.js";
 import { createConnectHandler } from "../src/proxy.js";
 
 const PROTO_TAG_ABRIDGED = Buffer.from([0xef, 0xef, 0xef, 0xef]);
+const PROTO_TAG_SECURE = Buffer.from([0xdd, 0xdd, 0xdd, 0xdd]);
 
 function sha256(...parts) {
   const h = createHash("sha256");
@@ -1378,6 +1382,80 @@ test("hardening: a stalled ClientHello logs the declared recordLen and hsLen (A-
       0,
       "an incomplete hello must never be answered or relayed"
     );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: connect/close identify the matched secret and the transport (A-9)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    null,
+    logCollector,
+    null
+  );
+
+  // One round trip per transport: the dd link uses the secure transport, the simple link the
+  // abridged one. Both carry the SAME secret bytes, so proto is the only thing that tells them
+  // apart in a journal.
+  const runOnce = (protoTag, payload) =>
+    new Promise((resolve, reject) => {
+      const { handshake, stream, encKey, encIv } = buildClientHandshake(secret, protoTag, 1);
+      const clientDec = createAesCtr(encKey, encIv);
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(Buffer.concat([handshake, stream.encrypt(payload)]));
+      });
+      let buf = Buffer.alloc(0);
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error("round-trip timeout"));
+      }, 3000);
+      socket.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (buf.length >= payload.length) {
+          clearTimeout(timer);
+          socket.destroy();
+          try {
+            assert.equal(clientDec.decrypt(buf.subarray(0, payload.length)).toString(), payload.toString());
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
+        }
+      });
+      socket.on("error", (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
+
+  try {
+    await runOnce(PROTO_TAG_SECURE, Buffer.from("dd-transport"));
+    await runOnce(PROTO_TAG_ABRIDGED, Buffer.from("simple-transport"));
+    await new Promise((r) => setTimeout(r, 60));
+
+    const connects = logs.filter((l) => l.event === "mtproto_connect");
+    assert.equal(connects.length, 2);
+    assert.deepEqual(
+      connects.map((l) => l.detail.proto),
+      ["secure", "abridged"],
+      "the transport must be visible in the journal"
+    );
+    for (const c of connects) {
+      assert.equal(c.detail.secret, "s0", "the secret is identified by index, never by value");
+      assert.equal(c.detail.tls, 0);
+    }
+
+    const closes = logs.filter((l) => l.event === "mtproto_close");
+    assert.equal(closes.length, 2);
+    assert.deepEqual(closes.map((l) => l.detail.proto), ["secure", "abridged"]);
+    for (const c of closes) assert.equal(c.detail.secret, "s0");
   } finally {
     server.closeAllConnections?.();
     fakeDc.closeAllConnections?.();

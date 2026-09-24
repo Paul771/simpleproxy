@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.6.0
+// VERSION: 1.7.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -15,7 +15,10 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.0 - new MTPROTO_DOPPELGANGER_LOG_MS (default 5000, 0 = per-connection):
+//   LAST_CHANGE: v1.7.0 - new MTPROTO_FAKE_TLS_CERT_LEN_MAX (default 0 = no cap): upper bound for
+//                the fake certificate in the fake-TLS server flight, so it can be shrunk to fit a
+//                mobile path MTU (read per handshake -> hot-reloadable, no restart)
+//   PREVIOUS: v1.6.0 - new MTPROTO_DOPPELGANGER_LOG_MS (default 5000, 0 = per-connection):
 //                coalescing window for the [proxy][doppelganger] line
 //   PREVIOUS: v1.5.0 - MTPROTO_MAX_CONNECTIONS default 64 -> 256 (a client opens ~8-10
 //                sockets, so 64 let a storm lock everyone out); new MTPROTO_HEARTBEAT_MS
@@ -90,6 +93,7 @@ function parseExpiry(value) {
 //                          mtprotoDigestFreshnessMs, mtprotoPreferIpv6,
 //                          mtprotoTlsProfileCapture, mtprotoTlsProfileRefreshMs, mtprotoTlsProfileTimeoutMs,
 //                          mtprotoDoppelganger, mtprotoDoppelgangerMaxDelayMs, mtprotoDoppelgangerLogMs,
+//                          mtprotoFakeTlsCertLenMax,
 //                          mtprotoMetricsPort, mtprotoMetricsHost } }
 //   SIDE_EFFECTS: none
 //   LINKS: M-CONFIG
@@ -253,6 +257,16 @@ export function loadConfig(env = process.env) {
     5_000,
     "MTPROTO_DOPPELGANGER_LOG_MS"
   );
+  // Upper bound for the fake certificate inside the fake-TLS server flight. 0 = replay the
+  // captured origin size as-is (best anti-DPI fidelity). A mobile path whose MTU is smaller than
+  // the captured certificate (e.g. 4091 on a ~1300-byte link) loses the tail of the flight and
+  // the client never leaves "Connecting"; a cap keeps the flight inside the path budget at the
+  // cost of fingerprint fidelity. Hot-reloadable (read per handshake).
+  const mtprotoFakeTlsCertLenMax = parsePortEnv(
+    env.MTPROTO_FAKE_TLS_CERT_LEN_MAX,
+    0,
+    "MTPROTO_FAKE_TLS_CERT_LEN_MAX"
+  );
 
   // --- Observability: Prometheus metrics side-port (off by default = 0). ---
   const mtprotoMetricsPort = parsePortEnv(env.MTPROTO_METRICS_PORT, 0, "MTPROTO_METRICS_PORT");
@@ -313,6 +327,7 @@ export function loadConfig(env = process.env) {
     mtprotoDoppelganger,
     mtprotoDoppelgangerMaxDelayMs,
     mtprotoDoppelgangerLogMs,
+    mtprotoFakeTlsCertLenMax,
     mtprotoMetricsPort,
     mtprotoMetricsHost,
     mtprotoBlocklist,

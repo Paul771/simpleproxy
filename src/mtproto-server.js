@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.11.0
+// VERSION: 1.12.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
 //            periodic [proxy][heartbeat] liveness line
@@ -15,7 +15,13 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.11.0 - the fake-TLS ClientHello extent comes from resolveClientHelloEnd
+//   LAST_CHANGE: v1.12.0 - link attribution: mtproto_connect/mtproto_close now carry `secret`
+//                (the matched secret's INDEX, never its bytes) and `proto` (abridged |
+//                intermediate | secure). The simple and dd links share the same key material, so
+//                tls:0 alone could not tell a stalled dd link from a healthy simple one in the
+//                journal. [proxy][doppelganger] additionally reports `certLen` — the fake
+//                certificate actually written, so MTPROTO_FAKE_TLS_CERT_LEN_MAX is observable.
+//   PREVIOUS: v1.11.0 - the fake-TLS ClientHello extent comes from resolveClientHelloEnd
 //                (handshake-message length) instead of requiring the declared TLS record length
 //                to be satisfiable, with the record framing kept as a second attempt for clients
 //                that sign the padded record. Prod 14:43: a client delivered the same 1298 bytes
@@ -64,6 +70,7 @@ import {
   buildUpstreamHandshake,
   getDcAddress,
   getDcAddressCandidates,
+  describeProtoTag,
 } from "./mtproto.js";
 import {
   validateClientHello,
@@ -74,6 +81,7 @@ import {
   extractSni,
   splitTlsRecords,
   resolveClientHelloEnd,
+  resolveFakeCertLen,
 } from "./faketls.js";
 import { maskConnection } from "./mask.js";
 
@@ -181,12 +189,14 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
   // interval <= 0 restores the old log-every-event behaviour.
   let dgLoggedAt = 0;
   let dgSuppressed = 0;
-  const logDoppelganger = (addr, records, delays) => {
+  const logDoppelganger = (addr, records, delays, certLen) => {
     const interval = cfg.mtprotoDoppelgangerLogMs ?? DOPPELGANGER_LOG_INTERVAL_MS;
     const now = Date.now();
     if (interval <= 0 || now - dgLoggedAt >= interval) {
       dgLoggedAt = now;
-      log("doppelganger", "DF-DOPPELGANGER", addr, { records, delays, suppressed: dgSuppressed });
+      // certLen = the fake certificate actually put on the wire, so a capped flight
+      // (MTPROTO_FAKE_TLS_CERT_LEN_MAX) is visible in the journal instead of assumed.
+      log("doppelganger", "DF-DOPPELGANGER", addr, { records, delays, certLen, suppressed: dgSuppressed });
       dgSuppressed = 0;
     } else {
       dgSuppressed += 1;
@@ -298,6 +308,17 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       }
       const up = buildUpstreamHandshake(parsed);
 
+      // Link attribution for the journal. The secret is reported by INDEX only — never its bytes.
+      // simple and dd carry the SAME key material (the `dd`/`ee` prefixes are client-side transport
+      // routing), so `tls` alone cannot tell them apart; `proto` can: simple = abridged,
+      // dd = secure, ee = any proto with tls:1. Without it a stalled dd link is indistinguishable
+      // from a healthy simple one in the journal.
+      const secretIndex = secrets.findIndex((s) => s.equals(parsed.secret));
+      const link = {
+        secret: secretIndex >= 0 ? `s${secretIndex}` : "s?",
+        proto: describeProtoTag(parsed.protoTag) || "unknown",
+      };
+
       // START_BLOCK_MT_RELAY
       // Try each DC candidate in order; fall back to the next on TCP connect failure
       // (the failed candidate never received the upstream handshake, so reuse is safe).
@@ -324,6 +345,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         log("mtproto_connect", "DF-1", socket.remoteAddress, `${dc.host}:${dc.port}`, {
           dc: parsed.dcIdx,
           tls: isTls ? 1 : 0,
+          ...link,
         });
         upstream.write(up.rndEnc);
 
@@ -362,6 +384,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             dc: parsed.dcIdx,
             client: socket.remoteAddress,
             tls: isTls ? 1 : 0,
+            ...link,
             bytes_in: bytesIn,
             bytes_out: bytesOut,
             duration_ms: Date.now() - startedAt,
@@ -675,7 +698,10 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           ? cfg.mtprotoTlsAlpn[0]
           : null;
         const profile = profileManager ? profileManager.get() : null;
-        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile, validated.ciphers);
+        // Resolve the fake-certificate size ONCE (cap applied here, not inside buildServerHello) so
+        // the number reported in the doppelganger line is exactly what goes on the wire.
+        const certLen = resolveFakeCertLen(profile, cfg.mtprotoFakeTlsCertLenMax ?? 0);
+        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile, validated.ciphers, certLen);
 
         // Doppelganger: replay captured inter-arrival delays so the flight is timed like the
         // real origin, not bursty-instant. Only the handshake flight is shaped; steady-state
@@ -690,7 +716,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             const d = delays[Math.min(idx, delays.length - 1)];
             setTimeout(() => sendNext(idx + 1), Math.min(d, cfg.mtprotoDoppelgangerMaxDelayMs)).unref?.();
           };
-          logDoppelganger(socket.remoteAddress, records.length, delays.length);
+          logDoppelganger(socket.remoteAddress, records.length, delays.length, certLen);
           sendNext(0);
         } else {
           socket.write(response);

@@ -1,5 +1,5 @@
 // FILE: tests/config.test.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-CONFIG env parsing and validation
 //   SCOPE: defaults, PORT parsing, auth credentials, invalid env
@@ -105,4 +105,13 @@ test("MTProto: whitespace and empties in MTPROTO_SECRET are trimmed away", () =>
 
 test("invalid MAX_TUNNELS throws INVALID_ENV", () => {
   assert.throws(() => loadConfig({ MAX_TUNNELS: "x" }), /INVALID_ENV/);
+});
+
+test("MTProto: MTPROTO_FAKE_TLS_CERT_LEN_MAX defaults to 0 (no cap), override applies, invalid rejects", () => {
+  assert.equal(loadConfig({}).mtprotoFakeTlsCertLenMax, 0, "unset = replay the captured cert as-is");
+  assert.equal(loadConfig({ MTPROTO_FAKE_TLS_CERT_LEN_MAX: "" }).mtprotoFakeTlsCertLenMax, 0);
+  assert.equal(loadConfig({ MTPROTO_FAKE_TLS_CERT_LEN_MAX: "0" }).mtprotoFakeTlsCertLenMax, 0, "0 = no cap");
+  assert.equal(loadConfig({ MTPROTO_FAKE_TLS_CERT_LEN_MAX: "1200" }).mtprotoFakeTlsCertLenMax, 1200);
+  assert.throws(() => loadConfig({ MTPROTO_FAKE_TLS_CERT_LEN_MAX: "-5" }), /INVALID_ENV/);
+  assert.throws(() => loadConfig({ MTPROTO_FAKE_TLS_CERT_LEN_MAX: "soon" }), /INVALID_ENV/);
 });

@@ -4,7 +4,7 @@
     <annotation>Forward HTTP CONNECT-прокси для Telegram Bot API (api.telegram.org) на Node.js (ноль внешних зависимостей), развёртывается на бесплатном хостинге Wispbyte. TLS end-to-end, токены ботов прокси не видит. Allowlist только *.telegram.org:443, опциональная basic auth.</annotation>
 
     <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="implemented">
-      <purpose>Чтение и валидация конфигурации из env (HTTP + MTProto + anti-DPI + per-user limits + metrics port + blocklist); MTPROTO_MAX_CONNECTIONS дефолт 256 (согласован с MTPROTO_PENDING_MAX); MTPROTO_HEARTBEAT_MS (дефолт 60000, 0 = выкл) для heartbeat; MTPROTO_DOPPELGANGER_LOG_MS (дефолт 5000, 0 = лог на каждое соединение) — окно коалесцинга doppelganger-лога</purpose>
+      <purpose>Чтение и валидация конфигурации из env (HTTP + MTProto + anti-DPI + per-user limits + metrics port + blocklist); MTPROTO_MAX_CONNECTIONS дефолт 256 (согласован с MTPROTO_PENDING_MAX); MTPROTO_HEARTBEAT_MS (дефолт 60000, 0 = выкл) для heartbeat; MTPROTO_DOPPELGANGER_LOG_MS (дефолт 5000, 0 = лог на каждое соединение) — окно коалесцинга doppelganger-лога; MTPROTO_FAKE_TLS_CERT_LEN_MAX (дефолт 0 = без cap, иначе потолок размера фейкового сертификата флайта под MTU пути; читается на каждый handshake → hot-reload)</purpose>
       <path>src/config.js</path>
       <depends>M-BLOCKLIST (валидация записей при загрузке)</depends>
       <verification-ref>V-M-CONFIG</verification-ref>
@@ -89,11 +89,12 @@
         <fn-getDcAddress PURPOSE="Разрешить dc_idx в одиночный адрес DC (IPv4/IPv6 по opts.preferIpv6)" />
         <fn-getDcAddressCandidates PURPOSE="Упорядоченный список кандидатов DC (preferred family первым, затем другой) для fallback; hasIpv6=false → только IPv4 (без ENETUNREACH-тупика)" />
         <fn-createAesCtr PURPOSE="Stateful AES-256-CTR шифр" />
+        <fn-describeProtoTag PURPOSE="Имя транспорта по proto tag (abridged|intermediate|secure) — по нему simple и dd различаются в логах" />
       </annotations>
     </M-MTPROTO>
 
     <M-MTPROTO-SERVER NAME="MTProtoServer" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (IPv4↔IPv6 fallback с учётом наличия IPv6 у хоста + одна retry-попытка preferred-кандидата) → relay (FAST_MODE) с backpressure (pause/resume на drain) и буферизацией хвоста при async DC-connect; граница fake-TLS ClientHello определяется resolveClientHelloEnd (длина handshake-сообщения, затем record-framing как фолбэк), поэтому клиент с завышенной длиной TLS-записи обслуживается, а не виснет до таймаута; doppelganger-тайминги, pending-handshake cap, metrics, per-user limits; abort клиента в окне async DC-connect прерывает незавершённый connect и relay не стартует (нет утечки active-слота до idle-timeout и ложных dc_fallback/retry/upstream_error); периодический [proxy][heartbeat] (uptime_s + active/pending/total) делает рестарты, простои и давление пула видимыми; [proxy][doppelganger] коалесцируется (один лог на интервал + счётчик suppressed), чтобы не забивать журнал/панель; mtproto_close/idle_timeout логируют dc/client/tls для атрибуции соединений, mtproto_handshake_timeout в фазе tls-hello дополнительно несёт recordLen/hsLen</purpose>
+      <purpose>MTProto-обработчик соединений: plain + fake-TLS handshake → подключение к DC (IPv4↔IPv6 fallback с учётом наличия IPv6 у хоста + одна retry-попытка preferred-кандидата) → relay (FAST_MODE) с backpressure (pause/resume на drain) и буферизацией хвоста при async DC-connect; граница fake-TLS ClientHello определяется resolveClientHelloEnd (длина handshake-сообщения, затем record-framing как фолбэк), поэтому клиент с завышенной длиной TLS-записи обслуживается, а не виснет до таймаута; doppelganger-тайминги, pending-handshake cap, metrics, per-user limits; abort клиента в окне async DC-connect прерывает незавершённый connect и relay не стартует (нет утечки active-слота до idle-timeout и ложных dc_fallback/retry/upstream_error); периодический [proxy][heartbeat] (uptime_s + active/pending/total) делает рестарты, простои и давление пула видимыми; [proxy][doppelganger] коалесцируется (один лог на интервал + счётчик suppressed + фактический certLen флайта), чтобы не забивать журнал/панель; mtproto_connect/close/idle_timeout логируют dc/client/tls плюс атрибуцию ссылки (secret=индекс сработавшего секрета, proto=abridged|intermediate|secure — simple и dd делят одни байты ключа, поэтому различимы только по proto), mtproto_handshake_timeout в фазе tls-hello дополнительно несёт recordLen/hsLen</purpose>
       <path>src/mtproto-server.js</path>
       <depends>M-MTPROTO, M-FAKETLS, M-LOG, M-REPLAY, M-TLS-PROFILE, M-METRICS, M-USER-STORE</depends>
       <verification-ref>V-M-MTPROTO</verification-ref>
@@ -103,7 +104,7 @@
     </M-MTPROTO-SERVER>
 
     <M-FAKETLS NAME="FakeTLS" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN (mirror профиля: при alpnKnown=true и отсутствии ALPN у origin — расширение опускается), TLS-record framing, SNI-парсинг, TLS-alert, resolveClientHelloEnd (граница ClientHello по длине handshake-сообщения — длина TLS-записи не авторитетна и может завышаться клиентом)</purpose>
+      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN (mirror профиля: при alpnKnown=true и отсутствии ALPN у origin — расширение опускается), TLS-record framing, SNI-парсинг, TLS-alert, resolveClientHelloEnd (граница ClientHello по длине handshake-сообщения — длина TLS-записи не авторитетна и может завышаться клиентом), resolveFakeCertLen (размер фейкового сертификата флайта с учётом MTPROTO_FAKE_TLS_CERT_LEN_MAX — усечение под MTU мобильного пути)</purpose>
       <path>src/faketls.js</path>
       <depends>node:crypto</depends>
       <verification-ref>V-M-FAKETLS</verification-ref>
@@ -116,6 +117,7 @@
         <fn-buildTlsAlert PURPOSE="Построить fatal TLS alert (reject_handshake)" />
         <fn-buildAlpnExtension PURPOSE="Построить ALPN-расширение для ServerHello" />
         <fn-resolveClientHelloEnd PURPOSE="Определить конец ClientHello (0 = ждать ещё байты): длина handshake-сообщения приоритетнее завышенной длины TLS-записи" />
+        <fn-resolveFakeCertLen PURPOSE="Размер фейкового сертификата в ServerHello-флайте: размер из профиля, усечённый cap'ом (MTPROTO_FAKE_TLS_CERT_LEN_MAX)" />
       </annotations>
     </M-FAKETLS>
 

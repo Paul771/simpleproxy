@@ -1,5 +1,5 @@
 // FILE: tests/mtproto.test.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-MTPROTO obfuscated2 handshake parse/build and DC mapping
 //   SCOPE: client handshake round-trip, secret validation, upstream handshake, DC resolution
@@ -17,6 +17,7 @@ import {
   buildUpstreamHandshake,
   getDcAddress,
   createAesCtr,
+  describeProtoTag,
 } from "../src/mtproto.js";
 
 const PROTO_TAG_ABRIDGED = Buffer.from([0xef, 0xef, 0xef, 0xef]);
@@ -154,6 +155,14 @@ test("buildUpstreamHandshake: relay client->TG data round-trips through the prox
   sink.decrypt(Buffer.alloc(64)); // advance past handshake
   const received = sink.decrypt(toTg);
   assert.equal(received.toString(), payload);
+});
+
+test("describeProtoTag: names the transport, which is what tells simple/dd/ee apart", () => {
+  assert.equal(describeProtoTag(PROTO_TAG_ABRIDGED), "abridged");
+  assert.equal(describeProtoTag(PROTO_TAG_INTERMEDIATE), "intermediate");
+  assert.equal(describeProtoTag(PROTO_TAG_SECURE), "secure");
+  assert.equal(describeProtoTag(Buffer.from([0x00, 0x11, 0x22, 0x33])), null);
+  assert.equal(describeProtoTag(Buffer.from([0xdd, 0xdd, 0xdd])), null, "short tag is not a transport");
 });
 
 test("getDcAddress: maps dc_idx to datacenter", () => {
