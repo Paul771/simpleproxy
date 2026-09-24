@@ -293,9 +293,10 @@
         <scenario-5 kind="success">createProfileManager: start → capture → get(); stop чистит таймер.</scenario-5>
         <scenario-6 kind="success" wave="E">alpnKnown: origin отвечает ServerHello БЕЗ ALPN → profile.alpn=null, alpnKnown=true (отличает «origin без ALPN» от «профиль не распарсен»); createTlsRecordObserver отдаёт body каждой записи (ServerHello парсится из body, устойчиво к фрагментации записи по чанкам).</scenario-6>
         <scenario-7 kind="failure" wave="E">degenerate capture: origin отдаёт ServerHello + одну 36-байтную 0x17 (alert/rate-limit) → profile=null + лог [proxy][tls_profile_reject] reason=degenerate_flight; refresh с таким ответом НЕ перезаписывает предыдущий good-профиль (certLen сохраняется). Гейты: serverHelloParsed != null И certLen >= 256.</scenario-7>
+        <scenario-8 kind="success" wave="A">retry после неудачного захвата: инжектированный capture всегда возвращает null → за refreshMs=60000 успевает ≥3 попытки (без ретрая была бы 1), строки failed несут retry_in_ms = 20 → 40 → 80 (фактически запланированные задержки, никогда не выше refreshMs); после успешного захвата backoff сбрасывается и новых попыток до refreshMs нет.</scenario-8>
       </scenarios>
       <required-log-markers>
-        <marker-1>[proxy][tls_profile][DF-TLS-PROFILE]</marker-1>
+        <marker-1>[proxy][tls_profile][DF-TLS-PROFILE] (успех: cipher/alpn/ccsCount/certLen; провал: status=failed + retry_in_ms)</marker-1>
         <marker-2>[proxy][doppelganger][DF-DOPPELGANGER]</marker-2>
       </required-log-markers>
       <wave-follow-up>smoke: MTPROTO_TLS_PROFILE_CAPTURE=true + реальный домен → лог captured; invalid.invalid → failed + fallback.</wave-follow-up>

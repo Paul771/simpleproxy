@@ -142,14 +142,14 @@
     </M-REPLAY>
 
     <M-TLS-PROFILE NAME="TlsProfile" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Захват структуры TLS server-flight у fronted-домена и replay её в fake ServerHello (anti-DPI, telemt-style)</purpose>
+      <purpose>Захват структуры TLS server-flight у fronted-домена и replay её в fake ServerHello (anti-DPI, telemt-style); неудачный захват не ждёт полный refreshMs, а повторяется по backoff 30s→60s→… (cap = refreshMs), а строка failed несёт retry_in_ms — фактическую задержку следующей попытки</purpose>
       <path>src/tls-profile.js</path>
       <depends>node:net, node:crypto, M-FAKETLS</depends>
       <verification-ref>V-M-TLS-PROFILE</verification-ref>
       <annotations>
         <fn-buildCaptureClientHello PURPOSE="Построить TLS 1.3 ClientHello для probe origin" />
         <fn-captureTlsProfile PURPOSE="Сырой TCP-capture структуры server-flight (cipher/ALPN/alpnKnown/CCS/размеры 0x17/inter-arrival delays); ServerHello парсится из record-body (устойчиво к фрагментации); вырожденные/alert-флайты отвергаются (certLen>=256, parsed ServerHello) с логом tls_profile_reject" />
-        <fn-createProfileManager PURPOSE="Кэш профиля с periodic refresh" />
+        <fn-createProfileManager PURPOSE="Кэш профиля: self-rescheduling refresh + backoff-ретрай после неудачного захвата (30s база, удвоение, cap refreshMs); capture инжектится для тестов" />
         <fn-createTlsRecordObserver PURPOSE="Stateful наблюдатель TLS-записей (type+size+body)" />
       </annotations>
     </M-TLS-PROFILE>

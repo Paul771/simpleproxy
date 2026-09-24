@@ -1,5 +1,5 @@
 // FILE: tests/tls-profile.test.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-TLS-PROFILE capture, replay and profile manager
 //   SCOPE: scripted local TLS origin -> capture profile; buildServerHello replay; manager start/get/stop
@@ -275,6 +275,105 @@ test("buildServerHello: profile=null keeps the synthetic single-CCS + single-app
   const appData = recs.filter((r) => r.type === 0x17);
   assert.equal(ccs.length, 1);
   assert.equal(appData.length, 1);
+});
+
+test("createProfileManager: a failed capture retries on a short backoff instead of waiting a full refresh", async () => {
+  const events = [];
+  const logCollector = (event, ref, host, detail) => events.push({ event, ref, host, detail });
+  let attempts = 0;
+  // Always-failing capture: a real boot probe can fail (origin unreachable, DNS hiccup) and then
+  // the ee link would run for a whole refreshMs without a profile.
+  const capture = async () => {
+    attempts += 1;
+    return null;
+  };
+  const mgr = createProfileManager({
+    host: "origin.invalid",
+    refreshMs: 60_000,
+    retryMs: 20,
+    log: logCollector,
+    capture,
+  });
+  try {
+    mgr.start();
+    const deadline = Date.now() + 3000;
+    while (attempts < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    // Without the retry chain a single attempt per refreshMs (60s) would mean attempts === 1 here.
+    assert.ok(attempts >= 3, `expected >=3 capture attempts, got ${attempts}`);
+
+    const failures = events.filter((e) => e.detail && e.detail.status === "failed");
+    assert.ok(failures.length >= 3, `expected >=3 failure lines, got ${failures.length}`);
+    // retry_in_ms is the delay actually scheduled, and the backoff grows.
+    assert.deepEqual(
+      failures.slice(0, 3).map((e) => e.detail.retry_in_ms),
+      [20, 40, 80]
+    );
+    for (const f of failures) {
+      assert.ok(f.detail.retry_in_ms <= 60_000, "a retry must never wait longer than a full refresh");
+    }
+  } finally {
+    mgr.stop();
+  }
+});
+
+test("createProfileManager: a successful capture returns to the plain refresh interval", async () => {
+  const events = [];
+  const logCollector = (event, ref, host, detail) => events.push({ event, ref, host, detail });
+  const good = { cipher: Buffer.from([0x13, 0x01]), alpn: null, alpnKnown: true, ccsCount: 1, appDataSizes: [4091], certLen: 4091, recordDelays: [5] };
+  let attempts = 0;
+  // Fail twice, then succeed: the backoff must reset so the next wait is the full interval.
+  const capture = async () => {
+    attempts += 1;
+    return attempts < 3 ? null : good;
+  };
+  const mgr = createProfileManager({
+    host: "origin.invalid",
+    refreshMs: 60_000,
+    retryMs: 20,
+    log: logCollector,
+    capture,
+  });
+  try {
+    mgr.start();
+    const deadline = Date.now() + 3000;
+    while (attempts < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(attempts >= 3, `expected >=3 capture attempts, got ${attempts}`);
+    assert.ok(mgr.get(), "the successful capture must populate the profile");
+
+    const ok = events.find((e) => e.detail && e.detail.certLen === 4091);
+    assert.ok(ok, "the success line must be logged");
+    // No further attempt may be scheduled before refreshMs: the backoff is reset, not doubled.
+    const attemptsAfterSuccess = attempts;
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(attempts, attemptsAfterSuccess, "a good profile must not be re-captured early");
+  } finally {
+    mgr.stop();
+  }
+});
+
+test("createProfileManager: stop during an in-flight capture does not reschedule", async () => {
+  let calls = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  // A capture that never settles on its own: stop() must win over the completion that follows.
+  const capture = async () => {
+    calls += 1;
+    await gate;
+    return null;
+  };
+  const mgr = createProfileManager({ host: "origin.invalid", refreshMs: 60_000, retryMs: 20, capture });
+  try {
+    mgr.start();
+    const started = Date.now();
+    while (calls < 1 && Date.now() - started < 2000) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(calls, 1, "the first capture must be in flight");
+    mgr.stop();
+    release();
+    await new Promise((r) => setTimeout(r, 80)); // well past retryMs=20
+    assert.equal(calls, 1, "a stopped manager must not schedule another attempt");
+  } finally {
+    mgr.stop();
+  }
 });
 
 test("createProfileManager: start captures a profile, get returns it, stop clears the timer", async () => {

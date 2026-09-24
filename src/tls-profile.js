@@ -1,5 +1,5 @@
 // FILE: src/tls-profile.js
-// VERSION: 1.3.0
+// VERSION: 1.4.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Capture a real TLS server-flight profile from a fronted domain and replay its structure
 //   SCOPE: raw TCP TLS-1.3 capture (ClientHello build, record observer), profile cache + periodic refresh
@@ -12,12 +12,19 @@
 // START_MODULE_MAP
 //   buildCaptureClientHello - build a TLS 1.3 ClientHello to probe an origin server flight
 //   captureTlsProfile - connect to an origin, capture the server-flight record structure
-//   createProfileManager - cached profile with periodic refresh
+//   createProfileManager - cached profile with periodic refresh + retry backoff after a failed capture
 //   createTlsRecordObserver - stateful raw TLS record observer (type + size + body of every record)
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.3.0 - reject degenerate captures so a good profile is never overwritten:
+//   LAST_CHANGE: v1.4.0 - a FAILED capture now schedules a short retry (30s base, doubling, capped
+//                at refreshMs) instead of waiting a full refreshMs, and the failure line reports
+//                the delay actually scheduled (retry_in_ms). Prod: the boot probe to rutube.ru
+//                failed once and the ee link then ran with a random certLen and no doppelganger
+//                until the 10-minute refresh. The manager is now a self-rescheduling timeout
+//                (the next delay depends on the capture result), the capture function is injectable
+//                for tests, and any successful capture resets the backoff.
+//   PREVIOUS: v1.3.0 - reject degenerate captures so a good profile is never overwritten:
 //                buildProfile now requires a parsed ServerHello and certLen >= MIN_PROFILE_CERT_LEN
 //                (256). Prod symptom: a 10-min refresh captured a single 36-byte 0x17 (alert /
 //                rate-limited flight) and replaced the good certLen=4091 profile, shrinking the
@@ -52,6 +59,10 @@ const QUIET_READ_MS = 600; // no-new-byetes gap that ends the first-flight captu
 // single 36-byte 0x17 and the old code accepted it, replacing a good certLen=4091 profile and
 // shrinking the replayed fake certificate to a 36-byte record-size tell.
 const MIN_PROFILE_CERT_LEN = 256;
+// First retry delay after a FAILED capture. A boot probe that fails (origin unreachable, DNS hiccup)
+// otherwise left the ee link without a profile — random certLen, no doppelganger — for a whole
+// refreshMs (10 min by default).
+const PROFILE_RETRY_BASE_MS = 30_000;
 
 // Real-browser-grade ClientHello TEMPLATE (captured from a live TLS 1.3 stack, rutube.ru SNI,
 // ALPN h2/http-1.1). Hand-assembling extensions proved fragile (two structural bugs shipped
@@ -364,50 +375,90 @@ function buildProfile(host, serverHelloParsed, records) {
 }
 
 // START_CONTRACT: createProfileManager
-//   PURPOSE: Cache a captured profile and refresh it on a timer
-//   INPUTS: { host, port, refreshMs, timeoutMs, log }
-//   OUTPUTS: { get(): Profile | null, start(): void, stop(): void, refresh(): Promise<void> }
-//   SIDE_EFFECTS: schedules an unref'd refresh interval; performs outbound TCP captures
+//   PURPOSE: Cache a captured profile and refresh it on a timer, retrying soon on a backoff after
+//            a FAILED capture so a boot-time probe failure cannot leave the ee link without a
+//            profile for a whole refreshMs
+//   INPUTS: { host, port, refreshMs, retryMs, timeoutMs, log, capture? }
+//   OUTPUTS: { get(): Profile | null, start(): void, stop(): void, refresh(): Promise<Profile | null> }
+//   SIDE_EFFECTS: schedules an unref'd timeout; performs outbound TCP captures
 //   LINKS: M-TLS-PROFILE
 // END_CONTRACT: createProfileManager
-export function createProfileManager({ host, port = 443, refreshMs = 600_000, timeoutMs = 5000, log } = {}) {
+export function createProfileManager({
+  host,
+  port = 443,
+  refreshMs = 600_000,
+  retryMs = PROFILE_RETRY_BASE_MS,
+  timeoutMs = 5000,
+  log,
+  capture = captureTlsProfile,
+} = {}) {
   // START_BLOCK_MANAGER
   let profile = null;
   let timer = null;
   let inFlight = false;
+  let running = false;
+  // Backoff state: reset by any successful capture, doubled by each failure, capped at refreshMs.
+  let backoffMs = retryMs;
+  const nextBackoff = () => Math.min(backoffMs, refreshMs);
 
   const refresh = async () => {
-    if (inFlight) return;
+    if (inFlight) return null;
     inFlight = true;
     try {
-      const captured = await captureTlsProfile(host, port, { timeoutMs, log });
-      if (captured) {
-        profile = captured;
-        log?.("tls_profile", "DF-TLS-PROFILE", host, {
-          cipher: captured.cipher?.toString("hex"),
-          alpn: captured.alpn,
-          alpnKnown: captured.alpnKnown,
-          ccsCount: captured.ccsCount,
-          appDataRecords: captured.appDataSizes.length,
-          certLen: captured.certLen,
-          delays: captured.recordDelays.length,
-        });
-      } else {
-        log?.("tls_profile", "DF-TLS-PROFILE", host, { status: "failed" });
+      const captured = await capture(host, port, { timeoutMs, log });
+      if (!captured) {
+        // retry_in_ms is the delay the scheduler will actually use, so the journal states the real
+        // recovery plan instead of implying a full refreshMs wait after a boot-time failure.
+        log?.("tls_profile", "DF-TLS-PROFILE", host, { status: "failed", retry_in_ms: nextBackoff() });
+        return null;
       }
+      profile = captured;
+      backoffMs = retryMs;
+      log?.("tls_profile", "DF-TLS-PROFILE", host, {
+        cipher: captured.cipher?.toString("hex"),
+        alpn: captured.alpn,
+        alpnKnown: captured.alpnKnown,
+        ccsCount: captured.ccsCount,
+        appDataRecords: captured.appDataSizes.length,
+        certLen: captured.certLen,
+        delays: captured.recordDelays.length,
+      });
+      return captured;
     } finally {
       inFlight = false;
     }
   };
 
-  const start = () => {
-    refresh();
-    timer = setInterval(() => refresh(), refreshMs);
+  // One self-rescheduling timeout instead of setInterval: the next delay depends on whether the
+  // capture succeeded, which a fixed interval cannot express. The first delay is read BEFORE the
+  // backoff is doubled, so the logged retry_in_ms and the scheduled delay always agree.
+  const scheduleAfter = async () => {
+    const captured = await refresh();
+    if (captured) {
+      schedule(refreshMs);
+      return;
+    }
+    const delay = nextBackoff();
+    backoffMs = Math.min(backoffMs * 2, refreshMs);
+    schedule(delay);
+  };
+
+  const schedule = (delay) => {
+    if (!running) return;
+    timer = setTimeout(() => void scheduleAfter(), delay);
     if (typeof timer.unref === "function") timer.unref();
   };
 
+  const start = () => {
+    running = true;
+    void scheduleAfter();
+  };
+
   const stop = () => {
-    if (timer !== null) clearInterval(timer);
+    // `running` also covers the in-flight case: a capture that resolves after stop() must not
+    // schedule a new attempt (clearTimeout alone only cancels what is already pending).
+    running = false;
+    if (timer !== null) clearTimeout(timer);
     timer = null;
   };
 

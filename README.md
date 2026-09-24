@@ -176,6 +176,13 @@ record-size fingerprint (JA3/JA4 server-side). Захват — сырой `net.
 flight, профиль ~1 КБ, refresh каждые `MTPROTO_TLS_PROFILE_REFRESH_MS`. При неудаче — fallback
 на синтетический ServerHello (обратная совместимость).
 
+**Ретрай после неудачного захвата**: если проба к origin'у не удалась (недоступен, DNS- hiccup),
+менеджер не ждёт полный `MTPROTO_TLS_PROFILE_REFRESH_MS`, а повторяет по backoff
+30с → 60с → 120с → … (потолок = refreshMs), а строка
+`[proxy][tls_profile] … {"status":"failed","retry_in_ms":30000}` показывает фактическую задержку
+следующей попытки. Успешный захват сбрасывает backoff. Без этого после неудачного стартового
+захвата ee-ссылка до 10 минут летела со случайным `certLen` и без doppelganger.
+
 **ALPN fidelity**: профиль фиксирует `alpnKnown` — отличает «origin ответил без ALPN» (например,
 rutube.ru) от «профиль не распарсен». В первом случае fake ServerHello **опускает** ALPN, а не
 подставляет configured `h2`; во втором — прежний fallback на `MTPROTO_TLS_ALPN`. Так server-flight
