@@ -1,11 +1,11 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.9.0
+// VERSION: 1.10.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
 //            byte-quota teardown, strict unknown-user denial, CONNECT header slowloris guard;
 //            Wave-A DPI-window resilience: MTProto-specific idle/handshake timeout overrides
-//            and handshake-death observability
+//            and handshake-death observability; close-death attribution
 //   SCOPE: C-1 pendingHandshakes leak (auth-fail / bad-dc paths), B4 buffer caps
 //          (handshake_overflow), B3 mask relay byte cap, MTPROTO_MASK_RELAY_MAX_BYTES config;
 //          W2-2 mtproto_quota_exceeded teardown, W2-3 MTPROTO_USERS_STRICT deny-unknown,
@@ -21,6 +21,11 @@
 //            A-10/A-11 handshake-death forensics: mtproto_handshake_timeout separates a client that
 //            hung up after ServerHello (closed=true, short elapsed_ms) from one that stayed silent
 //            (closed=false, elapsed_ms≈timeout) and reports the flight it sent
+//            B-1..B-5 close attribution: mtproto_close names which side died (client_close vs
+//            upstream_close vs upstream_error+errno), ages the last byte per direction
+//            (last_rx_ms/last_tx_ms, null when a direction never carried app data), and keeps a
+//            server-side decision (idle_timeout, user_quota) from being relabelled client_close
+//            B-6 every terminal handshake rejection carries a `reason`
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
 //            M-PROXY
 //   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
@@ -29,7 +34,17 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.9.0 - A-10/A-11: the post-ServerHello timeout line must separate a client that
+//   LAST_CHANGE: v1.10.0 - B-1..B-6: mtproto_close must say WHICH side died (reason), with the
+//               errno when a socket errored (error_code) and the age of the last byte in each
+//               direction (last_rx_ms/last_tx_ms, null - never 0 - for a direction that carried
+//               no app data); a server-side reap (idle_timeout) and a quota kick (user_quota)
+//               must keep their own reason instead of being relabelled by the close events their
+//               own teardown causes; all five terminal handshake rejections name themselves.
+//               Fixture notes: startTenantProxy grew optional resolveDc/connectImpl overrides, and
+//               the injected connector must be a genuinely CONNECTED net.Socket - the relay writes
+//               its upstream handshake on connect, and an unconnected socket fails that write with
+//               ERR_SOCKET_CLOSED, masking the errno under test.
+//   PREVIOUS: v1.9.0 - A-10/A-11: the post-ServerHello timeout line must separate a client that
 //               hangs up on our flight (closed=true, elapsed_ms < timeout/2) from one that stays
 //               connected and silent (closed=false, elapsed_ms spans the timeout), and
 //               flight_bytes must equal exactly the ServerHello bytes the client received;
@@ -64,6 +79,8 @@
 //   buildFakeTlsClientHello - synthetic fake-TLS ClientHello carrying an obfs handshake
 //   startEchoMaskServer - mask upstream echoing received bytes back
 //   startProxy - mux server wiring a real mtproto handler with injectable resolver/metrics
+//   startTenantProxy - multi-tenant fixture: real handler behind mux with injectable
+//                      userStore/logCollector/metrics plus optional resolveDc and connectImpl
 //   awaitClose - await socket closure (or error) with a deadline
 //   waitFor - poll a condition until it holds or the deadline passes
 //   roundTripPayload - full obfuscated2 round trip through the proxy (encrypt -> echo -> decrypt)
@@ -560,7 +577,7 @@ function roundTripPayload(addr, secretBuf, payload, timeoutMs = 3000) {
 
 // Multi-tenant proxy fixture: real mtproto handler behind mux, injectable userStore/log/
 // metrics so markers and counters can be asserted deterministically.
-async function startTenantProxy(cfgOverrides, userStore, logCollector, metrics) {
+async function startTenantProxy(cfgOverrides, userStore, logCollector, metrics, resolveDc = null, connectImpl = null) {
   const fakeDc = await startFakeDc();
   const dcAddr = fakeDc.address();
   const cfg = {
@@ -578,7 +595,21 @@ async function startTenantProxy(cfgOverrides, userStore, logCollector, metrics) 
   const handlers = {
     "http-connect": () => {},
     "http-other": () => {},
-    "mtproto": createMtprotoHandler(cfg, logCollector, () => ({ host: "127.0.0.1", port: dcAddr.port }), null, null, null, metrics, userStore),
+    "mtproto": createMtprotoHandler(
+      cfg,
+      logCollector,
+      // A null resolver override is how the bad-dc path is exercised; the default points the
+      // relay at the fixture's own fake DC.
+      resolveDc ?? (() => ({ host: "127.0.0.1", port: dcAddr.port })),
+      null,
+      null,
+      null,
+      metrics,
+      userStore,
+      // `undefined`, never `null`: createMtprotoHandler's connectImpl default fires only for
+      // undefined, so an explicit null would disable the real connector.
+      connectImpl ?? undefined
+    ),
   };
   const server = createMuxServer(handlers);
   await new Promise((resolve) => server.listen(cfg.port, cfg.host, resolve));
@@ -1571,4 +1602,327 @@ test("hardening: a client that hangs up right after ServerHello is reported as c
     server.close();
     fakeDc.close();
   }
+});
+
+test("hardening: a client-initiated close is attributed, and both directions age their last byte (B-1)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    null,
+    logCollector,
+    null
+  );
+
+  try {
+    // One real round trip, then the client hangs up. mtproto_close is emitted from a teardown bound
+    // to BOTH sockets, so without a reason the line cannot say which side went first.
+    await new Promise((resolve, reject) => {
+      const { handshake, stream, encKey, encIv } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+      const clientDec = createAesCtr(encKey, encIv);
+      const payload = Buffer.from("close-cause");
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(Buffer.concat([handshake, stream.encrypt(payload)]));
+      });
+      let buf = Buffer.alloc(0);
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error("round-trip timeout"));
+      }, 3000);
+      socket.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (buf.length >= payload.length) {
+          assert.equal(clientDec.decrypt(buf.subarray(0, payload.length)).toString(), payload.toString());
+          clearTimeout(timer);
+          socket.destroy();
+          resolve();
+        }
+      });
+      socket.on("error", (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
+
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "the relay must log a close");
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.equal(evt.detail.reason, "client_close", "the client hung up, so that is the reason");
+    assert.equal(evt.detail.error_code, undefined, "a clean close carries no errno");
+    assert.ok(evt.detail.bytes_in > 0, "the round trip must have moved bytes in");
+    assert.ok(evt.detail.bytes_out > 0, "the round trip must have moved bytes out");
+    assert.equal(typeof evt.detail.last_rx_ms, "number", "last_rx_ms is an age when bytes arrived");
+    assert.equal(typeof evt.detail.last_tx_ms, "number", "last_tx_ms is an age when bytes were sent");
+    assert.ok(
+      evt.detail.last_rx_ms < 1000 && evt.detail.last_tx_ms < 1000,
+      `both directions were just used; got rx=${evt.detail.last_rx_ms} tx=${evt.detail.last_tx_ms}`
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: a DC that closes cleanly is attributed to upstream_close, and a silent direction reads null (B-2)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  // A DC that drains and then sends a clean FIN WITHOUT echoing. The client-facing direction
+  // therefore never carries a byte, which must read as null - a 0 would claim "just now".
+  const silentDc = net.createServer((s) => {
+    s.resume();
+    setTimeout(() => s.end(), 120);
+  });
+  await new Promise((r) => silentDc.listen(0, "127.0.0.1", r));
+  const dcPort = silentDc.address().port;
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    null,
+    logCollector,
+    null,
+    () => ({ host: "127.0.0.1", port: dcPort })
+  );
+
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(addr.port, "127.0.0.1", () => {
+      // 64 bytes of app data past the handshake: gives the rx direction a real age.
+      socket.write(Buffer.concat([handshake, randomBytes(64)]));
+    });
+    socket.on("error", () => {});
+    assert.equal(await awaitClose(socket, 3000), true, "the DC close must tear the client down too");
+
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "must log a close");
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.equal(evt.detail.reason, "upstream_close", "the DC hung up first, not the client");
+    assert.equal(evt.detail.error_code, undefined, "a clean FIN carries no errno");
+    assert.ok(evt.detail.last_rx_ms < 1000, `the client did send app data; got ${evt.detail.last_rx_ms}`);
+    assert.equal(evt.detail.last_tx_ms, null, "nothing was ever sent to the client, so the age is null");
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+    silentDc.close();
+  }
+});
+
+test("hardening: an upstream socket error is attributed together with its errno (B-3)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  // A real listener so the injected socket is genuinely CONNECTED: the relay writes its upstream
+  // handshake the moment it connects, and writing to an unconnected net.Socket fails with
+  // ERR_SOCKET_CLOSED - which would mask the errno under test behind a fixture artefact.
+  const dummyDc = net.createServer((s) => s.resume());
+  await new Promise((r) => dummyDc.listen(0, "127.0.0.1", r));
+  const dummyPort = dummyDc.address().port;
+  // "the DC died" and "the DC was reset" are different ISP symptoms, so the errno has to survive
+  // into the journal. net.Socket, not a bare Duplex: the handler calls upstream.setTimeout() on
+  // connect, which only exists on a real socket.
+  const connectImpl = () => {
+    const sock = net.connect(dummyPort, "127.0.0.1");
+    // The handler subscribes after connectImpl returns, so the real 'connect' is already past it.
+    // The guard is load-bearing: a bare re-emit would re-enter this same listener forever.
+    let announced = false;
+    sock.on("connect", () => {
+      if (announced) return;
+      announced = true;
+      sock.emit("connect");
+    });
+    setTimeout(() => {
+      sock.emit("error", Object.assign(new Error("reset by peer"), { code: "ECONNRESET" }));
+      sock.destroy();
+    }, 150);
+    return sock;
+  };
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    null,
+    logCollector,
+    null,
+    null,
+    connectImpl
+  );
+
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(handshake));
+    socket.on("error", () => {});
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "must log a close");
+
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.equal(evt.detail.reason, "upstream_error", "the errno arrived before any close event");
+    assert.equal(evt.detail.error_code, "ECONNRESET", "the errno must reach the journal verbatim");
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+    dummyDc.closeAllConnections?.();
+    dummyDc.close();
+  }
+});
+
+test("hardening: the idle reaper keeps its own reason instead of being relabelled client_close (B-4)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  const IDLE_MS = 80;
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoIdleTimeoutMs: IDLE_MS },
+    null,
+    logCollector,
+    null
+  );
+
+  try {
+    // The idle timer destroys both sockets, so the close events that follow would otherwise
+    // relabel a server-side reap as a client hangup. First stamp wins - and it must be the idle one.
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(handshake));
+    socket.on("error", () => {});
+    assert.equal(await awaitClose(socket, 3000), true, "the idle reaper must tear the client down");
+
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "must log a close");
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.equal(evt.detail.reason, "idle_timeout", "a server-side reap must not read as a client close");
+    assert.equal(evt.detail.last_rx_ms, null, "no app data ever arrived, so rx has no age");
+    assert.equal(evt.detail.last_tx_ms, null, "nothing was ever sent, so tx has no age");
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: a quota kick keeps its own reason on the resulting close (B-5)", async () => {
+  const aliceSecret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  const userStore = createUserStore([
+    { user: "alice", secretHex: aliceSecret.toString("hex"), maxConns: null, expiresAt: null, byteQuota: 1024 },
+  ]);
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [aliceSecret.toString("hex")] },
+    userStore,
+    logCollector,
+    null
+  );
+
+  try {
+    const { handshake } = buildClientHandshake(aliceSecret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(addr.port, "127.0.0.1", () => {
+      socket.write(Buffer.concat([handshake, randomBytes(4 * 1024)]));
+    });
+    socket.on("error", () => {});
+    assert.equal(await awaitClose(socket, 4000), true, "the quota kick must tear the client down");
+
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "must log a close");
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.equal(
+      evt.detail.reason,
+      "user_quota",
+      "the quota decision must survive the close events its own teardown causes"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: every handshake-phase rejection names its reason (B-6)", async () => {
+  const secret = randomBytes(16);
+  const wrongSecret = randomBytes(16);
+
+  // One scenario per terminal handshake path. Each gets its own proxy and MUST tear it down in a
+  // finally: a leaked listener keeps the test process alive, which turns a single failed assertion
+  // into a hang instead of a readable failure.
+  const scenario = async (label, cfg, userStore, resolveDc, payload, expectEvent, expectReason) => {
+    const logs = [];
+    // 4 params: handshake-phase rejections log their detail as the 4th argument.
+    const collector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+    const { server, fakeDc, addr } = await startTenantProxy(
+      { mtprotoSecrets: [secret.toString("hex")], ...cfg },
+      userStore,
+      collector,
+      null,
+      resolveDc
+    );
+    try {
+      const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(payload));
+      socket.on("error", () => {});
+      assert.equal(await awaitClose(socket, 3000), true, `${label}: the connection must be dropped`);
+      const evt = logs.find((l) => l.event === expectEvent);
+      assert.ok(evt, `${label}: ${expectEvent} must be logged`);
+      assert.equal(evt.detail.reason, expectReason, `${label}: the rejection must name itself`);
+    } finally {
+      server.closeAllConnections?.();
+      fakeDc.closeAllConnections?.();
+      server.close();
+      fakeDc.close();
+    }
+  };
+
+  // auth_fail: a full handshake whose HMAC does not verify.
+  await scenario(
+    "auth_fail",
+    {},
+    null,
+    null,
+    buildClientHandshake(wrongSecret, PROTO_TAG_ABRIDGED, 1).handshake,
+    "mtproto_auth_fail",
+    "auth_fail"
+  );
+
+  // bad_dc: the resolver yields no candidates at all.
+  await scenario(
+    "bad_dc",
+    {},
+    null,
+    () => null,
+    buildClientHandshake(secret, PROTO_TAG_ABRIDGED, -7).handshake,
+    "mtproto_bad_dc",
+    "bad_dc"
+  );
+
+  // user_reject: a valid secret whose tenant record refuses admission.
+  await scenario(
+    "user_reject",
+    {},
+    createUserStore([
+      { user: "alice", secretHex: secret.toString("hex"), maxConns: 0, expiresAt: null, byteQuota: null },
+    ]),
+    null,
+    buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1).handshake,
+    "mtproto_user_reject",
+    "user_reject"
+  );
+
+  // pending_cap: the Slowloris guard has no room left.
+  await scenario(
+    "pending_cap",
+    { mtprotoPendingMax: 0 },
+    null,
+    null,
+    randomBytes(16),
+    "mtproto_pending_cap",
+    "pending_cap"
+  );
+
+  // faketls_reject: a TLS-shaped record too short to be a real ClientHello.
+  await scenario(
+    "faketls_reject",
+    {},
+    null,
+    null,
+    Buffer.concat([Buffer.from([0x16, 0x03, 0x01, 0x01, 0x00]), randomBytes(600)]),
+    "faketls_reject",
+    "faketls_record_short"
+  );
 });

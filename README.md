@@ -339,6 +339,30 @@ MTPROTO_DOPPELGANGER=1            # опционально: тайминги fli
 `flight_records` показывают, что именно ушло в провод именно в этой попытке, — привязки к
 конкретному соединению коалесцированная строка `[proxy][doppelganger]` не даёт.
 
+Строка `[proxy][mtproto_close]` отвечает на второй вопрос — **кто умер первым**. Раньше teardown
+был навешен на `close` обоих сокетов без различия, а `error` прогласывался пустым обработчиком,
+поэтому «клиент повесил трубку» и «упал DC» давали байт-в-байт одинаковую запись. Теперь в
+detail есть:
+
+- `reason` — `client_close` | `upstream_close` | `client_error` | `upstream_error` |
+  `idle_timeout` | `user_quota` | `unknown`;
+- `error_code` — только errno (`ECONNRESET` и т.п.), присутствует у `*-error`. Сообщение
+  ошибки не пишется;
+- `last_rx_ms` / `last_tx_ms` — сколько прошло с последнего байта в каждом направлении;
+  `null`, если направление не носило post-handshake данных (`0` читался бы как «только что»).
+
+Правило — **first-stamp-wins**: серверное решение штампуется до `destroy`, поэтому
+`idle_timeout` и `user_quota` не переписываются собственными `close`-событиями, которые этот
+`destroy` порождает. Node эмитит `error` раньше `close`, поэтому errno не теряется. Словарь
+совпадает с `teardown(reason)` маски, поэтому оба релея фильтруются по одному полю.
+
+Как читать: `reason=client_close` при `last_rx_ms` около 90 с — клиент держал соединение и
+ушёл молча (сам ушёл, либо режется путь). `reason=upstream_close`/`upstream_error` — виноват DC
+или соединение до него. `last_tx_ms` большой при `last_rx_ms` маленьком — DC перестал слать, а
+клиент ещё ждал. Те же `reason` теперь есть в detail терминальных handshake-отказов
+(`auth_fail`, `bad_dc`, `user_reject`, `user_unknown`, `pending_cap`, `faketls_record_short`,
+`handshake_overflow`, `upstream_error`), так что отказы и закрытия фильтруются одним полем.
+
 Карта окон с клиента:
 
 ```powershell

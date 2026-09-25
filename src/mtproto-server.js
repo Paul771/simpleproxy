@@ -1,9 +1,11 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.13.0
+// VERSION: 1.14.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
-//            periodic [proxy][heartbeat] liveness line, handshake-death forensics
-//   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
+//            periodic [proxy][heartbeat] liveness line, handshake-death and close-death forensics
+//   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay,
+//          close attribution (reason / error_code / last-byte ages) on the relay and on every
+//          terminal handshake rejection
 //   DEPENDS: M-MTPROTO, M-FAKETLS, M-LOG
 //   LINKS: M-MTPROTO
 //   ROLE: RUNTIME
@@ -15,7 +17,26 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.13.0 - handshake-death forensics: mtproto_handshake_timeout now carries
+//   LAST_CHANGE: v1.14.0 - close attribution. The relay teardown was bound to BOTH sockets'
+//                'close' with no way to tell them apart, and both 'error' handlers were empty
+//                swallows, so mtproto_close could not say which side died. Prod 15:45 showed why
+//                that matters: 14 sessions from 3 different clients, all DC2, all dying at
+//                91.3-91.9s after <600 bytes - a lifetime NO timer in this codebase owns (the
+//                idle reaper is 300s, handshake 10s), and therefore unattributable. mtproto_close
+//                now carries `reason` (client_close | upstream_close | client_error |
+//                upstream_error | idle_timeout | user_quota | unknown), `error_code` (errno only,
+//                never err.message) and `last_rx_ms`/`last_tx_ms` (age of the last byte per
+//                direction, null - not 0 - when that direction never carried app data).
+//                FIRST STAMP WINS, so a server-side decision (idle reaper, quota kick) survives
+//                the close events its own teardown causes; without that, every reap would be
+//                relabelled "the client hung up". Node emits 'error' before 'close', so an errno
+//                is recorded ahead of the close it causes. Vocabulary mirrors M-MASK's
+//                teardown(reason) so both relays filter by one field. The seven terminal
+//                handshake paths now share one rejectWith() helper (stamp, merge reason into the
+//                detail, release the pending slot, log, destroy), replacing hand-rolled
+//                releasePending/log/destroy triples that had drifted apart; mtproto_bad_dc moved
+//                its dc index from the message slot into the detail object.
+//   PREVIOUS: v1.13.0 - handshake-death forensics: mtproto_handshake_timeout now carries
 //                elapsed_ms, closed, flight_bytes and flight_records on top of bytes/phase.
 //                Prod 14:25: a burst of eleven `{"bytes":0,"phase":"tls-app"}` lines from one
 //                mobile client was ambiguous - the handshake timer is NOT cleared when the client
@@ -245,7 +266,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     }
     // Slowloris guard: cap the number of sockets still in the handshake phase.
     if (pendingHandshakes >= cfg.mtprotoPendingMax) {
-      log("mtproto_pending_cap", "DF-4", socket.remoteAddress, { pending: pendingHandshakes });
+      log("mtproto_pending_cap", "DF-4", socket.remoteAddress, { pending: pendingHandshakes, reason: "pending_cap" });
       if (metrics) metrics.inc("simpleproxy_pending_caps_total");
       socket.destroy();
       return;
@@ -265,6 +286,30 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       pendingReleased = true;
       pendingHandshakes -= 1;
       syncPending();
+    };
+
+    // Close attribution. The relay teardown is bound to BOTH sockets, so without a stamp
+    // mtproto_close cannot say which side went first - and prod showed a tight cluster of sessions
+    // (3 different clients, all DC2) dying at 91.3-91.9s after <600 bytes, a lifetime no timer in
+    // this codebase owns. FIRST STAMP WINS: a server-side decision (idle reaper, quota kick) must
+    // survive the close events its own teardown then causes, otherwise every reap would be
+    // relabelled "the client hung up". Vocabulary mirrors M-MASK's teardown(reason) so both relays
+    // can be filtered by one field.
+    let closeReason = null;
+    let closeErrorCode = null;
+    const stampClose = (reason, errorCode = null) => {
+      if (closeReason !== null) return;
+      closeReason = reason;
+      closeErrorCode = errorCode;
+    };
+    // The single terminal path of the handshake phase: stamp, merge the reason into the detail,
+    // release the pending slot, log, destroy. Replaces the hand-rolled
+    // releasePending/log/destroy triples that had drifted apart.
+    const rejectWith = (reason, event, df, target, detail, errorCode = null) => {
+      stampClose(reason, errorCode);
+      releasePending();
+      log(event, df, target, errorCode ? { ...detail, reason, error_code: errorCode } : { ...detail, reason });
+      socket.destroy();
     };
 
     const secrets = cfg.mtprotoSecrets.map((s) => Buffer.from(s, "hex"));
@@ -292,9 +337,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     const finishHandshakeAndRelay = () => {
       const parsed = parseClientHandshake(obfsHandshake.subarray(0, HANDSHAKE_LEN), secrets);
       if (!parsed) {
-        releasePending();
-        log("mtproto_auth_fail", "DF-1", socket.remoteAddress);
-        socket.destroy();
+        rejectWith("auth_fail", "mtproto_auth_fail", "DF-1", socket.remoteAddress, null);
         return;
       }
       // Per-user limits (multi-tenant): resolve the user by matched secret, enforce cap/expiry/quota.
@@ -306,13 +349,14 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         const unknownDenied =
           cfg.mtprotoUsersStrict === true && userStore.size() > 0 && user === null;
         if (unknownDenied || !userStore.admit(user)) {
-          releasePending();
           if (unknownDenied && metrics) metrics.inc("simpleproxy_user_unknown_total");
-          log(unknownDenied ? "mtproto_user_unknown" : "mtproto_user_reject", "DF-4", socket.remoteAddress, {
-            user: user ? user.user : "unknown",
-            strict: cfg.mtprotoUsersStrict === true,
-          });
-          socket.destroy();
+          rejectWith(
+            unknownDenied ? "user_unknown" : "user_reject",
+            unknownDenied ? "mtproto_user_unknown" : "mtproto_user_reject",
+            "DF-4",
+            socket.remoteAddress,
+            { user: user ? user.user : "unknown", strict: cfg.mtprotoUsersStrict === true }
+          );
           return;
         }
       }
@@ -321,9 +365,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       const resolved = resolveDc(parsed.dcIdx, { preferIpv6: cfg.mtprotoPreferIpv6, hasIpv6 });
       const candidates = Array.isArray(resolved) ? resolved : resolved ? [resolved] : [];
       if (candidates.length === 0) {
-        releasePending();
-        log("mtproto_bad_dc", "DF-1", socket.remoteAddress, parsed.dcIdx);
-        socket.destroy();
+        rejectWith("bad_dc", "mtproto_bad_dc", "DF-1", socket.remoteAddress, { dc: parsed.dcIdx });
         return;
       }
       const up = buildUpstreamHandshake(parsed);
@@ -371,6 +413,11 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
 
         let bytesIn = 0;
         let bytesOut = 0;
+        // Age of the last byte carried by each direction, stamped in the same two places as the
+        // byte counters so the two always describe the same stream. 0 = that direction never
+        // carried post-handshake app data, reported as null (NOT 0, which would read as "just now").
+        let lastRxAt = 0;
+        let lastTxAt = 0;
         const startedAt = Date.now();
         let idleTimer = null;
         let tornDown = false;
@@ -382,10 +429,14 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         const armIdle = () => {
           clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
+            // Stamp BEFORE destroying: the close events this triggers would otherwise relabel a
+            // server-side reap as a client hangup.
+            stampClose("idle_timeout");
             log("mtproto_idle_timeout", "DF-3", dc.host, dc.port, {
               dc: parsed.dcIdx,
               client: socket.remoteAddress,
               idle_ms: idleMs,
+              reason: "idle_timeout",
             });
             socket.destroy();
             upstream.destroy();
@@ -400,6 +451,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           activeConnections -= 1;
           syncActive();
           if (userStore && user) userStore.release(user);
+          const now = Date.now();
           log("mtproto_close", "DF-2", dc.host, dc.port, {
             dc: parsed.dcIdx,
             client: socket.remoteAddress,
@@ -407,7 +459,11 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             ...link,
             bytes_in: bytesIn,
             bytes_out: bytesOut,
-            duration_ms: Date.now() - startedAt,
+            duration_ms: now - startedAt,
+            reason: closeReason ?? "unknown",
+            ...(closeErrorCode ? { error_code: closeErrorCode } : {}),
+            last_rx_ms: lastRxAt === 0 ? null : now - lastRxAt,
+            last_tx_ms: lastTxAt === 0 ? null : now - lastTxAt,
           });
           socket.destroy();
           upstream.destroy();
@@ -424,13 +480,15 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         const pushAppDataToDc = (appData) => {
           if (tornDown) return;
           bytesIn += appData.length;
+          lastRxAt = Date.now();
           if (metrics) metrics.inc("simpleproxy_bytes_in_total", appData.length);
           // Per-user byte quota, mid-stream enforcement (W2-2): addBytes charges first and
           // returns false once the quota is crossed -> tear the relay down immediately
           // instead of letting an exhausted user keep transferring until TCP EOF.
           if (userStore && user && !userStore.addBytes(user, appData.length)) {
-            log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_in: bytesIn });
+            log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_in: bytesIn, reason: "user_quota" });
             if (metrics) metrics.inc("simpleproxy_quota_exceeded_total");
+            stampClose("user_quota");
             teardown();
             return;
           }
@@ -463,10 +521,12 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           upstream.on("data", (chunk) => {
             if (tornDown) return;
             bytesOut += chunk.length;
+            lastTxAt = Date.now();
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
             if (userStore && user && !userStore.addBytes(user, chunk.length)) {
-              log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut });
+              log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut, reason: "user_quota" });
               if (metrics) metrics.inc("simpleproxy_quota_exceeded_total");
+              stampClose("user_quota");
               teardown();
               return;
             }
@@ -486,10 +546,12 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           upstream.on("data", (chunk) => {
             if (tornDown) return;
             bytesOut += chunk.length;
+            lastTxAt = Date.now();
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
             if (userStore && user && !userStore.addBytes(user, chunk.length)) {
-              log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut });
+              log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut, reason: "user_quota" });
               if (metrics) metrics.inc("simpleproxy_quota_exceeded_total");
+              stampClose("user_quota");
               teardown();
               return;
             }
@@ -522,10 +584,19 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           pendingData = Buffer.alloc(0);
         }
 
-        socket.on("error", () => {});
-        upstream.on("error", () => {});
-        socket.on("close", teardown);
-        upstream.on("close", teardown);
+        // Close attribution. Node emits 'error' before 'close' for a given socket, so an errno is
+        // recorded ahead of the close it causes and the close cannot mask it. The handlers only
+        // stamp: teardown (bound to both close events) does the logging, once.
+        socket.on("error", (err) => stampClose("client_error", err.code ?? null));
+        upstream.on("error", (err) => stampClose("upstream_error", err.code ?? null));
+        socket.on("close", () => {
+          stampClose("client_close");
+          teardown();
+        });
+        upstream.on("close", () => {
+          stampClose("upstream_close");
+          teardown();
+        });
         armIdle();
       };
 
@@ -590,9 +661,15 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
               return;
             }
           }
-          releasePending(); // never entering relay
-          log("mtproto_upstream_error", "DF-1", `${dc.host}:${dc.port}`, err.code || err.message);
-          socket.destroy();
+          // Every candidate (and the one preferred retry) is unreachable: the client is dropped.
+          rejectWith(
+            "upstream_error",
+            "mtproto_upstream_error",
+            "DF-1",
+            `${dc.host}:${dc.port}`,
+            { attempts: attempt + 1 },
+            err.code ?? null
+          );
         });
       };
       tryConnect();
@@ -644,9 +721,10 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       // the handshake completes (ClientHello <= ~16 KiB, obfuscated2 hello = 64 B).
       if (buf.length > HANDSHAKE_BUF_MAX_BYTES) {
         detachForHandoff();
-        releasePending();
-        log("handshake_overflow", "DF-1", socket.remoteAddress, { kind: "handshake_buf", bytes: buf.length });
-        socket.destroy();
+        rejectWith("handshake_overflow", "handshake_overflow", "DF-1", socket.remoteAddress, {
+          kind: "handshake_buf",
+          bytes: buf.length,
+        });
         return;
       }
 
@@ -663,8 +741,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         const recordLen = buf.readUInt16BE(3);
         if (recordLen < 512) {
           detachForHandoff();
-          log("faketls_reject", "DF-1", socket.remoteAddress, { recordLen });
-          socket.destroy();
+          rejectWith("faketls_record_short", "faketls_reject", "DF-1", socket.remoteAddress, { recordLen });
           return;
         }
         // The record length may overstate what the client actually wrote (prod: a client sent the
@@ -778,9 +855,10 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // Bound buffering during the async DC connect window (up to 10s per candidate):
         // unbounded accumulation here was a remote OOM vector.
         if (pendingData.length > PENDING_DATA_MAX_BYTES) {
-          releasePending();
-          log("handshake_overflow", "DF-1", socket.remoteAddress, { kind: "pending_data", bytes: pendingData.length });
-          socket.destroy();
+          rejectWith("handshake_overflow", "handshake_overflow", "DF-1", socket.remoteAddress, {
+            kind: "pending_data",
+            bytes: pendingData.length,
+          });
         }
         return;
       }
