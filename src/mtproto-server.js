@@ -1,8 +1,8 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.12.0
+// VERSION: 1.13.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
-//            periodic [proxy][heartbeat] liveness line
+//            periodic [proxy][heartbeat] liveness line, handshake-death forensics
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay
 //   DEPENDS: M-MTPROTO, M-FAKETLS, M-LOG
 //   LINKS: M-MTPROTO
@@ -15,7 +15,18 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.12.0 - link attribution: mtproto_connect/mtproto_close now carry `secret`
+//   LAST_CHANGE: v1.13.0 - handshake-death forensics: mtproto_handshake_timeout now carries
+//                elapsed_ms, closed, flight_bytes and flight_records on top of bytes/phase.
+//                Prod 14:25: a burst of eleven `{"bytes":0,"phase":"tls-app"}` lines from one
+//                mobile client was ambiguous - the handshake timer is NOT cleared when the client
+//                hangs up, so "the client rejected our ServerHello" and "the follow-up was dropped
+//                on the path" produced byte-identical evidence. closed (socket already gone when
+//                the timer fired) + elapsed_ms (the socket's REAL lifetime, not the timeout)
+//                split those two cases, and flight_bytes/flight_records report what we actually
+//                put on the wire, which the coalesced doppelganger line cannot attribute to a
+//                single connection. splitTlsRecords moved out of the doppelganger branch so both
+//                paths report the same (framed, not per-write) record count.
+//   PREVIOUS: v1.12.0 - link attribution: mtproto_connect/mtproto_close now carry `secret`
 //                (the matched secret's INDEX, never its bytes) and `proto` (abridged |
 //                intermediate | secure). The simple and dd links share the same key material, so
 //                tls:0 alone could not tell a stalled dd link from a healthy simple one in the
@@ -268,6 +279,15 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     let obfsHandshake = Buffer.alloc(0);
     let extraAppData = Buffer.alloc(0); // app bytes received beyond the 64-byte obfs handshake
     let pendingData = Buffer.alloc(0); // client bytes arriving during the async DC connect
+    // Handshake-death forensics (mtproto_handshake_timeout detail). A silent client and a client
+    // that hung up on our ServerHello used to produce the identical `bytes:0 phase:tls-app` line,
+    // because the timer is not cleared on close - so the line cannot tell "abort after
+    // ServerHello" from "the follow-up was dropped". acceptedAt/closedMs recover the socket's real
+    // lifetime, and the flight fields report what we actually put on the wire for that attempt.
+    const acceptedAt = Date.now();
+    let closedMs = 0;
+    let flightBytes = 0;
+    let flightRecords = 0;
 
     const finishHandshakeAndRelay = () => {
       const parsed = parseClientHandshake(obfsHandshake.subarray(0, HANDSHAKE_LEN), secrets);
@@ -702,12 +722,17 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // the number reported in the doppelganger line is exactly what goes on the wire.
         const certLen = resolveFakeCertLen(profile, cfg.mtprotoFakeTlsCertLenMax ?? 0);
         const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile, validated.ciphers, certLen);
+        // Frame the flight unconditionally: the doppelganger path needs the records to pace, and
+        // both paths need the shape for the handshake-death log (a single write is not a single TLS
+        // record, so counting the framing is the only honest record count).
+        const records = splitTlsRecords(response);
+        flightBytes = response.length;
+        flightRecords = records.length;
 
         // Doppelganger: replay captured inter-arrival delays so the flight is timed like the
         // real origin, not bursty-instant. Only the handshake flight is shaped; steady-state
         // relay stays untouched. Falls back to a single write when disabled / no profile.
         if (cfg.mtprotoDoppelganger && profile && Array.isArray(profile.recordDelays) && profile.recordDelays.length > 0) {
-          const records = splitTlsRecords(response);
           const delays = profile.recordDelays;
           let sent = 0;
           const sendNext = (idx) => {
@@ -776,7 +801,18 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       // still mid-flight" (recordLen/hsLen beyond `bytes`) from "the ClientHello message is
       // complete but its record length overstates it" (the exact prod stall that resolveClientHelloEnd
       // now recovers from) without needing packet captures.
-      const detail = { bytes: buf ? buf.length : 0, phase };
+      const now = Date.now();
+      const closed = closedMs > 0 || socket.destroyed;
+      const detail = {
+        bytes: buf ? buf.length : 0,
+        phase,
+        // The socket's real lifetime, NOT the timeout: when the client hung up early this is how
+        // long it lasted, which is what separates "rejected our flight" from "still waiting".
+        elapsed_ms: (closed && closedMs > 0 ? closedMs : now) - acceptedAt,
+        closed,
+        flight_bytes: flightBytes,
+        flight_records: flightRecords,
+      };
       if (phase === "tls-hello" && detail.bytes >= 5) {
         detail.recordLen = buf.readUInt16BE(3);
         if (detail.bytes >= 9 && buf[5] === 0x01) detail.hsLen = buf.readUIntBE(6, 3);
@@ -796,6 +832,10 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     // also covers post-handshake failures where `completed` is already true (the
     // v1.3.x leak that let garbage probes exhaust mtprotoPendingMax permanently).
     socket.once("close", () => {
+      // Stamp the first close so a handshake timeout can report the socket's real lifetime
+      // (see acceptedAt). The timer itself is deliberately left armed: the timeout line is the
+      // only evidence a handshake died, so it must survive the client's own hangup.
+      if (closedMs === 0) closedMs = Date.now();
       releasePending();
     });
     processBuffer(buf);

@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.8.0
+// VERSION: 1.9.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -16,8 +16,11 @@
 //          leak, no spurious dc_fallback/upstream_error) — injectable connectImpl;
 //          A-5 periodic [proxy][heartbeat] liveness line (uptime_s + active/pending/total);
 //          config: MTPROTO_MAX_CONNECTIONS default 256 + MTPROTO_HEARTBEAT_MS parse/disable;
-//          A-6 [proxy][doppelganger] coalescing with a suppressed counter + config
-//          MTPROTO_DOPPELGANGER_LOG_MS
+//            A-6 [proxy][doppelganger] coalescing with a suppressed counter + config
+//            MTPROTO_DOPPELGANGER_LOG_MS
+//            A-10/A-11 handshake-death forensics: mtproto_handshake_timeout separates a client that
+//            hung up after ServerHello (closed=true, short elapsed_ms) from one that stayed silent
+//            (closed=false, elapsed_ms≈timeout) and reports the flight it sent
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
 //            M-PROXY
 //   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
@@ -26,7 +29,12 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.8.0 - A-9: connect/close identify the matched secret by index (s0) and the
+//   LAST_CHANGE: v1.9.0 - A-10/A-11: the post-ServerHello timeout line must separate a client that
+//               hangs up on our flight (closed=true, elapsed_ms < timeout/2) from one that stays
+//               connected and silent (closed=false, elapsed_ms spans the timeout), and
+//               flight_bytes must equal exactly the ServerHello bytes the client received;
+//               added the waitFor poll helper
+//   PREVIOUS: v1.8.0 - A-9: connect/close identify the matched secret by index (s0) and the
 //               transport (abridged for the simple link, secure for dd) — the only way to tell a
 //               stalled dd link from a working simple one in the journal
 //   PREVIOUS: v1.7.0 - A-7/A-8: a fake-TLS ClientHello whose TLS record length overstates the
@@ -57,6 +65,7 @@
 //   startEchoMaskServer - mask upstream echoing received bytes back
 //   startProxy - mux server wiring a real mtproto handler with injectable resolver/metrics
 //   awaitClose - await socket closure (or error) with a deadline
+//   waitFor - poll a condition until it holds or the deadline passes
 //   roundTripPayload - full obfuscated2 round trip through the proxy (encrypt -> echo -> decrypt)
 // END_MODULE_MAP
 
@@ -255,6 +264,16 @@ function awaitClose(socket, ms = 2000) {
     socket.once("error", done);
     setTimeout(() => resolve(false), ms);
   });
+}
+
+// Poll a condition until it holds or the deadline passes (re-checks once at the deadline).
+async function waitFor(cond, ms = 2000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return cond();
 }
 
 test("hardening: pending slots survive a burst of wrong-secret probes (C-1 leak)", async () => {
@@ -1456,6 +1475,96 @@ test("hardening: connect/close identify the matched secret and the transport (A-
     assert.equal(closes.length, 2);
     assert.deepEqual(closes.map((l) => l.detail.proto), ["secure", "abridged"]);
     for (const c of closes) assert.equal(c.detail.secret, "s0");
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: a silent post-ServerHello client is reported as still connected, with the flight we sent (A-10)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  // 4 params: mtproto_handshake_timeout logs its detail as the 4th argument.
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const HANDSHAKE_MS = 300;
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoHandshakeTimeoutMs: HANDSHAKE_MS },
+    null,
+    logCollector,
+    null
+  );
+
+  try {
+    // A valid ClientHello is answered with a ServerHello; the client then never says anything and
+    // never hangs up. "Still connected when the timer fired" is what separates this from a client
+    // that gave up on our flight (A-11) - prod showed both as the identical bytes:0 tls-app line.
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, handshake);
+    const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(hello));
+    let received = 0;
+    socket.on("data", (d) => {
+      received += d.length;
+    });
+    assert.equal(await awaitClose(socket, 3000), true, "the handshake timeout must reap it");
+
+    const evt = logs.find((l) => l.event === "mtproto_handshake_timeout");
+    assert.ok(evt, "handshake timeout must be logged");
+    assert.equal(evt.detail.phase, "tls-app");
+    assert.equal(evt.detail.closed, false, "a client that never hung up must be distinguishable from one that did");
+    assert.ok(
+      evt.detail.elapsed_ms >= HANDSHAKE_MS - 50,
+      `elapsed_ms must span the full timeout for a silent client, got ${evt.detail.elapsed_ms}`
+    );
+    assert.equal(
+      evt.detail.flight_bytes,
+      received,
+      "flight_bytes must be exactly the ServerHello bytes the client received"
+    );
+    assert.ok(evt.detail.flight_records >= 1, "the flight must be counted in TLS records");
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: a client that hangs up right after ServerHello is reported as closed, not silent (A-11)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  // 4 params: mtproto_handshake_timeout logs its detail as the 4th argument.
+  const logCollector = (event, ref, src, detail) => logs.push({ event, ref, src, detail });
+  const HANDSHAKE_MS = 600;
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoHandshakeTimeoutMs: HANDSHAKE_MS },
+    null,
+    logCollector,
+    null
+  );
+
+  try {
+    // Reads the ServerHello and immediately hangs up: the client rejected or abandoned the flight.
+    // The handshake timer is deliberately NOT cleared on close (that is the ambiguity being
+    // measured), so the line still fires - but it must now carry the socket's real lifetime.
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, handshake);
+    const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(hello));
+    socket.on("data", () => socket.end());
+    assert.equal(await awaitClose(socket, 3000), true, "the client must hang up on its own");
+
+    assert.ok(
+      await waitFor(() => logs.some((l) => l.event === "mtproto_handshake_timeout")),
+      "the stale handshake timer must still report the line"
+    );
+    const evt = logs.find((l) => l.event === "mtproto_handshake_timeout");
+    assert.equal(evt.detail.phase, "tls-app");
+    assert.equal(evt.detail.closed, true, "a client that hung up must not be logged as silent");
+    assert.ok(
+      evt.detail.elapsed_ms < HANDSHAKE_MS / 2,
+      `elapsed_ms must be the socket's real lifetime, not the timeout; got ${evt.detail.elapsed_ms}`
+    );
   } finally {
     server.closeAllConnections?.();
     fakeDc.closeAllConnections?.();
