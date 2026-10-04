@@ -1,11 +1,11 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.14.0
+// VERSION: 1.15.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
 //            periodic [proxy][heartbeat] liveness line, handshake-death and close-death forensics
 //   SCOPE: per-connection handshake validation (obfuscated2 / fake-TLS), DC upstream, bidirectional relay,
-//          close attribution (reason / error_code / last-byte ages) on the relay and on every
-//          terminal handshake rejection
+//          close attribution (reason / error_code / last-byte ages / handshake progress) on the relay
+//          and on every terminal handshake rejection
 //   DEPENDS: M-MTPROTO, M-FAKETLS, M-LOG
 //   LINKS: M-MTPROTO
 //   ROLE: RUNTIME
@@ -17,7 +17,28 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.14.0 - close attribution. The relay teardown was bound to BOTH sockets'
+//   LAST_CHANGE: v1.15.0 - handshake-progress attribution. v1.14.0 named WHICH side closed, and
+//                production immediately proved that was necessary but not sufficient: over a
+//                9-minute window at uptime 6660-7200, ~31 of ~58 closes shared one signature - the
+//                DC sent its last byte within ~250ms of session start, both directions then went
+//                silent, and the DC closed with a clean FIN ~91.4s later (mean 91.42s, sd ~212ms
+//                over 31 independent connections from 2 clients: a deterministic DC-side timer,
+//                not jitter). Up from ~8% of sessions earlier the same day to ~53%. Byte counts
+//                could not separate that from a healthy session, because BOTH can move the same
+//                few hundred bytes, and the log never recorded whether the client ever ANSWERED
+//                the DC's first reply. mtproto_close now carries `dc_replies`,
+//                `first_dc_reply_ms` (null, not 0, when the DC never spoke) and
+//                `client_sends_after_first_dc_reply`. The pair discriminates the two live
+//                hypotheses: client_sends_after_first_dc_reply == 0 with dc_replies >= 1 puts the
+//                break on the CLIENT leg (packet loss, or the client rejected the reply), while a
+//                non-zero count means the DC is refusing what we forward - which would be ours.
+//                Counts are app-data DELIVERIES, not MTProto messages: neither TCP nor the fake-TLS
+//                record layer is message-aligned, so one message may count once or split across
+//                several. Same null-vs-0 discipline as last_rx_ms/last_tx_ms, and the same
+//                backwards-looking semantics: every *_ms field is an age measured AT TEARDOWN, not
+//                a session offset - reading first_dc_reply_ms as "the reply came 91s in" inverts
+//                the meaning.
+//   PREVIOUS: v1.14.0 - close attribution. The relay teardown was bound to BOTH sockets'
 //                'close' with no way to tell them apart, and both 'error' handlers were empty
 //                swallows, so mtproto_close could not say which side died. Prod 15:45 showed why
 //                that matters: 14 sessions from 3 different clients, all DC2, all dying at
@@ -418,6 +439,18 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // carried post-handshake app data, reported as null (NOT 0, which would read as "just now").
         let lastRxAt = 0;
         let lastTxAt = 0;
+        // Handshake PROGRESS, as opposed to byte volume. A stalled MTProto handshake and a healthy
+        // session can move identical byte counts, so byte counters alone cannot tell them apart:
+        // production showed sessions where the DC replied once and then both directions went silent
+        // for ~91.4s before the DC closed, and nothing in the line said whether the client had ever
+        // answered that reply. dcReplies + clientSendsAfterFirstDcReply are the discriminating pair -
+        // zero on the latter with a non-zero former means the break is on the client leg (loss or
+        // client-side rejection), non-zero means the DC rejected what we forwarded, which is ours.
+        // Counts are app-data DELIVERIES, not MTProto messages: neither TCP nor the fake-TLS record
+        // layer is message-aligned, so a single message may be counted once or split across several.
+        let dcReplies = 0;
+        let firstDcReplyAt = 0;
+        let clientSendsAfterFirstDcReply = 0;
         const startedAt = Date.now();
         let idleTimer = null;
         let tornDown = false;
@@ -464,6 +497,9 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             ...(closeErrorCode ? { error_code: closeErrorCode } : {}),
             last_rx_ms: lastRxAt === 0 ? null : now - lastRxAt,
             last_tx_ms: lastTxAt === 0 ? null : now - lastTxAt,
+            dc_replies: dcReplies,
+            first_dc_reply_ms: firstDcReplyAt === 0 ? null : now - firstDcReplyAt,
+            client_sends_after_first_dc_reply: clientSendsAfterFirstDcReply,
           });
           socket.destroy();
           upstream.destroy();
@@ -481,6 +517,9 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           if (tornDown) return;
           bytesIn += appData.length;
           lastRxAt = Date.now();
+          // Counted only once the DC has spoken: the client's opening request is not a reply, and
+          // the buffered flush below runs before any DC data can have arrived.
+          if (firstDcReplyAt !== 0) clientSendsAfterFirstDcReply += 1;
           if (metrics) metrics.inc("simpleproxy_bytes_in_total", appData.length);
           // Per-user byte quota, mid-stream enforcement (W2-2): addBytes charges first and
           // returns false once the quota is crossed -> tear the relay down immediately
@@ -522,6 +561,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             if (tornDown) return;
             bytesOut += chunk.length;
             lastTxAt = Date.now();
+            dcReplies += 1;
+            if (firstDcReplyAt === 0) firstDcReplyAt = Date.now();
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
             if (userStore && user && !userStore.addBytes(user, chunk.length)) {
               log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut, reason: "user_quota" });
@@ -547,6 +588,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             if (tornDown) return;
             bytesOut += chunk.length;
             lastTxAt = Date.now();
+            dcReplies += 1;
+            if (firstDcReplyAt === 0) firstDcReplyAt = Date.now();
             if (metrics) metrics.inc("simpleproxy_bytes_out_total", chunk.length);
             if (userStore && user && !userStore.addBytes(user, chunk.length)) {
               log("mtproto_quota_exceeded", "DF-USER", dc.host, dc.port, { user: user.user, bytes_out: bytesOut, reason: "user_quota" });

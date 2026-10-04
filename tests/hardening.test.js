@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.10.0
+// VERSION: 1.11.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -21,11 +21,14 @@
 //            A-10/A-11 handshake-death forensics: mtproto_handshake_timeout separates a client that
 //            hung up after ServerHello (closed=true, short elapsed_ms) from one that stayed silent
 //            (closed=false, elapsed_ms≈timeout) and reports the flight it sent
-//            B-1..B-5 close attribution: mtproto_close names which side died (client_close vs
+//            B-1..B-6 close attribution: mtproto_close names which side died (client_close vs
 //            upstream_close vs upstream_error+errno), ages the last byte per direction
 //            (last_rx_ms/last_tx_ms, null when a direction never carried app data), and keeps a
 //            server-side decision (idle_timeout, user_quota) from being relabelled client_close
 //            B-6 every terminal handshake rejection carries a `reason`
+//            B-7..B-9 handshake-progress attribution: mtproto_close reports dc_replies,
+//            first_dc_reply_ms and client_sends_after_first_dc_reply, so a stalled handshake
+//            (DC answered once, client never came back) is distinguishable from a healthy one
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER, M-MASK, M-METRICS, M-CONFIG, M-USER-STORE,
 //            M-PROXY
 //   LINKS: V-M-MTPROTO-SERVER, V-M-MASK, V-M-CONFIG, V-M-USER-STORE, V-M-PROXY
@@ -34,7 +37,18 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.10.0 - B-1..B-6: mtproto_close must say WHICH side died (reason), with the
+//   LAST_CHANGE: v1.11.0 - B-7..B-9: byte counts cannot separate a stalled MTProto handshake from
+//               a healthy one, because both can move the same few hundred bytes, and production
+//               (~53% of closes in one 9-minute window, DC silent then clean FIN ~91.4s later)
+//               gave no way to tell whether the client ever ANSWERED the DC's first reply.
+//               mtproto_close now carries dc_replies, first_dc_reply_ms (null - never 0 - when the
+//               DC never spoke) and client_sends_after_first_dc_reply. B-7 pins the production
+//               signature (dc_replies >= 1, client_sends_after_first_dc_reply === 0), B-8 pins the
+//               mirror image so the counter cannot pass while hardcoded to 0, B-9 pins the
+//               no-reply case and its null. Fixture lesson: a test client MUST drain what it
+//               receives (socket.resume()) - a socket with unread bytes in its receive buffer never
+//               surfaces 'close', so awaitClose times out on a relay that tore down correctly.
+//   PREVIOUS: v1.10.0 - B-1..B-6: mtproto_close must say WHICH side died (reason), with the
 //               errno when a socket errored (error_code) and the age of the last byte in each
 //               direction (last_rx_ms/last_tx_ms, null - never 0 - for a direction that carried
 //               no app data); a server-side reap (idle_timeout) and a quota kick (user_quota)
@@ -1925,4 +1939,169 @@ test("hardening: every handshake-phase rejection names its reason (B-6)", async 
     "faketls_reject",
     "faketls_record_short"
   );
+});
+
+test("hardening: a stalled handshake shows the DC answered and the client never came back (B-7)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  // Reproduces the production 91.4s signature exactly: the DC answers ONCE, then both directions go
+  // silent until the DC gives up. byte counts alone cannot tell this apart from a healthy session -
+  // only handshake PROGRESS can, which is what these fields exist to record.
+  const stallingDc = net.createServer((s) => {
+    s.once("data", () => {
+      s.write(randomBytes(64)); // the one and only reply (a real DC replies to req_pq_multi)
+      // then read and discard forever: no further DC traffic, no client traffic either
+      s.on("data", () => {});
+    });
+    setTimeout(() => s.end(), 400);
+  });
+  await new Promise((r) => stallingDc.listen(0, "127.0.0.1", r));
+  const dcPort = stallingDc.address().port;
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    null,
+    logCollector,
+    null,
+    () => ({ host: "127.0.0.1", port: dcPort })
+  );
+
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(addr.port, "127.0.0.1", () => {
+      socket.write(Buffer.concat([handshake, randomBytes(64)]));
+    });
+    // The client MUST drain what it receives: a socket with unread bytes in its receive buffer does
+    // not surface 'close', so awaitClose would time out on a relay that tore down correctly.
+    socket.resume();
+    socket.on("error", () => {});
+    assert.equal(await awaitClose(socket, 3000), true, "the DC FIN must tear the client down");
+
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "must log a close");
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.equal(evt.detail.reason, "upstream_close", "the DC hung up first");
+    assert.ok(evt.detail.dc_replies >= 1, `the DC answered, so dc_replies >= 1; got ${evt.detail.dc_replies}`);
+    assert.equal(
+      typeof evt.detail.first_dc_reply_ms,
+      "number",
+      "a DC that answered has a first-reply age"
+    );
+    assert.ok(evt.detail.first_dc_reply_ms >= 0, "the age cannot be negative");
+    assert.equal(
+      evt.detail.client_sends_after_first_dc_reply,
+      0,
+      "this is the whole point: the client never sent a second message"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+    stallingDc.close();
+  }
+});
+
+test("hardening: a client that keeps talking after the DC's first reply is counted (B-8)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  // The mirror image of B-7: the counter must actually climb, otherwise B-7 would pass on a
+  // field that is hardcoded to 0 and the whole diagnostic would be worthless.
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    null,
+    logCollector,
+    null
+  );
+
+  try {
+    await new Promise((resolve, reject) => {
+      const { handshake, stream } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(Buffer.concat([handshake, stream.encrypt(Buffer.from("first"))]));
+      });
+      let sendsAfterReply = 0;
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error("two-round-trip timeout"));
+      }, 3000);
+      socket.on("data", () => {
+        // One echo seen. A second client->DC delivery now happens AFTER the DC's first reply.
+        if (sendsAfterReply >= 1) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve();
+          return;
+        }
+        sendsAfterReply += 1;
+        socket.write(stream.encrypt(Buffer.from("second")));
+      });
+      socket.on("error", (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
+
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "must log a close");
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.ok(evt.detail.dc_replies >= 2, `the echo DC replied twice; got ${evt.detail.dc_replies}`);
+    assert.ok(
+      evt.detail.client_sends_after_first_dc_reply >= 1,
+      `the client spoke again after the reply; got ${evt.detail.client_sends_after_first_dc_reply}`
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+test("hardening: a DC that never answers leaves first_dc_reply_ms null, not 0 (B-9)", async () => {
+  const secret = randomBytes(16);
+  const logs = [];
+  const logCollector = (event, ref, src, data, detail) => logs.push({ event, ref, src, data, detail });
+  // Same null-vs-0 discipline as last_rx_ms/last_tx_ms: with no reply there is no age to report, and
+  // 0 would read as "answered instantly". client_sends_after_first_dc_reply must also be 0 - with no
+  // first reply there is nothing to be "after", so the field describes a stall we cannot attribute.
+  const muteDc = net.createServer((s) => {
+    s.on("data", () => {});
+    setTimeout(() => s.end(), 120);
+  });
+  await new Promise((r) => muteDc.listen(0, "127.0.0.1", r));
+  const dcPort = muteDc.address().port;
+  const { server, fakeDc, addr } = await startTenantProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    null,
+    logCollector,
+    null,
+    () => ({ host: "127.0.0.1", port: dcPort })
+  );
+
+  try {
+    const { handshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const socket = net.connect(addr.port, "127.0.0.1", () => {
+      socket.write(Buffer.concat([handshake, randomBytes(64)]));
+    });
+    socket.resume(); // drain, so 'close' is observable (see B-7)
+    socket.on("error", () => {});
+    assert.equal(await awaitClose(socket, 3000), true, "the DC FIN must tear the client down");
+
+    assert.ok(await waitFor(() => logs.some((l) => l.event === "mtproto_close")), "must log a close");
+    const evt = logs.find((l) => l.event === "mtproto_close");
+    assert.equal(evt.detail.reason, "upstream_close", "the DC hung up first");
+    assert.equal(evt.detail.dc_replies, 0, "a mute DC never replied");
+    assert.equal(evt.detail.first_dc_reply_ms, null, "no reply means no age, and 0 would lie");
+    assert.equal(
+      evt.detail.client_sends_after_first_dc_reply,
+      0,
+      "nothing can follow a reply that never came"
+    );
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+    muteDc.close();
+  }
 });
