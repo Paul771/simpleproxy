@@ -789,9 +789,11 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         }
         // The record length may overstate what the client actually wrote (prod: a client sent the
         // same 1298 bytes on every attempt and stalled in phase="tls-hello" until the timeout).
-        // resolveClientHelloEnd trusts the ClientHello's own handshake-message length in that
-        // case, and returns 0 while the message itself is still incomplete — so a genuinely
-        // fragmented hello keeps waiting instead of being answered from partial bytes.
+        // resolveClientHelloEnd handles that by trusting the handshake-message length, and — when
+        // the record AND handshake lengths overstate together — by falling back to the ClientHello's
+        // own structure. It returns 0 only while that structure is still arriving, so a genuinely
+        // fragmented hello keeps waiting instead of being answered from partial bytes. Either way
+        // the answer is gated on validateClientHello, so a wrong extent cannot get through.
         const recordEnd = 5 + recordLen;
         let helloEnd = resolveClientHelloEnd(buf);
         if (helloEnd === 0) return;

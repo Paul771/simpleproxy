@@ -1,8 +1,9 @@
 // FILE: src/faketls.js
-// VERSION: 1.4.0
+// VERSION: 1.5.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
-//   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers
+//   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers,
+//          ClientHello extent resolution (declared lengths, else ClientHello structure)
 //   DEPENDS: node:crypto
 //   LINKS: M-FAKETLS
 //   ROLE: RUNTIME
@@ -19,12 +20,30 @@
 //   buildTlsAlert - build a TLS alert record (used for reject_handshake mode)
 //   splitTlsRecords - split a byte stream into individual TLS records (doppelganger timing replay)
 //   resolveClientHelloEnd - resolve where the ClientHello ends (0 = need more bytes), trusting the
-//                           handshake-message length over an overstated TLS record length
+//                           handshake-message length over an overstated TLS record length, then the
+//                           ClientHello's own structure when both declared lengths overstate
+//   resolveClientHelloStructuralEnd - resolve the ClientHello end by walking its TLS structure,
+//                           ignoring the declared record/handshake length fields entirely
 //   resolveFakeCertLen - fake-certificate length for the server flight (captured size, capped)
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.4.0 - resolveFakeCertLen(profile, cap): the fake certificate length is
+//   LAST_CHANGE: v1.5.0 - resolveClientHelloStructuralEnd: the v1.3.0 fallback only covered a TLS
+//                record length that overstated while the handshake-message length stayed
+//                accurate. Production showed the harder variant: 1298 bytes arrived while
+//                recordLen AND hsLen agreed with each other (recordEnd == messageEnd) and both
+//                described a ~1789-byte hello, so neither declared extent was reachable, the
+//                client was never answered (flight_bytes: 0 on all 22 attempts in a 110-minute
+//                window, both directions silent, every retry doomed), and 85% of that window's
+//                connection attempts died this way. resolveClientHelloEnd now falls back to the
+//                ClientHello's own length-prefixed structure — session_id, cipher_suites,
+//                               compression_methods, extensions — whose fields describe what the
+//                               client really wrote. Safe because acceptance stays gated on the
+//                               HMAC in validateClientHello: the extent is confirmed by the client's
+//                               own signature over exactly those bytes, never guessed, so a wrong
+//                               walk cannot validate and no truncated hello can be answered. An
+//                               extensions block that has not fully landed still returns 0.
+//   PREVIOUS: v1.4.0 - resolveFakeCertLen(profile, cap): the fake certificate length is
 //                resolved once, by the caller, so MTPROTO_FAKE_TLS_CERT_LEN_MAX can shrink the
 //                ServerHello flight to fit a path MTU (a mobile link whose MTU is below the
 //                captured 4091-byte certificate loses the flight tail and the client hangs in
@@ -173,7 +192,7 @@ export function validateClientHello(handshake, secrets) {
 //   INPUTS: { buf: Buffer - bytes received from the client, starting at 0x16 0x03 0x01 }
 //   OUTPUTS: { number - end offset of the ClientHello, or 0 when more bytes are needed }
 //   SIDE_EFFECTS: none
-//   LINKS: M-FAKETLS, M-MTPROTO-SERVER
+//   LINKS: M-FAKETLS, M-MTPROTO-SERVER, fn-resolveClientHelloStructuralEnd
 // END_CONTRACT: resolveClientHelloEnd
 export function resolveClientHelloEnd(buf) {
   // START_BLOCK_CLIENT_HELLO_EXTENT
@@ -189,9 +208,56 @@ export function resolveClientHelloEnd(buf) {
   // ServerHello. An incomplete message still returns 0, so a genuinely fragmented hello keeps
   // waiting instead of being answered from partial bytes.
   const messageEnd = 9 + buf.readUIntBE(6, 3);
-  if (messageEnd < 5 + CLIENT_HELLO_MIN_RECORD) return buf.length >= recordEnd ? recordEnd : 0;
-  return buf.length >= messageEnd ? messageEnd : 0;
+  if (messageEnd < 5 + CLIENT_HELLO_MIN_RECORD) {
+    return buf.length >= recordEnd ? recordEnd : resolveClientHelloStructuralEnd(buf);
+  }
+  if (buf.length >= messageEnd) return messageEnd;
+  // Both declared lengths can promise more than the client ever writes, and agree with each other
+  // while doing it (prod: 1298 bytes received against a record AND handshake length that both
+  // described ~1789 bytes, so neither declared extent was reachable). Trusting the structure
+  // recovers those clients; the earlier fallback above only covered a record length that
+  // overstated while the handshake length stayed accurate, which left these unanswered until the
+  // handshake timeout (flight_bytes: 0 on every attempt, no ServerHello ever sent).
+  const structural = resolveClientHelloStructuralEnd(buf);
+  if (structural !== 0) return structural;
+  return 0;
   // END_BLOCK_CLIENT_HELLO_EXTENT
+}
+
+// START_CONTRACT: resolveClientHelloStructuralEnd
+//   PURPOSE: Resolve a ClientHello's true end by walking its own TLS structure instead of
+//            trusting the declared record/handshake length fields
+//   INPUTS: { buf: Buffer - bytes received from the client, starting at 0x16 0x03 0x01 }
+//   OUTPUTS: { number - structural end offset, or 0 when the structure is unreadable, still
+//              arriving, or too short to be a real ClientHello }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, fn-resolveClientHelloEnd, fn-validateClientHello
+// END_CONTRACT: resolveClientHelloStructuralEnd
+export function resolveClientHelloStructuralEnd(buf) {
+  // START_BLOCK_CLIENT_HELLO_STRUCTURE
+  // Layout after the 9-byte prefix (record header + handshake type + 3-byte handshake length):
+  // client_version(2) random(32) session_id_len(1) session_id(N) cipher_suites_len(2) suites(2N)
+  // compression_len(1) compression(M) extensions_len(2) extensions(...). Every field is length-
+  // prefixed, so the true end is reachable without believing any declared total — which is the
+  // whole point: these clients inflate the totals and then send only what they really wrote.
+  if (buf.length < 5) return 0;
+  if (buf[0] !== 0x16 || buf[1] !== 0x03 || buf[2] !== 0x01) return 0;
+  if (buf.length < 9 || buf[5] !== 0x01) return 0;
+  let p = SESSION_ID_POS + buf[SESSION_ID_LEN_POS];
+  if (p + 2 > buf.length) return 0;
+  const csLen = buf.readUInt16BE(p);
+  if (csLen % 2 !== 0) return 0;
+  p += 2 + csLen;
+  if (p + 1 > buf.length) return 0;
+  p += 1 + buf[p];
+  if (p + 2 > buf.length) return 0;
+  const extLen = buf.readUInt16BE(p);
+  const end = p + 2 + extLen;
+  // Still arriving: the extensions block has not fully landed. Keep waiting.
+  if (end > buf.length) return 0;
+  if (end < 5 + CLIENT_HELLO_MIN_RECORD) return 0;
+  return end;
+  // END_BLOCK_CLIENT_HELLO_STRUCTURE
 }
 
 // START_CONTRACT: resolveFakeCertLen

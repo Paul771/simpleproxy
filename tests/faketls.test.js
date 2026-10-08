@@ -1,13 +1,32 @@
 // FILE: tests/faketls.test.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-FAKETLS ClientHello validation, ServerHello build, TLS record framing
-//   SCOPE: HMAC digest round-trip, record reader/writer, wrong-secret rejection
+//   SCOPE: HMAC digest round-trip, record reader/writer, wrong-secret rejection, ClientHello
+//          extent resolution when declared lengths overstate what the client wrote
 //   DEPENDS: M-FAKETLS
 //   LINKS: V-M-FAKETLS
 //   ROLE: TEST
 //   MAP_MODE: LOCALS
 // END_MODULE_CONTRACT
+//
+// START_MODULE_MAP
+//   buildClientHello - fake-TLS ClientHello fixture; recordLenPad/hsLenPad inflate the declared
+//                      length fields without writing those bytes (the prod signature uses both)
+//   hmacSha256 - local HMAC helper mirroring the client's digest computation
+//   fakeCertLen - last TLS record of a flight is the fake certificate
+// END_MODULE_MAP
+//
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.3.0 - pin the structural ClientHello fallback. Three cases: both declared
+//                lengths overstate in agreement (recordEnd == messageEnd, the prod signature that
+//                v1.3.0 missed) and must resolve to the structural end; a hello whose extensions
+//                block has not fully landed must still return 0 rather than be answered from
+//                truncated bytes; and the HMAC must accept the structural extent while rejecting a
+//                one-byte-short guess and a wrong secret — the safety property that makes the
+//                fallback a confirmation rather than a guess.
+//   PREVIOUS: v1.2.0 - certLenCap coverage for the bounded server flight.
+// END_CHANGE_SUMMARY
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -33,10 +52,12 @@ function hmacSha256(key, msg) {
 }
 
 // Emulate a client building a fake-TLS ClientHello with the HMAC digest.
-// recordLenPad inflates the TLS record-length field WITHOUT writing those bytes: it models a
-// client whose length field overstates the message it actually sends (the digest is computed
-// over the inflated buffer, exactly as such a client would sign what it wrote).
-function buildClientHello(secret, offeredCiphers = [0x13, 0x01], recordLenPad = 0) {
+// recordLenPad / hsLenPad inflate the declared length fields WITHOUT writing those bytes: they model
+// a client whose length fields overstate the message it actually sends (the digest is computed
+// over the inflated buffer, exactly as such a client would sign what it wrote). Passing the SAME
+// pad to both reproduces the production signature, where the two declared extents agree with each
+// other (recordEnd == messageEnd) yet both promise ~460 bytes more than the client ever delivers.
+function buildClientHello(secret, offeredCiphers = [0x13, 0x01], recordLenPad = 0, hsLenPad = 0) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
@@ -67,7 +88,7 @@ function buildClientHello(secret, offeredCiphers = [0x13, 0x01], recordLenPad = 
 
   // Handshake message: type(1) + length(3) + inner
   const hsLenBuf = Buffer.alloc(3);
-  hsLenBuf.writeUIntBE(inner.length, 0, 3);
+  hsLenBuf.writeUIntBE(inner.length + hsLenPad, 0, 3);
   const handshakeMsg = Buffer.concat([Buffer.from([0x01]), hsLenBuf, inner]);
 
   // TLS record header: 0x16 0x03 0x01 + u16(recordLen) + handshakeMsg
@@ -391,6 +412,45 @@ test("resolveClientHelloEnd: non-ClientHello or too-short buffers need more byte
   const notAHello = Buffer.from(hello);
   notAHello[5] = 0x02; // ServerHello: the handshake framing cannot be trusted
   assert.equal(resolveClientHelloEnd(notAHello.subarray(0, 200)), 0);
+});
+
+// --- ClientHello extent: BOTH declared lengths can overstate what the client wrote (prod stall) ---
+// Production signature: 1298 bytes arrived, recordLen/hsLen agreed with each other but described a
+// ~1789-byte hello, so neither declared extent was reachable. The previous fix only covered a
+// record length that overstated while the handshake length stayed accurate, so these clients were
+// never answered at all and sat until the handshake timeout (flight_bytes: 0 on every attempt).
+test("resolveClientHelloEnd: resolves structurally when record AND handshake lengths both overstate", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 480, 480);
+  const recordLen = hello.readUInt16BE(3);
+  const hsLen = hello.readUIntBE(6, 3);
+  assert.equal(5 + recordLen, 9 + hsLen, "fixture must keep the two declared extents in agreement");
+  assert.ok(5 + recordLen > hello.length, "fixture must model a record longer than what arrived");
+  assert.equal(resolveClientHelloEnd(hello), hello.length, "the structural extent is the real end");
+});
+
+test("resolveClientHelloEnd: a structurally incomplete hello still waits for more bytes", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 480, 480);
+  assert.equal(
+    resolveClientHelloEnd(hello.subarray(0, hello.length - 1)),
+    0,
+    "one byte short of the extensions end must still wait, not be answered from a truncated hello"
+  );
+});
+
+// The safety property that makes the structural fallback acceptable: acceptance stays gated on the
+// HMAC, so the extent is CONFIRMED rather than guessed. A wrong guess cannot validate.
+test("validateClientHello: the structural extent is exactly what the HMAC covers", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 480, 480);
+  assert.ok(validateClientHello(hello, [secret]), "the true extent must validate");
+  assert.equal(
+    validateClientHello(hello.subarray(0, hello.length - 1), [secret]),
+    null,
+    "a one-byte-short guess must not validate"
+  );
+  assert.equal(validateClientHello(hello, [randomBytes(16)]), null, "wrong secret still rejected");
 });
 
 // --- certLenCap: keep the server flight under a small path MTU ---

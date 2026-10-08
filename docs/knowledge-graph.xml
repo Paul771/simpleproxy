@@ -106,7 +106,7 @@
     </M-MTPROTO-SERVER>
 
     <M-FAKETLS NAME="FakeTLS" TYPE="CORE_LOGIC" STATUS="implemented">
-      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN (mirror профиля: при alpnKnown=true и отсутствии ALPN у origin — расширение опускается), TLS-record framing, SNI-парсинг, TLS-alert, resolveClientHelloEnd (граница ClientHello по длине handshake-сообщения — длина TLS-записи не авторитетна и может завышаться клиентом), resolveFakeCertLen (размер фейкового сертификата флайта с учётом MTPROTO_FAKE_TLS_CERT_LEN_MAX — усечение под MTU мобильного пути)</purpose>
+      <purpose>Fake-TLS (ee-secret) handshake: HMAC-валидация ClientHello, ServerHello с ALPN (mirror профиля: при alpnKnown=true и отсутствии ALPN у origin — расширение опускается), TLS-record framing, SNI-парсинг, TLS-alert, resolveClientHelloEnd (граница ClientHello по длине handshake-сообщения — длина TLS-записи не авторитетна и может завышаться клиентом), resolveClientHelloStructuralEnd (граница по собственной структуре ClientHello — session_id/cipher_suites/compression_methods/extensions — когда завышены ОБА объявленных поля и согласуются между собой: prod-подпись 1298 байт против recordEnd==messageEnd ~1789, 85% попыток в окне не получали ServerHello вовсе; приём остаётся гейтом на HMAC, поэтому extent подтверждается подписью клиента, а не угадывается, и обрезанный hello обслужить нельзя), resolveFakeCertLen (размер фейкового сертификата флайта с учётом MTPROTO_FAKE_TLS_CERT_LEN_MAX — усечение под MTU мобильного пути)</purpose>
       <path>src/faketls.js</path>
       <depends>node:crypto</depends>
       <verification-ref>V-M-FAKETLS</verification-ref>
@@ -118,7 +118,8 @@
         <fn-extractSni PURPOSE="Распарсить SNI hostname из ClientHello (null если нет)" />
         <fn-buildTlsAlert PURPOSE="Построить fatal TLS alert (reject_handshake)" />
         <fn-buildAlpnExtension PURPOSE="Построить ALPN-расширение для ServerHello" />
-        <fn-resolveClientHelloEnd PURPOSE="Определить конец ClientHello (0 = ждать ещё байты): длина handshake-сообщения приоритетнее завышенной длины TLS-записи" />
+        <fn-resolveClientHelloEnd PURPOSE="Определить конец ClientHello (0 = ждать ещё байты): длина handshake-сообщения приоритетнее завышенной длины TLS-записи, затем структурная граница, если завышены оба поля" />
+        <fn-resolveClientHelloStructuralEnd PURPOSE="Определить конец ClientHello по его собственной структуре (все поля с length-префиксом), игнорируя заявленные длины; 0 пока extensions-блок не доехал" />
         <fn-resolveFakeCertLen PURPOSE="Размер фейкового сертификата в ServerHello-флайте: размер из профиля, усечённый cap'ом (MTPROTO_FAKE_TLS_CERT_LEN_MAX)" />
       </annotations>
     </M-FAKETLS>

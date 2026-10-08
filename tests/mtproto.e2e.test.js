@@ -1,13 +1,23 @@
 // FILE: tests/mtproto.e2e.test.js
-// VERSION: 1.0.0
+// VERSION: 1.1.0
 // START_MODULE_CONTRACT
 //   PURPOSE: End-to-end MTProto flow: client handshake -> proxy -> fake DC, data round-trip
-//   SCOPE: full obfuscated2 handshake over real sockets, relay integrity
+//   SCOPE: full obfuscated2 handshake over real sockets, relay integrity, fake-TLS ClientHello
+//          whose declared lengths overstate what the client actually sends
 //   DEPENDS: M-MTPROTO, M-MUX, M-MTPROTO-SERVER
 //   LINKS: V-M-MTPROTO
 //   ROLE: TEST
 //   MAP_MODE: LOCALS
 // END_MODULE_CONTRACT
+//
+// START_CHANGE_SUMMARY
+//   LAST_CHANGE: v1.1.0 - buildFakeTlsClientHello gained recordLenPad/hsLenPad so the fake-TLS
+//                ClientHello can overstate its declared lengths without writing those bytes, and a
+//                new e2e drives that end to end: the proxy must still answer with a ServerHello and
+//                relay the payload. RED reproduced the production line verbatim (bytes:702,
+//                phase=tls-hello, recordLen:1080, hsLen:1076, flight_bytes:0) — 85% of a real
+//                110-minute window died exactly this way, unanswered until the handshake timeout.
+// END_CHANGE_SUMMARY
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -242,7 +252,7 @@ function hmacSha256(key, msg) {
 
 // Build a fake-TLS ClientHello carrying the obfuscated2 handshake in the TLS random field's
 // successor: the 64-byte obfs handshake is sent as the first TLS application-data record.
-function buildFakeTlsClientHello(secret, obfsHandshake) {
+function buildFakeTlsClientHello(secret, obfsHandshake, recordLenPad = 0, hsLenPad = 0) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
@@ -267,10 +277,10 @@ function buildFakeTlsClientHello(secret, obfsHandshake) {
     extensions,
   ]);
   const hsLenBuf = Buffer.alloc(3);
-  hsLenBuf.writeUIntBE(inner.length, 0, 3);
+  hsLenBuf.writeUIntBE(inner.length + hsLenPad, 0, 3);
   const handshakeMsg = Buffer.concat([Buffer.from([0x01]), hsLenBuf, inner]);
   const recordLenBuf = Buffer.alloc(2);
-  recordLenBuf.writeUInt16BE(handshakeMsg.length, 0);
+  recordLenBuf.writeUInt16BE(handshakeMsg.length + recordLenPad, 0);
   let hello = Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), recordLenBuf, handshakeMsg]);
 
   const msg = Buffer.concat([
@@ -341,6 +351,92 @@ test("e2e: fake-TLS (ee) handshake -> proxy -> fake DC, data round-trips", async
             rawBuf = rawBuf.subarray(5 + recLen);
             if (recType === 0x17) {
               // First 0x17 record is the fake-cert app-data; response fully consumed.
+              phase = "app-data";
+              tlsIn = createTlsRecordReader();
+              break;
+            }
+          }
+        }
+        if (phase === "app-data" && rawBuf.length > 0) {
+          for (const appData of tlsIn.feed(rawBuf)) {
+            appBuf = Buffer.concat([appBuf, appData]);
+            if (appBuf.length >= payload.length) {
+              clearTimeout(timer);
+              socket.destroy();
+              resolve(clientDec.decrypt(appBuf).toString());
+              return;
+            }
+          }
+          rawBuf = Buffer.alloc(0);
+        }
+      });
+      socket.on("error", reject);
+    });
+
+    assert.equal(result, payload);
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+// Production stall: the client's record AND handshake length fields both overstated what it sent,
+// in agreement with each other (recordEnd == messageEnd), so neither declared extent was reachable.
+// The proxy must still answer with a ServerHello from the structurally-resolved ClientHello instead
+// of leaving the client waiting for a handshake timeout (prod: flight_bytes: 0 on every attempt).
+test("e2e: fake-TLS handshake completes when both declared lengths overstate the ClientHello", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const { server, addr } = await startProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    () => ({ host: "127.0.0.1", port: dcAddr.port })
+  );
+
+  try {
+    const { handshake: obfsHandshake, stream, encKey, encIv } = buildClientHandshake(
+      secret,
+      PROTO_TAG_ABRIDGED,
+      1
+    );
+    // Same pad in both fields reproduces the prod signature.
+    const { hello: tlsHello } = buildFakeTlsClientHello(secret, obfsHandshake, 480, 480);
+    assert.equal(
+      5 + tlsHello.readUInt16BE(3),
+      9 + tlsHello.readUIntBE(6, 3),
+      "fixture must keep the declared extents in agreement"
+    );
+    assert.ok(5 + tlsHello.readUInt16BE(3) > tlsHello.length, "record must promise more than arrived");
+
+    const payload = "inflated-length-payload";
+    const sent = stream.encrypt(Buffer.from(payload));
+    const clientDec = createAesCtr(encKey, encIv);
+
+    const result = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => {
+        socket.write(
+          Buffer.concat([tlsHello, wrapTlsRecord(obfsHandshake), wrapTlsRecord(sent)])
+        );
+      });
+      let rawBuf = Buffer.alloc(0);
+      let phase = "consume-response";
+      let tlsIn = null;
+      let appBuf = Buffer.alloc(0);
+      const timer = setTimeout(
+        () => reject(new Error(`inflated-length timeout, phase=${phase} got: ${appBuf.toString("hex")}`)),
+        3000
+      );
+      socket.on("data", (d) => {
+        rawBuf = Buffer.concat([rawBuf, d]);
+        if (phase === "consume-response") {
+          while (rawBuf.length >= 5) {
+            const recLen = rawBuf.readUInt16BE(3);
+            if (rawBuf.length < 5 + recLen) break;
+            const recType = rawBuf[0];
+            rawBuf = rawBuf.subarray(5 + recLen);
+            if (recType === 0x17) {
               phase = "app-data";
               tlsIn = createTlsRecordReader();
               break;
