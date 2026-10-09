@@ -1,5 +1,5 @@
 // FILE: tests/faketls.test.js
-// VERSION: 1.3.0
+// VERSION: 1.4.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-FAKETLS ClientHello validation, ServerHello build, TLS record framing
 //   SCOPE: HMAC digest round-trip, record reader/writer, wrong-secret rejection, ClientHello
@@ -18,7 +18,15 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.3.0 - pin the structural ClientHello fallback. Three cases: both declared
+//   LAST_CHANGE: v1.4.0 - extractAlpn (first offered protocol, absent -> null) and
+//                resolveServerCipher (profile cipher only when offered; Buffer / byte Array / hex
+//                string all accepted, unparseable -> default). The hex case is the load-bearing one:
+//                Buffer.from("1302") is 4 UTF-8 bytes and could never match a 2-byte suite, so a
+//                hex-valued profile would have silently degraded to the default forever.
+//                buildHelloWithExtensions/alpnExt fixtures added; note extLen must span the
+//                ProtocolNameList length field AND its entries, which is the easy way to get this
+//                wrong (the first run of this test failed on exactly that).
+//   PREVIOUS: v1.3.0 - pin the structural ClientHello fallback. Three cases: both declared
 //                lengths overstate in agreement (recordEnd == messageEnd, the prod signature that
 //                v1.3.0 missed) and must resolve to the structural end; a hello whose extensions
 //                block has not fully landed must still return 0 rather than be answered from
@@ -42,6 +50,9 @@ import {
   buildAlpnExtension,
   splitTlsRecords,
   resolveClientHelloEnd,
+  resolveClientHelloStructuralEnd,
+  extractAlpn,
+  resolveServerCipher,
 } from "../src/faketls.js";
 
 const DIGEST_POS = 11;
@@ -376,7 +387,95 @@ test("buildServerHello: legacy profile without alpnKnown still falls back to con
   assert.ok(response.includes(buildAlpnExtension(["h2"])), "no alpnKnown -> configured ALPN is used");
 });
 
-// --- ClientHello extent: the record-length field is not trusted when it overstates the message ---
+// --- ALPN offer: needed to tell "client offered ALPN, we sent none" apart from "client offered none" ---
+// Production showed a fake-TLS client that receives our flight and closes ~90ms later having sent
+// nothing, while another client on the same proxy relays megabytes. The journal carried neither the
+// selected cipher nor whether ALPN was offered, so the two cases were indistinguishable.
+function buildHelloWithExtensions(exts) {
+  const sessionId = randomBytes(16);
+  const cipherSuites = Buffer.from([0x00, 0x02, 0x13, 0x01]);
+  const compression = Buffer.from([0x01, 0x00]);
+  const extTotal = Buffer.alloc(2);
+  extTotal.writeUInt16BE(Buffer.concat(exts).length, 0);
+  const inner = Buffer.concat([
+    Buffer.from([0x03, 0x03]),
+    randomBytes(32),
+    Buffer.from([sessionId.length]),
+    sessionId,
+    cipherSuites,
+    compression,
+    extTotal,
+    Buffer.concat(exts),
+  ]);
+  const hsLenBuf = Buffer.alloc(3);
+  hsLenBuf.writeUIntBE(inner.length, 0, 3);
+  const handshakeMsg = Buffer.concat([Buffer.from([0x01]), hsLenBuf, inner]);
+  const recordLenBuf = Buffer.alloc(2);
+  recordLenBuf.writeUInt16BE(handshakeMsg.length, 0);
+  return Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), recordLenBuf, handshakeMsg]);
+}
+
+function alpnExt(protocols) {
+  const list = Buffer.concat(protocols.map((p) => {
+    const b = Buffer.from(p, "latin1");
+    return Buffer.concat([Buffer.from([b.length]), b]);
+  }));
+  // extLen spans the ProtocolNameList length field AND its entries; extData then carries that
+  // length separately. Missing the second field is the easy way to get this wrong.
+  const ext = Buffer.alloc(6);
+  ext.writeUInt16BE(0x0010, 0);
+  ext.writeUInt16BE(2 + list.length, 2);
+  ext.writeUInt16BE(list.length, 4);
+  return Buffer.concat([ext, list]);
+}
+
+test("extractAlpn: returns the first offered protocol, or null when absent", () => {
+  assert.equal(extractAlpn(buildHelloWithExtensions([alpnExt(["h2", "http/1.1"])])), "h2");
+  assert.equal(extractAlpn(buildHelloWithExtensions([alpnExt(["http/1.1"])])), "http/1.1");
+  const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(40)]);
+  padExt.writeUInt16BE(40, 2);
+  assert.equal(extractAlpn(buildHelloWithExtensions([padExt])), null, "no ALPN extension -> null");
+  assert.equal(extractAlpn(Buffer.alloc(64)), null, "not a ClientHello -> null");
+});
+
+// The cipher actually put on the wire is the one thing a strict client aborts on right after
+// ServerHello, and it was invisible in the journal.
+test("resolveServerCipher: replays profile.cipher only when the client offered it", () => {
+  const offered1301 = [Buffer.from([0x13, 0x01])];
+  const offered1302 = [Buffer.from([0x13, 0x02])];
+  const profile = { cipher: "1302" };
+  assert.equal(
+    resolveServerCipher(profile, offered1302).toString("hex"),
+    "1302",
+    "offered -> profile cipher is replayed"
+  );
+  assert.equal(
+    resolveServerCipher(profile, offered1301).toString("hex"),
+    "1301",
+    "not offered -> RFC 8446 fallback, never a foreign suite"
+  );
+  assert.equal(resolveServerCipher(null, offered1302).toString("hex"), "1301", "no profile -> default");
+  assert.equal(resolveServerCipher(profile, null).toString("hex"), "1301", "no offer list -> default");
+  assert.equal(resolveServerCipher(profile, []).toString("hex"), "1301", "empty offer list -> default");
+  // Byte Array and Buffer forms must keep working (existing callers / captured profile).
+  assert.equal(
+    resolveServerCipher({ cipher: [0x13, 0x02] }, offered1302).toString("hex"),
+    "1302",
+    "byte-array profile cipher"
+  );
+  assert.equal(
+    resolveServerCipher({ cipher: Buffer.from([0x13, 0x02]) }, offered1302).toString("hex"),
+    "1302",
+    "buffer profile cipher"
+  );
+  assert.equal(
+    resolveServerCipher({ cipher: "not-hex" }, offered1302).toString("hex"),
+    "1301",
+    "unparseable profile cipher -> default, never garbage on the wire"
+  );
+});
+
+
 test("resolveClientHelloEnd: returns the record end when the record framing is satisfied", () => {
   const secret = randomBytes(16);
   const { hello } = buildClientHello(secret);

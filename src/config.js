@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.7.0
+// VERSION: 1.8.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -15,7 +15,13 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.7.0 - new MTPROTO_FAKE_TLS_CERT_LEN_MAX (default 0 = no cap): upper bound for
+//   LAST_CHANGE: v1.8.0 - new MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS (default 5000, 0 = per event):
+//                coalescing window for the [proxy][mtproto_handshake_timeout] line, matching the
+//                existing doppelganger window. A fake-TLS client that rejects our ServerHello
+//                retries in a tight loop (production: 424 connections in 60s, ~1000 journal lines on
+//                a 1 vCPU / 512 MB host); metrics still count every event and `suppressed` is
+//                carried forward, so nothing is lost.
+//   PREVIOUS: v1.7.0 - new MTPROTO_FAKE_TLS_CERT_LEN_MAX (default 0 = no cap): upper bound for
 //                the fake certificate in the fake-TLS server flight, so it can be shrunk to fit a
 //                mobile path MTU (read per handshake -> hot-reloadable, no restart)
 //   PREVIOUS: v1.6.0 - new MTPROTO_DOPPELGANGER_LOG_MS (default 5000, 0 = per-connection):
@@ -257,6 +263,16 @@ export function loadConfig(env = process.env) {
     5_000,
     "MTPROTO_DOPPELGANGER_LOG_MS"
   );
+  // Coalescing window for the [proxy][mtproto_handshake_timeout] line: minimum ms between lines
+  // (0 = one line per dead handshake). Same rationale as the doppelganger window: a client that
+  // rejects our ServerHello retries in a tight loop, and production showed one opening 424
+  // connections in 60s and emitting ~1000 lines, which drowns every other signal on a 1 vCPU /
+  // 512 MB host. The metrics counter is unaffected; `suppressed` is carried forward until emitted.
+  const mtprotoHandshakeTimeoutLogMs = parsePortEnv(
+    env.MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS,
+    5_000,
+    "MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS"
+  );
   // Upper bound for the fake certificate inside the fake-TLS server flight. 0 = replay the
   // captured origin size as-is (best anti-DPI fidelity). A mobile path whose MTU is smaller than
   // the captured certificate (e.g. 4091 on a ~1300-byte link) loses the tail of the flight and
@@ -327,6 +343,7 @@ export function loadConfig(env = process.env) {
     mtprotoDoppelganger,
     mtprotoDoppelgangerMaxDelayMs,
     mtprotoDoppelgangerLogMs,
+  mtprotoHandshakeTimeoutLogMs,
     mtprotoFakeTlsCertLenMax,
     mtprotoMetricsPort,
     mtprotoMetricsHost,

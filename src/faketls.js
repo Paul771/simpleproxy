@@ -1,5 +1,5 @@
 // FILE: src/faketls.js
-// VERSION: 1.5.0
+// VERSION: 1.6.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
 //   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers,
@@ -25,10 +25,28 @@
 //   resolveClientHelloStructuralEnd - resolve the ClientHello end by walking its TLS structure,
 //                           ignoring the declared record/handshake length fields entirely
 //   resolveFakeCertLen - fake-certificate length for the server flight (captured size, capped)
+//   extractAlpn - first ALPN protocol the client offered (null when the extension is absent)
+//   resolveServerCipher - the cipher suite the ServerHello actually selects (profile.cipher only
+//                          when offered; accepts Buffer / byte Array / hex string)
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.5.0 - resolveClientHelloStructuralEnd: the v1.3.0 fallback only covered a TLS
+//   LAST_CHANGE: v1.6.0 - two parsers the journal needed and the code did not have. extractAlpn
+//                returns the first ALPN protocol a ClientHello offered: when a captured profile
+//                recorded no ALPN (alpnKnown=true) buildServerHello OMITS the extension to match the
+//                fronted origin, so "client offered ALPN and we sent none" was indistinguishable
+//                from "client offered nothing" — and a strict client aborting right after
+//                ServerHello is exactly the production signature. locateExtensions factors out the
+//                length-prefixed field walk that extractSni already did, so both share one parser
+//                instead of two copies that can drift.
+//                resolveServerCipher externalises the RFC 8446 offered-suite gate that buildServerHello
+//                applied inline, so the journal can report the suite that REALLY went on the wire
+//                rather than the captured profile value — which is frequently not what was sent.
+//                It also fixes a latent trap: Buffer.from("1302") on a hex STRING yields 4 UTF-8
+//                bytes that can never equal a 2-byte suite, so any hex-valued profile (which is how
+//                every serialized form renders it) would have degraded to the default forever,
+//                silently. Buffer, byte Array and hex string are all accepted now.
+//   PREVIOUS: v1.5.0 - resolveClientHelloStructuralEnd: the v1.3.0 fallback only covered a TLS
 //                record length that overstated while the handshake-message length stayed
 //                accurate. Production showed the harder variant: 1298 bytes arrived while
 //                recordLen AND hsLen agreed with each other (recordEnd == messageEnd) and both
@@ -305,12 +323,7 @@ export function buildServerHello(secret, clientDigest, sessionId, alpn = null, p
   if (profile && profile.alpn) replayAlpn = profile.alpn;
   else if (profile && profile.alpnKnown === true) replayAlpn = null;
   else replayAlpn = alpn;
-  const profileCipher = profile && profile.cipher ? Buffer.from(profile.cipher) : null;
-  const profileCipherOffered =
-    profileCipher !== null &&
-    Array.isArray(offeredCiphers) &&
-    offeredCiphers.some((c) => c.length === 2 && c.equals(profileCipher));
-  const cipher = profileCipherOffered ? profileCipher : TLS_CIPHERSUITE;
+  const cipher = resolveServerCipher(profile, offeredCiphers);
   const tlsExtensions = Buffer.concat([
     Buffer.from([0x00, 0x2e, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]),
     x25519,
@@ -457,15 +470,16 @@ export function buildAlpnExtension(protocols) {
   // END_BLOCK_ALPN
 }
 
-// START_CONTRACT: extractSni
-//   PURPOSE: Parse the SNI hostname from a TLS ClientHello record (server_name extension)
+// START_CONTRACT: locateExtensions
+//   PURPOSE: Locate the extensions block of a ClientHello by walking its length-prefixed fields
 //   INPUTS: { handshake: Buffer - full ClientHello from 0x16 onward }
-//   OUTPUTS: { string | null - lowercased SNI hostname, or null if absent/unparseable }
+//   OUTPUTS: { { start: number, end: number } | null - offsets of the extension block, null if
+//              the handshake is not a ClientHello or any field overruns it }
 //   SIDE_EFFECTS: none
-//   LINKS: M-FAKETLS
-// END_CONTRACT: extractSni
-export function extractSni(handshake) {
-  // START_BLOCK_SNI
+//   LINKS: M-FAKETLS, fn-extractSni, fn-extractAlpn
+// END_CONTRACT: locateExtensions
+function locateExtensions(handshake) {
+  // START_BLOCK_LOCATE_EXTENSIONS
   try {
     if (handshake.length < 5 || handshake[0] !== 0x16) return null;
     let off = 5; // skip 0x16 0x03 0x01 + record length(2)
@@ -486,38 +500,146 @@ export function extractSni(handshake) {
     off += 1 + handshake[off]; // compression methods (len byte + bytes)
     if (off + 2 > hsEnd) return null;
     const extLen = handshake.readUInt16BE(off);
-    off += 2;
-    const extEnd = off + extLen;
-    if (extEnd > hsEnd) return null;
-    while (off + 4 <= extEnd) {
-      const extType = handshake.readUInt16BE(off);
-      const eLen = handshake.readUInt16BE(off + 2);
-      off += 4;
-      if (extType === 0x0000) {
-        // server_name extension
-        if (off + 2 > extEnd) return null;
-        const snListLen = handshake.readUInt16BE(off);
-        let p = off + 2;
-        const snListEnd = off + 2 + snListLen; // list bytes start after the 2-byte listLen field
-        if (snListEnd > extEnd) return null;
-        while (p + 3 <= snListEnd) {
-          const nameType = handshake[p];
-          const nameLen = handshake.readUInt16BE(p + 1);
-          p += 3;
-          if (nameType === 0x00 && p + nameLen <= snListEnd) {
-            return handshake.subarray(p, p + nameLen).toString("latin1").toLowerCase();
-          }
-          p += nameLen;
-        }
-        return null;
-      }
-      off += eLen;
-    }
+    const start = off + 2;
+    const end = start + extLen;
+    if (end > hsEnd) return null;
+    return { start, end };
+  } catch {
     return null;
+  }
+  // END_BLOCK_LOCATE_EXTENSIONS
+}
+
+// Walk every extension in the block. `visit(extType, bodyStart, bodyEnd, blockEnd)` returning true
+// stops the walk. A malformed extension body stops it too (the ClientHello is then untrustworthy,
+// so no extension after it may be read).
+function eachExtension(handshake, visit) {
+  // START_BLOCK_EACH_EXTENSION
+  const loc = locateExtensions(handshake);
+  if (!loc) return false;
+  let off = loc.start;
+  while (off + 4 <= loc.end) {
+    const extType = handshake.readUInt16BE(off);
+    const eLen = handshake.readUInt16BE(off + 2);
+    off += 4;
+    if (off + eLen > loc.end) return false;
+    if (visit(extType, off, off + eLen, loc.end)) return true;
+    off += eLen;
+  }
+  return false;
+  // END_BLOCK_EACH_EXTENSION
+}
+
+// START_CONTRACT: extractSni
+//   PURPOSE: Parse the SNI hostname from a TLS ClientHello record (server_name extension)
+//   INPUTS: { handshake: Buffer - full ClientHello from 0x16 onward }
+//   OUTPUTS: { string | null - lowercased SNI hostname, or null if absent/unparseable }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, fn-locateExtensions
+// END_CONTRACT: extractSni
+export function extractSni(handshake) {
+  // START_BLOCK_SNI
+  try {
+    let host = null;
+    eachExtension(handshake, (extType, start, end, blockEnd) => {
+      if (extType !== 0x0000) return false; // server_name extension
+      if (start + 2 > end) return true;
+      const snListLen = handshake.readUInt16BE(start);
+      let p = start + 2;
+      const snListEnd = start + 2 + snListLen; // list bytes start after the 2-byte listLen field
+      if (snListEnd > blockEnd) return true;
+      while (p + 3 <= snListEnd) {
+        const nameType = handshake[p];
+        const nameLen = handshake.readUInt16BE(p + 1);
+        p += 3;
+        if (nameType === 0x00 && p + nameLen <= snListEnd) {
+          host = handshake.subarray(p, p + nameLen).toString("latin1").toLowerCase();
+          return true;
+        }
+        p += nameLen;
+      }
+      return true; // server_name present but carrying no hostname -> absent
+    });
+    return host;
   } catch {
     return null;
   }
   // END_BLOCK_SNI
+}
+
+// START_CONTRACT: extractAlpn
+//   PURPOSE: Parse the FIRST ALPN protocol the client offered from a TLS ClientHello
+//   INPUTS: { handshake: Buffer - full ClientHello from 0x16 onward }
+//   OUTPUTS: { string | null - first offered protocol name, or null if the extension is absent }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, fn-locateExtensions, fn-buildServerHello
+// END_CONTRACT: extractAlpn
+export function extractAlpn(handshake) {
+  // START_BLOCK_ALPN_PARSE
+  // Existence is the diagnostic, not the value: when a captured profile recorded NO alpn
+  // (alpnKnown=true, alpn=null) buildServerHello OMITS the extension to match the fronted origin,
+  // so "client offered ALPN and we sent none" is a plausible reason for a strict client to abort
+  // right after ServerHello - and it was indistinguishable from "client offered nothing".
+  try {
+    let proto = null;
+    eachExtension(handshake, (extType, start, end, blockEnd) => {
+      if (extType !== 0x0010) return false; // application_layer_protocol_negotiation
+      if (start + 2 > end) return true;
+      const listLen = handshake.readUInt16BE(start);
+      let p = start + 2;
+      const listEnd = start + 2 + listLen;
+      if (listEnd > blockEnd) return true;
+      while (p < listEnd) {
+        const n = handshake[p];
+        if (n > 0 && p + 1 + n <= listEnd) {
+          proto = handshake.subarray(p + 1, p + 1 + n).toString("latin1");
+          return true;
+        }
+        p += 1 + n;
+      }
+      return true;
+    });
+    return proto;
+  } catch {
+    return null;
+  }
+  // END_BLOCK_ALPN_PARSE
+}
+
+// START_CONTRACT: resolveServerCipher
+//   PURPOSE: Resolve which cipher suite the fake ServerHello actually selects
+//   INPUTS: { profile: { cipher } | null - captured profile; offeredCiphers: Buffer[] | null - suites
+//             the client offered (from validateClientHello) }
+//   OUTPUTS: { Buffer(2) - the selected suite: profile.cipher when the client offered it, else the
+//              0x1301 default }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, fn-buildServerHello, fn-validateClientHello
+// END_CONTRACT: resolveServerCipher
+export function resolveServerCipher(profile, offeredCiphers) {
+  // START_BLOCK_SERVER_CIPHER
+  // RFC 8446 requires the selected suite to be one the CLIENT offered: answering a foreign suite
+  // (e.g. rutube's 0x1302 to a 0x1301-only client) makes strict clients abort right after
+  // ServerHello. Exposed separately from buildServerHello so the journal can report the suite that
+  // really went on the wire instead of the captured profile value, which is not always the one sent.
+  const raw = profile && profile.cipher;
+  // The captured profile carries the suite as a Buffer (tls-profile), tests and older callers pass
+  // a plain byte Array, and every SERIALIZED form (metrics, journal, any future config load) renders
+  // it as hex. Buffer.from(x) on a hex STRING yields its UTF-8 bytes — "1302" becomes 4 bytes —
+  // which can never equal a 2-byte suite, so a hex-valued profile would silently degrade to the
+  // default forever. Accept all three encodings; anything else falls back to the default.
+  let profileCipher = null;
+  if (typeof raw === "string") {
+    if (/^[0-9a-fA-F]{4}$/.test(raw)) profileCipher = Buffer.from(raw, "hex");
+  } else if (raw != null) {
+    const asBuf = Buffer.from(raw);
+    if (asBuf.length === 2) profileCipher = asBuf;
+  }
+  const profileCipherOffered =
+    profileCipher !== null &&
+    Array.isArray(offeredCiphers) &&
+    offeredCiphers.some((c) => c.length === 2 && c.equals(profileCipher));
+  return profileCipherOffered ? profileCipher : Buffer.from(TLS_CIPHERSUITE);
+  // END_BLOCK_SERVER_CIPHER
 }
 
 // START_CONTRACT: splitTlsRecords

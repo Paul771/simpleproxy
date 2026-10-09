@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.11.0
+// VERSION: 1.12.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -37,7 +37,18 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.11.0 - B-7..B-9: byte counts cannot separate a stalled MTProto handshake from
+//   LAST_CHANGE: v1.12.0 - fake-TLS handshake-death diagnostics + timeout coalescing. The tls-app
+//                timeout must report sni / sid_len / cipher (selected, not profile) / offered /
+//                alpn (offered) / alpn_sent, because production had one client relaying megabytes
+//                and another aborting an identical ServerHello in ~90ms with nothing in the journal
+//                to tell them apart. [doppelganger] must carry the same cipher + offered even while
+//                its own line is coalesced. mtproto_handshake_timeout must coalesce into ONE line
+//                per window with the remainder counted in `suppressed` — 424 connections in 60s
+//                (~7/s) from a single retry loop produced ~1000 lines on a 1 vCPU / 512 MB host.
+//                The coalescing test separates the log window from the handshake timeout on purpose:
+//                a window shorter than the per-event spacing opens a new window every time and
+//                proves nothing.
+//   PREVIOUS: v1.11.0 - B-7..B-9: byte counts cannot separate a stalled MTProto handshake from
 //               a healthy one, because both can move the same few hundred bytes, and production
 //               (~53% of closes in one 9-minute window, DC silent then clean FIN ~91.4s later)
 //               gave no way to tell whether the client ever ANSWERED the DC's first reply.
@@ -115,6 +126,7 @@ import { wrapTlsRecord, createTlsRecordReader } from "../src/faketls.js";
 import { maskConnection } from "../src/mask.js";
 import { createUserStore } from "../src/user-store.js";
 import { createConnectHandler } from "../src/proxy.js";
+import { createProfileManager } from "../src/tls-profile.js";
 
 const PROTO_TAG_ABRIDGED = Buffer.from([0xef, 0xef, 0xef, 0xef]);
 const PROTO_TAG_SECURE = Buffer.from([0xdd, 0xdd, 0xdd, 0xdd]);
@@ -202,7 +214,7 @@ function hmacSha256(key, msg) {
 // carries a length that overstates the message (the digest signs the inflated buffer, exactly as
 // such a client would sign what it wrote). obfsHandshake is returned to the caller, which wraps
 // it into an app-data record itself.
-function buildFakeTlsClientHello(secret, obfsHandshake, recordLenPad = 0) {
+function buildFakeTlsClientHello(secret, obfsHandshake, recordLenPad = 0, extraExts = []) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
@@ -213,9 +225,10 @@ function buildFakeTlsClientHello(secret, obfsHandshake, recordLenPad = 0) {
   const padLen = 533;
   const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(padLen)]);
   padExt.writeUInt16BE(padLen, 2);
+  const allExts = Buffer.concat([...extraExts, padExt]);
   const extTotal = Buffer.alloc(2);
-  extTotal.writeUInt16BE(padExt.length, 0);
-  const extensions = Buffer.concat([extTotal, padExt]);
+  extTotal.writeUInt16BE(allExts.length, 0);
+  const extensions = Buffer.concat([extTotal, allExts]);
 
   const inner = Buffer.concat([
     Buffer.from([0x03, 0x03]),
@@ -552,6 +565,192 @@ test("config: MTPROTO_MASK_RELAY_MAX_BYTES default, override, disable, invalid",
     () => loadConfig({ MTPROTO_MASK_RELAY_MAX_BYTES: "soon" }),
     /INVALID_ENV/
   );
+});
+
+// --- Handshake-death diagnostics + log coalescing ---
+// Production: one fake-TLS client relays megabytes through this proxy while another receives the
+// identical ServerHello, sends nothing, and closes ~90ms later — every time. Nothing in the journal
+// distinguished them, because the line carried neither the suite we selected nor whether the client
+// offered ALPN. These fields are the only thing that can tell "client offered ALPN and we omitted it"
+// from "client offered nothing", and "foreign suite on the wire" from "client never offered ours".
+function tlsAppTimeoutProxy(logs, cfgOverrides = {}, profileManager = null) {
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 30_000,
+    rules: [],
+    mtprotoSecrets: [],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoPendingMax: 256,
+    mtprotoTlsDomain: "rutube.ru",
+    mtprotoHandshakeTimeoutMs: 150,
+    ...cfgOverrides,
+  };
+  const log = (event, ref, src, detail) => logs.push({ event, ref, src, detail: detail || {} });
+  const handlers = {
+    "http-connect": () => {},
+    "http-other": () => {},
+    "mtproto": createMtprotoHandler(cfg, log, () => null, null, null, profileManager, null),
+  };
+  const server = createMuxServer(handlers);
+  return new Promise((resolve) => {
+    server.listen(cfg.port, cfg.host, () => resolve({ server, addr: server.address() }));
+  });
+}
+
+function alpnExtension(protocols) {
+  const list = Buffer.concat(protocols.map((p) => {
+    const b = Buffer.from(p, "latin1");
+    return Buffer.concat([Buffer.from([b.length]), b]);
+  }));
+  const ext = Buffer.alloc(6);
+  ext.writeUInt16BE(0x0010, 0);
+  ext.writeUInt16BE(2 + list.length, 2);
+  ext.writeUInt16BE(list.length, 4);
+  return Buffer.concat([ext, list]);
+}
+
+// Send only the ClientHello: the proxy answers with a ServerHello and the client then goes silent,
+// which is the production signature of a client that rejects our flight.
+async function sendHelloAndWait(addr, hello) {
+  const socket = net.connect(addr.port, "127.0.0.1", () => {
+    socket.write(hello);
+    socket.resume();
+  });
+  await awaitClose(socket, 3000);
+}
+
+test("tls-app handshake timeout reports what the client offered and what flight we built", async () => {
+  const logs = [];
+  const secret = randomBytes(16);
+  const { server, addr } = await tlsAppTimeoutProxy(logs, {
+    mtprotoSecrets: [secret.toString("hex")],
+  });
+  try {
+    const { handshake: obfsHandshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    // Client offers ALPN. With no profile, buildServerHello falls back to the configured ALPN, so
+    // the line must show both what the client asked for and what we actually put on the wire.
+    const { hello } = buildFakeTlsClientHello(secret, obfsHandshake, 0, [alpnExtension(["h2"])]);
+
+    await sendHelloAndWait(addr, hello);
+
+    const line = logs.find((l) => l.event === "mtproto_handshake_timeout");
+    assert.ok(line, "handshake_timeout must be logged");
+    assert.equal(line.detail.phase, "tls-app");
+    assert.equal(line.detail.cipher, "1301", "the suite actually put on the wire must be reported");
+    assert.equal(line.detail.offered, 1, "how many suites the client offered");
+    assert.equal(line.detail.sid_len, 16, "session-id length the client used");
+    assert.equal(line.detail.alpn, "h2", "ALPN the client offered");
+    assert.ok("alpn_sent" in line.detail, "alpn_sent must always be present");
+    assert.ok("sni" in line.detail, "sni must always be present (null when absent)");
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test("doppelganger line reports the selected cipher and the offered-suite count", async () => {
+  const logs = [];
+  const secret = randomBytes(16);
+  // A captured profile whose cipher (0x1302) the fixture client does NOT offer: the selected suite
+  // must be 0x1301, so reporting profile.cipher here would be a lie about what went on the wire.
+  const profileManager = createProfileManager({
+    host: "127.0.0.1",
+    port: 1,
+    refreshMs: 60_000,
+    log: () => {},
+    capture: async () => ({
+      host: "127.0.0.1",
+      cipher: Buffer.from([0x13, 0x02]),
+      alpn: null,
+      alpnKnown: true,
+      ccsCount: 1,
+      appDataSizes: [281, 281],
+      certLen: 900,
+      recordDelays: [1, 1],
+    }),
+  });
+  profileManager.start();
+  for (let i = 0; i < 20 && !profileManager.get(); i++) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(profileManager.get(), "profile must be available before the client connects");
+
+  const { server, addr } = await tlsAppTimeoutProxy(
+    logs,
+    { mtprotoSecrets: [secret.toString("hex")], mtprotoDoppelganger: true },
+    profileManager
+  );
+  try {
+    const { handshake: obfsHandshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, obfsHandshake);
+    await sendHelloAndWait(addr, hello);
+
+    const line = logs.find((l) => l.event === "doppelganger");
+    assert.ok(line, "doppelganger line must be logged");
+    assert.equal(line.detail.cipher, "1301", "hex-encoded selected suite, not the profile value");
+    assert.equal(line.detail.offered, 1, "offered-suite count");
+  } finally {
+    profileManager.stop?.();
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+// A single client in a tight retry loop produced 424 connections in 60s (~7/s) and ~1000 journal
+// lines on a 1 vCPU / 512 MB / 1 GB host, drowning every other signal. The doppelganger line already
+// had a coalescing guard; this marker had none.
+test("handshake_timeout lines are coalesced with a suppressed counter", async () => {
+  const logs = [];
+  const secret = randomBytes(16);
+  const { server, addr } = await tlsAppTimeoutProxy(logs, {
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoHandshakeTimeoutMs: 80, // each dead handshake resolves fast...
+    mtprotoHandshakeTimeoutLogMs: 800, // ...while the log window comfortably covers all six
+  });
+  try {
+    const { handshake: obfsHandshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, obfsHandshake);
+    for (let i = 0; i < 6; i++) await sendHelloAndWait(addr, hello);
+
+    let lines = logs.filter((l) => l.event === "mtproto_handshake_timeout");
+    assert.equal(lines.length, 1, "six dead handshakes in one window must produce ONE line, not six");
+    assert.equal(lines[0].detail.suppressed, 0, "the line that opens the window suppresses nothing");
+
+    // The count is carried forward and reported on the next line, so a burst is never lost.
+    await new Promise((r) => setTimeout(r, 950));
+    await sendHelloAndWait(addr, hello);
+
+    lines = logs.filter((l) => l.event === "mtproto_handshake_timeout");
+    assert.equal(lines.length, 2, "a later handshake must reopen the window");
+    assert.equal(lines[1].detail.suppressed, 5, "the burst must be counted, never silently dropped");
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test("handshake_timeout coalescing off (0) keeps one line per event", async () => {
+  const logs = [];
+  const secret = randomBytes(16);
+  const { server, addr } = await tlsAppTimeoutProxy(logs, {
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoHandshakeTimeoutLogMs: 0,
+  });
+  try {
+    const { handshake: obfsHandshake } = buildClientHandshake(secret, PROTO_TAG_ABRIDGED, 1);
+    const { hello } = buildFakeTlsClientHello(secret, obfsHandshake);
+    for (let i = 0; i < 3; i++) await sendHelloAndWait(addr, hello);
+
+    const lines = logs.filter((l) => l.event === "mtproto_handshake_timeout");
+    assert.equal(lines.length, 3, "interval 0 must restore per-event logging");
+    assert.equal(lines[0].detail.suppressed, 0, "nothing suppressed when coalescing is off");
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
 });
 
 // --- Wave 2 helpers ---

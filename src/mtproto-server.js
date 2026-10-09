@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.15.0
+// VERSION: 1.16.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
 //            periodic [proxy][heartbeat] liveness line, handshake-death and close-death forensics
@@ -17,7 +17,22 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.15.0 - handshake-progress attribution. v1.14.0 named WHICH side closed, and
+//   LAST_CHANGE: v1.16.0 - fake-TLS handshake-death diagnostics + log coalescing. Production had
+//                two clients on ONE proxy: one relaying megabytes, another receiving an identical
+//                ServerHello, sending nothing, and closing ~90ms later on every attempt. Capping
+//                certLen (4230 -> 1138 bytes) changed nothing about that signature, and nothing in
+//                the line said why — it carried neither the suite we selected nor whether the client
+//                offered ALPN. The timeout now reports sni / sid_len / cipher (the SELECTED suite) /
+//                offered (suite count) / alpn (offered) / alpn_sent (what we actually emitted), which
+//                separates "client offered ALPN and we omitted it" from "client offered nothing" and
+//                "foreign suite on the wire" from "client never offered ours"; [doppelganger] gains
+//                the same cipher + offered so a busy client is diagnosable from the coalesced line.
+//                Separately, mtproto_handshake_timeout is now coalesced like the doppelganger marker
+//                (MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS, default 5s, 0 = per event): one client retrying
+//                in a loop produced 424 connections in 60s and ~1000 lines on a 1 vCPU / 512 MB host,
+//                drowning every other signal. Metrics still count each event; `suppressed` is carried
+//                forward and reported on the next line, so a burst is never lost.
+//   PREVIOUS: v1.15.0 - handshake-progress attribution. v1.14.0 named WHICH side closed, and
 //                production immediately proved that was necessary but not sufficient: over a
 //                9-minute window at uptime 6660-7200, ~31 of ~58 closes shared one signature - the
 //                DC sent its last byte within ~250ms of session start, both directions then went
@@ -132,6 +147,8 @@ import {
   wrapTlsRecord,
   buildTlsAlert,
   extractSni,
+  extractAlpn,
+  resolveServerCipher,
   splitTlsRecords,
   resolveClientHelloEnd,
   resolveFakeCertLen,
@@ -145,6 +162,9 @@ const HEARTBEAT_INTERVAL_MS = 60_000;
 // Default minimum spacing between [proxy][doppelganger] lines (overridable via
 // MTPROTO_DOPPELGANGER_LOG_MS; 0 restores one line per connection).
 const DOPPELGANGER_LOG_INTERVAL_MS = 5_000;
+// Default minimum spacing between [proxy][mtproto_handshake_timeout] lines (overridable via
+// MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS; 0 restores one line per event).
+const HANDSHAKE_TIMEOUT_LOG_INTERVAL_MS = 5_000;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 // One retry of the preferred DC candidate after the list is exhausted (see START_BLOCK_MT_RELAY):
 // a transient IPv4 failure or a wasted fallback would otherwise drop the client. The retry uses a
@@ -242,20 +262,51 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
   // interval <= 0 restores the old log-every-event behaviour.
   let dgLoggedAt = 0;
   let dgSuppressed = 0;
-  const logDoppelganger = (addr, records, delays, certLen) => {
+  const logDoppelganger = (addr, records, delays, certLen, flightInfo = null) => {
     const interval = cfg.mtprotoDoppelgangerLogMs ?? DOPPELGANGER_LOG_INTERVAL_MS;
     const now = Date.now();
     if (interval <= 0 || now - dgLoggedAt >= interval) {
       dgLoggedAt = now;
       // certLen = the fake certificate actually put on the wire, so a capped flight
-      // (MTPROTO_FAKE_TLS_CERT_LEN_MAX) is visible in the journal instead of assumed.
-      log("doppelganger", "DF-DOPPELGANGER", addr, { records, delays, certLen, suppressed: dgSuppressed });
+      // (MTPROTO_FAKE_TLS_CERT_LEN_MAX) is visible in the journal instead of assumed. cipher/offered
+      // = the SELECTED suite and how many the client offered: the captured profile's cipher is not
+      // necessarily what was sent, and reporting it as if it were would hide a client abort.
+      log("doppelganger", "DF-DOPPELGANGER", addr, {
+        records,
+        delays,
+        certLen,
+        ...(flightInfo ? { cipher: flightInfo.cipher, offered: flightInfo.offered } : {}),
+        suppressed: dgSuppressed,
+      });
       dgSuppressed = 0;
     } else {
       dgSuppressed += 1;
     }
   };
   // END_BLOCK_MT_DOPPELGANGER_LOG
+
+  // START_BLOCK_MT_HANDSHAKE_TIMEOUT_LOG
+  // Same coalescing contract as the doppelganger line, applied to the handshake-death marker.
+  // A client that rejects our ServerHello retries in a tight loop: production showed one client
+  // opening 424 connections in 60s (~7/s) and emitting ~1000 lines on a 1 vCPU / 512 MB / 1 GB
+  // host, which drowns every other signal and churns the panel's stdout socket (the panel then
+  // stalls and replays its whole buffer on reconnect). The metrics counter still increments per
+  // event, and `suppressed` is carried forward until emitted, so a burst is never lost — only
+  // reported a little later. interval <= 0 restores one line per event.
+  let hstLoggedAt = 0;
+  let hstSuppressed = 0;
+  const logHandshakeTimeout = (addr, detail) => {
+    const interval = cfg.mtprotoHandshakeTimeoutLogMs ?? HANDSHAKE_TIMEOUT_LOG_INTERVAL_MS;
+    const now = Date.now();
+    if (interval <= 0 || now - hstLoggedAt >= interval) {
+      hstLoggedAt = now;
+      log("mtproto_handshake_timeout", "DF-1", addr, { ...detail, suppressed: hstSuppressed });
+      hstSuppressed = 0;
+    } else {
+      hstSuppressed += 1;
+    }
+  };
+  // END_BLOCK_MT_HANDSHAKE_TIMEOUT_LOG
 
   // START_BLOCK_ROUTE_UNKNOWN
   // Behaviour on unknown SNI / failed fake-TLS auth (telemt-inspired anti-DPI).
@@ -354,6 +405,8 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
     let closedMs = 0;
     let flightBytes = 0;
     let flightRecords = 0;
+    // Handshake-death diagnostics, filled in once the fake-TLS flight is built (see logHandshakeTimeout).
+    let flightInfo = null;
 
     const finishHandshakeAndRelay = () => {
       const parsed = parseClientHandshake(obfsHandshake.subarray(0, HANDSHAKE_LEN), secrets);
@@ -850,6 +903,22 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         const records = splitTlsRecords(response);
         flightBytes = response.length;
         flightRecords = records.length;
+        // Record what this flight actually carries. `cipher` is resolved the same way buildServerHello
+        // resolves it, so the journal cannot report a captured profile suite that was never sent.
+        const selectedCipher = resolveServerCipher(profile, validated.ciphers);
+        const offeredCount = Array.isArray(validated.ciphers) ? validated.ciphers.length : 0;
+        // What buildServerHello will put in the ALPN slot: the profile's when it recorded one, null
+        // when it recorded none (alpnKnown=true -> extension omitted), else the configured value.
+        const sentAlpn =
+          profile && profile.alpn ? profile.alpn : profile && profile.alpnKnown === true ? null : alpn;
+        flightInfo = {
+          sni,
+          sid_len: validated.sessionId.length,
+          cipher: selectedCipher.toString("hex"),
+          offered: offeredCount,
+          alpn: extractAlpn(clientHello),
+          alpn_sent: sentAlpn === undefined ? null : sentAlpn,
+        };
 
         // Doppelganger: replay captured inter-arrival delays so the flight is timed like the
         // real origin, not bursty-instant. Only the handshake flight is shaped; steady-state
@@ -863,7 +932,7 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
             const d = delays[Math.min(idx, delays.length - 1)];
             setTimeout(() => sendNext(idx + 1), Math.min(d, cfg.mtprotoDoppelgangerMaxDelayMs)).unref?.();
           };
-          logDoppelganger(socket.remoteAddress, records.length, delays.length, certLen);
+          logDoppelganger(socket.remoteAddress, records.length, delays.length, certLen, flightInfo);
           sendNext(0);
         } else {
           socket.write(response);
@@ -940,7 +1009,14 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         detail.recordLen = buf.readUInt16BE(3);
         if (detail.bytes >= 9 && buf[5] === 0x01) detail.hsLen = buf.readUIntBE(6, 3);
       }
-      log("mtproto_handshake_timeout", "DF-1", socket.remoteAddress, detail);
+      // Handshake-death DIAGNOSTICS, populated only once we actually built a ServerHello: what the
+      // client asked for and what we put on the wire. Production had two clients on one proxy — one
+      // relaying megabytes, the other closing ~90ms after an identical flight — and nothing here
+      // distinguished them. `cipher` is the SELECTED suite (not the captured profile value, which
+      // may never have been sent), `offered` is how many suites the client offered, and alpn vs
+      // alpn_sent separates "client offered ALPN and we omitted it" from "client offered nothing".
+      if (flightInfo) Object.assign(detail, flightInfo);
+      logHandshakeTimeout(socket.remoteAddress, detail);
       if (metrics) {
         metrics.inc("simpleproxy_handshake_timeouts_total");
         if (phase === "tls-app") metrics.inc("simpleproxy_faketls_post_hello_timeouts_total");
