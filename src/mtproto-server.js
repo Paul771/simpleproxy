@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.18.0
+// VERSION: 1.19.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
 //            periodic [proxy][heartbeat] liveness line, handshake-death and close-death forensics
@@ -17,7 +17,14 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.18.0 - the tls-hello timeout line now reports where the ClientHello walk stopped:
+//   LAST_CHANGE: v1.19.0 - the client's offered ALPN list is extracted once and fed to
+//                buildServerHello, so a client that offers ALPN always gets an answer even when the
+//                captured profile recorded none — that mismatch is what made a real phone's
+//                fake-TLS handshake "succeed" here and then die at the DC (bytes_out: 0,
+//                dc_replies: 0). `alpn_sent` in the journal now comes from resolveReplayAlpn, the
+//                same function the flight used; it was re-derived inline here, so the log could
+//                describe a rule the flight did not follow.
+//   PREVIOUS: v1.18.0 - the tls-hello timeout line now reports where the ClientHello walk stopped:
 //                sid_len, cs_len, ext_len, ext_end and struct. `ext_end` against `bytes` is the
 //                decisive pair — ext_end > bytes means the extensions length is itself inflated, so
 //                no further bytes would ever resolve it, which is a different failure from a
@@ -162,7 +169,8 @@ import {
   wrapTlsRecord,
   buildTlsAlert,
   extractSni,
-  extractAlpn,
+  extractAlpnList,
+  resolveReplayAlpn,
   resolveServerCipher,
   splitTlsRecords,
   resolveFakeTlsClientHello,
@@ -903,10 +911,13 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           ? cfg.mtprotoTlsAlpn[0]
           : null;
         const profile = profileManager ? profileManager.get() : null;
+        // What the client actually offered, in its preference order. Decides the ALPN answer via the
+        // SAME resolver buildServerHello uses, so `alpn_sent` below cannot drift from the wire.
+        const clientAlpn = extractAlpnList(clientHello);
         // Resolve the fake-certificate size ONCE (cap applied here, not inside buildServerHello) so
         // the number reported in the doppelganger line is exactly what goes on the wire.
         const certLen = resolveFakeCertLen(profile, cfg.mtprotoFakeTlsCertLenMax ?? 0);
-        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile, validated.ciphers, certLen);
+        const response = buildServerHello(validated.secret, validated.digest, validated.sessionId, alpn, profile, validated.ciphers, certLen, clientAlpn);
         // Frame the flight unconditionally: the doppelganger path needs the records to pace, and
         // both paths need the shape for the handshake-death log (a single write is not a single TLS
         // record, so counting the framing is the only honest record count).
@@ -917,16 +928,15 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
         // resolves it, so the journal cannot report a captured profile suite that was never sent.
         const selectedCipher = resolveServerCipher(profile, validated.ciphers);
         const offeredCount = Array.isArray(validated.ciphers) ? validated.ciphers.length : 0;
-        // What buildServerHello will put in the ALPN slot: the profile's when it recorded one, null
-        // when it recorded none (alpnKnown=true -> extension omitted), else the configured value.
-        const sentAlpn =
-          profile && profile.alpn ? profile.alpn : profile && profile.alpnKnown === true ? null : alpn;
+        // What buildServerHello will put in the ALPN slot, resolved by the same function it used, so
+        // the journal reports the wire and not a second guess at the rule.
+        const sentAlpn = resolveReplayAlpn({ profile, configuredAlpn: alpn, offeredAlpn: clientAlpn });
         flightInfo = {
           sni,
           sid_len: validated.sessionId.length,
           cipher: selectedCipher.toString("hex"),
           offered: offeredCount,
-          alpn: extractAlpn(clientHello),
+          alpn: clientAlpn[0] ?? null,
           alpn_sent: sentAlpn === undefined ? null : sentAlpn,
         };
 

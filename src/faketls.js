@@ -1,5 +1,5 @@
 // FILE: src/faketls.js
-// VERSION: 1.8.0
+// VERSION: 1.9.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
 //   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers,
@@ -33,12 +33,30 @@
 //                           the extent the client's HMAC confirms; reports resolved/foreign/incomplete
 //   resolveFakeCertLen - fake-certificate length for the server flight (captured size, capped)
 //   extractAlpn - first ALPN protocol the client offered (null when the extension is absent)
+//   extractAlpnList - every ALPN protocol the client offered, in its own preference order
+//   resolveReplayAlpn - which protocol the fake ServerHello must carry: replay the profile's,
+//                       answer the client if it offered, mirror the origin's silence otherwise
 //   resolveServerCipher - the cipher suite the ServerHello actually selects (profile.cipher only
 //                          when offered; accepts Buffer / byte Array / hex string)
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.8.0 - walkClientHelloLayout: the structural walk returned 0 for every failure
+//   LAST_CHANGE: v1.9.0 - the fake ServerHello must ANSWER a client that offered ALPN, even when the
+//                captured profile recorded that the origin negotiated none. alpnKnown=true made
+//                buildServerHello omit the extension so the flight matches the fronted site, and a
+//                client that sent ALPN and got silence aborted its MTProto stream. The proxy still
+//                logged a successful fake-TLS handshake, so the failure surfaced much later and
+//                looked like a network problem: we forwarded the client's bytes and the DC answered
+//                nothing at all (bytes_out: 0, dc_replies: 0, first_dc_reply_ms: null). That is the
+//                production signature this removes. RFC 7301 makes the answer mandatory anyway, so
+//                origin fidelity now yields to a question the client actually asked — and only to
+//                that: a client that offered nothing still gets the bare origin-shaped flight.
+//                resolveReplayAlpn owns the rule and is exported so mtproto-server derives
+//                `alpn_sent` from the SAME function the flight used; the log previously re-derived
+//                it inline, which is precisely the drift that made this invisible.
+//                extractAlpnList replaces the single-value extractAlpn internally: choosing between
+//                the configured protocol and the client's own first preference needs the whole list.
+//   PREVIOUS: v1.8.0 - walkClientHelloLayout: the structural walk returned 0 for every failure
 //                alike, which is correct for a decision and useless for a diagnosis. The journal
 //                could not tell "the extensions block has not landed yet" from "the extensions length
 //                is a lie too", and those two support opposite conclusions about whether more bytes
@@ -417,12 +435,13 @@ export function resolveFakeCertLen(profile, cap = 0) {
 //             profile?: { cipher, alpn, alpnKnown, ccsCount, appDataSizes, certLen } | null,
 //             offeredCiphers?: Buffer[] - suites from validateClientHello (gate profile.cipher),
 //             certLen?: number - explicit fake-certificate length; 0/omitted = derive via
-//                         resolveFakeCertLen(profile) (callers apply cfg caps themselves) }
+//                         resolveFakeCertLen(profile) (callers apply cfg caps themselves),
+//             offeredAlpn?: string[] - protocols the client offered (see resolveReplayAlpn) }
 //   OUTPUTS: { Buffer - full response packet }
 //   SIDE_EFFECTS: none
-//   LINKS: M-FAKETLS, M-TLS-PROFILE, fn-resolveFakeCertLen
+//   LINKS: M-FAKETLS, M-TLS-PROFILE, fn-resolveFakeCertLen, fn-resolveReplayAlpn
 // END_CONTRACT: buildServerHello
-export function buildServerHello(secret, clientDigest, sessionId, alpn = null, profile = null, offeredCiphers = null, certLen = 0) {
+export function buildServerHello(secret, clientDigest, sessionId, alpn = null, profile = null, offeredCiphers = null, certLen = 0, offeredAlpn = []) {
   // START_BLOCK_BUILD
   const x25519 = genX25519PublicKey();
   // When a captured profile is available, replay its structure: the observed CCS count and
@@ -432,16 +451,12 @@ export function buildServerHello(secret, clientDigest, sessionId, alpn = null, p
   // suite (e.g. rutube's 0x1302 to a 0x1301-only client) makes strict clients abort right
   // after ServerHello.
   //
-  // ALPN fidelity: when the profile was parsed and recorded a protocol, replay it; when it was
-  // parsed and recorded NONE (profile.alpnKnown === true, alpn === null) OMIT the extension —
-  // the fronted origin itself answered without ALPN (observed for rutube.ru in production), so
-  // injecting the configured h2 would be a server-flight fingerprint mismatch. Only fall back to
-  // the configured ALPN when there is no parsed profile (alpnKnown !== true), which preserves
-  // the profile-less / legacy behaviour.
-  let replayAlpn;
-  if (profile && profile.alpn) replayAlpn = profile.alpn;
-  else if (profile && profile.alpnKnown === true) replayAlpn = null;
-  else replayAlpn = alpn;
+  // ALPN fidelity, and the one place where fidelity has to yield: when the profile recorded a
+  // protocol we replay it; when it recorded NONE we used to omit the extension so the flight matches
+  // the fronted origin — but only for a client that never asked. resolveReplayAlpn owns that rule:
+  // a client that OFFERED ALPN must be answered (RFC 7301), because a strict one aborts its MTProto
+  // stream when the ServerHello declines, and we then forward bytes the DC silently ignores.
+  const replayAlpn = resolveReplayAlpn({ profile, configuredAlpn: alpn, offeredAlpn });
   const cipher = resolveServerCipher(profile, offeredCiphers);
   const tlsExtensions = Buffer.concat([
     Buffer.from([0x00, 0x2e, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]),
@@ -695,12 +710,27 @@ export function extractSni(handshake) {
 // END_CONTRACT: extractAlpn
 export function extractAlpn(handshake) {
   // START_BLOCK_ALPN_PARSE
-  // Existence is the diagnostic, not the value: when a captured profile recorded NO alpn
-  // (alpnKnown=true, alpn=null) buildServerHello OMITS the extension to match the fronted origin,
-  // so "client offered ALPN and we sent none" is a plausible reason for a strict client to abort
-  // right after ServerHello - and it was indistinguishable from "client offered nothing".
+  return extractAlpnList(handshake)[0] ?? null;
+  // END_BLOCK_ALPN_PARSE
+}
+
+// START_CONTRACT: extractAlpnList
+//   PURPOSE: List every ALPN protocol a ClientHello offered, in the client's own preference order
+//   INPUTS: { handshake: Buffer - ClientHello from 0x16 onward }
+//   OUTPUTS: { string[] - offered protocol names, empty when the extension is absent or unreadable }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, fn-extractAlpn, fn-resolveReplayAlpn
+// END_CONTRACT: extractAlpnList
+export function extractAlpnList(handshake) {
+  // Existence was always the diagnostic: when a captured profile recorded NO alpn
+  // (alpnKnown=true, alpn=null) buildServerHello used to OMIT the extension to match the fronted
+  // origin, so "client offered ALPN and we sent none" was indistinguishable from "client offered
+  // nothing" — and it was exactly this. Production ran a client that OFFERED ALPN: the proxy logged a
+  // successful fake-TLS handshake, then relayed the client's stream to the DC and received nothing
+  // back (bytes_out: 0, dc_replies: 0). The strict client had aborted once the ServerHello declined
+  // its offer. Deciding the answer needs the whole list, not just the first entry.
   try {
-    let proto = null;
+    const out = [];
     eachExtension(handshake, (extType, start, end, blockEnd) => {
       if (extType !== 0x0010) return false; // application_layer_protocol_negotiation
       if (start + 2 > end) return true;
@@ -710,19 +740,40 @@ export function extractAlpn(handshake) {
       if (listEnd > blockEnd) return true;
       while (p < listEnd) {
         const n = handshake[p];
-        if (n > 0 && p + 1 + n <= listEnd) {
-          proto = handshake.subarray(p + 1, p + 1 + n).toString("latin1");
-          return true;
-        }
+        if (n > 0 && p + 1 + n <= listEnd) out.push(handshake.subarray(p + 1, p + 1 + n).toString("latin1"));
         p += 1 + n;
       }
       return true;
     });
-    return proto;
+    return out;
   } catch {
-    return null;
+    return [];
   }
-  // END_BLOCK_ALPN_PARSE
+}
+
+// START_CONTRACT: resolveReplayAlpn
+//   PURPOSE: Decide which ALPN protocol (if any) the fake ServerHello must carry
+//   INPUTS: { profile: { alpn, alpnKnown } | null, configuredAlpn: string | null,
+//             offeredAlpn: string[] - what the CLIENT offered, in its preference order }
+//   OUTPUTS: { string | null - protocol to advertise, null = omit the extension entirely }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, fn-buildServerHello, fn-extractAlpnList, M-MTPROTO-SERVER
+// END_CONTRACT: resolveReplayAlpn
+export function resolveReplayAlpn({ profile, configuredAlpn, offeredAlpn }) {
+  // START_BLOCK_ALPN_RESOLVE
+  const offered = Array.isArray(offeredAlpn) ? offeredAlpn : [];
+  // The origin negotiated one: replay it verbatim, that is the whole point of the profile.
+  if (profile && profile.alpn) return profile.alpn;
+  // The client ASKED. RFC 7301 says it must be answered, and a client that offered ALPN and then
+  // received no extension treats the handshake as failed — the fake-TLS handshake "succeeds" here
+  // while the client's MTProto stream dies, so the DC is then handed bytes it will never answer.
+  // Origin fidelity cannot overrule a question the client actually asked.
+  if (offered.length > 0) return offered.includes(configuredAlpn) ? configuredAlpn : offered[0];
+  // Nobody asked, so mirroring the origin's silence costs nothing and keeps the flight shaped like
+  // the fronted site — which is exactly what alpnKnown=true records.
+  if (profile && profile.alpnKnown === true) return null;
+  return configuredAlpn ?? null;
+  // END_BLOCK_ALPN_RESOLVE
 }
 
 // START_CONTRACT: resolveServerCipher

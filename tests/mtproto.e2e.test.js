@@ -1,5 +1,5 @@
 // FILE: tests/mtproto.e2e.test.js
-// VERSION: 1.2.0
+// VERSION: 1.3.0
 // START_MODULE_CONTRACT
 //   PURPOSE: End-to-end MTProto flow: client handshake -> proxy -> fake DC, data round-trip
 //   SCOPE: full obfuscated2 handshake over real sockets, relay integrity, fake-TLS ClientHello
@@ -11,7 +11,17 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.2.0 - buildFakeTlsClientHello gained extLenPad so the e2e can inflate the
+//   LAST_CHANGE: v1.3.0 - a strict ALPN-demanding client, end to end. This is the production failure:
+//                the proxy logged a successful fake-TLS handshake and then relayed the client's bytes
+//                into a DC that answered nothing (bytes_out: 0, dc_replies: 0). Cause: a captured
+//                profile with alpnKnown=true made the ServerHello omit the ALPN extension, and a
+//                client that OFFERED ALPN treats that silence as a failed handshake. The emulator now
+//                refuses to send its obfuscated2 handshake until the ServerHello actually answers the
+//                offer, which is what a strict real client does. The fixture builders gained an
+//                `exts` parameter so a test can demand a strict server, and the assertion matches the
+//                exact extension bytes rather than re-walking the ServerHello extension list — a
+//                test that re-implements that walk only tests itself.
+//   PREVIOUS: v1.2.0 - buildFakeTlsClientHello gained extLenPad so the e2e can inflate the
 //                extensions block total too, and a new test drives that end to end: the proxy must
 //                answer with a ServerHello and relay the payload. This is the client that survived
 //                v1.1.0's structural fix — 1298 bytes against a ~1789-byte hello with every declared
@@ -42,6 +52,8 @@ import {
   buildServerHello,
   createTlsRecordReader,
   wrapTlsRecord,
+  buildAlpnExtension,
+  extractAlpnList,
   resolveClientHelloStructuralEnd,
 } from "../src/faketls.js";
 import { createHmac } from "node:crypto";
@@ -50,6 +62,22 @@ import { maskConnection } from "../src/mask.js";
 import { createProfileManager } from "../src/tls-profile.js";
 
 const PROTO_TAG_ABRIDGED = Buffer.from([0xef, 0xef, 0xef, 0xef]);
+
+// ALPN offer extension (type 0x0010). extension_data is `u16 list_len || ProtocolNameList`, so the
+// extension length spans the length field AND the entries — and the 6-byte header below already
+// carries that inner length. Getting this wrong is the easiest way to build an offer the parser
+// correctly refuses, which looks exactly like "the client never offered ALPN".
+function alpnExt(protocols) {
+  const list = Buffer.concat(protocols.map((p) => {
+    const b = Buffer.from(p, "latin1");
+    return Buffer.concat([Buffer.from([b.length]), b]);
+  }));
+  const ext = Buffer.alloc(6);
+  ext.writeUInt16BE(0x0010, 0);
+  ext.writeUInt16BE(2 + list.length, 2);
+  ext.writeUInt16BE(list.length, 4);
+  return Buffer.concat([ext, list]);
+}
 
 function sha256(...parts) {
   const h = createHash("sha256");
@@ -265,12 +293,15 @@ function hmacSha256(key, msg) {
 // extLenPad additionally inflates the extensions block total, which is what a client does when it
 // inflates every declared length including the innermost one (prod: 1298 bytes against a ~1789-byte
 // hello, resolved by neither the record, the handshake, nor the structural walk).
+// exts appends real ClientHello extensions (e.g. an ALPN offer) to the padding extension, so a test
+// can demand a strict server. extLenPad still inflates only the declared extensions total.
 function buildFakeTlsClientHello(
   secret,
   obfsHandshake,
   recordLenPad = 0,
   hsLenPad = 0,
-  extLenPad = 0
+  extLenPad = 0,
+  exts = []
 ) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
@@ -283,8 +314,8 @@ function buildFakeTlsClientHello(
   const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(padLen)]);
   padExt.writeUInt16BE(padLen, 2);
   const extTotal = Buffer.alloc(2);
-  extTotal.writeUInt16BE(padExt.length + extLenPad, 0);
-  const extensions = Buffer.concat([extTotal, padExt]);
+  extTotal.writeUInt16BE(padExt.length + exts.reduce((n, e) => n + e.length, 0) + extLenPad, 0);
+  const extensions = Buffer.concat([extTotal, padExt, ...exts]);
 
   const inner = Buffer.concat([
     Buffer.from([0x03, 0x03]),
@@ -566,6 +597,115 @@ test("e2e: fake-TLS handshake completes when the extensions length overstates to
     assert.equal(resolveClientHelloStructuralEnd(tlsHello), 0, "structure must yield no extent either");
 
     assert.equal(await fakeTlsRoundTrip(addr, secret, tlsHello), "extensions-inflated-payload");
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+// The production symptom, end to end: the proxy logged a successful fake-TLS handshake, then relayed
+// the client's bytes to the DC and got NOTHING back (bytes_out: 0, dc_replies: 0, first_dc_reply_ms:
+// null). The client had OFFERED ALPN, and a captured profile with alpnKnown=true made buildServerHello
+// omit the extension to mirror a fronted origin that negotiated none — so the client aborted its
+// MTProto stream and everything we forwarded was garbage the DC ignored. This client refuses to send
+// its obfuscated2 handshake unless the ServerHello actually answered its ALPN offer, which is what a
+// strict real client does.
+test("e2e: a client that offered ALPN is answered even when the profile recorded none", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const profile = {
+    cipher: [0x13, 0x01],
+    alpn: null,
+    alpnKnown: true, // origin negotiated no ALPN
+    ccsCount: 1,
+    appDataSizes: [180, 360],
+    certLen: 360,
+    recordDelays: [],
+  };
+  const log = makeLog();
+  const cfg = {
+    port: 0,
+    host: "127.0.0.1",
+    maxTunnels: 32,
+    idleTimeoutMs: 5_000,
+    rules: [],
+    mtprotoSecrets: [secret.toString("hex")],
+    mtprotoPort: 0,
+    mtprotoMaxConnections: 64,
+    mtprotoTlsDomain: "www.google.com",
+    mtprotoTlsAlpn: ["h2", "http/1.1"],
+  };
+    // The profile reaches the handler through a profileManager, not as a positional arg.
+    const profileManager = { get: () => profile };
+    const handlers = {
+      "http-connect": createConnectHandler(cfg, () => true, () => true, log)["http-connect"],
+      "http-other": createConnectHandler(cfg, () => true, () => true, log)["http-other"],
+      "mtproto": createMtprotoHandler(cfg, log, () => ({ host: "127.0.0.1", port: dcAddr.port }), null, maskConnection, profileManager),
+    };
+  const server = createMuxServer(handlers);
+  await new Promise((resolve) => server.listen(cfg.port, cfg.host, resolve));
+  const addr = server.address();
+
+  try {
+    const { handshake: obfsHandshake, stream, encKey, encIv } = buildClientHandshake(
+      secret,
+      PROTO_TAG_ABRIDGED,
+      1
+    );
+    // Same ClientHello the other fake-TLS tests use, plus the ALPN offer this client insists on.
+    const { hello: tlsHello } = buildFakeTlsClientHello(secret, obfsHandshake, 0, 0, 0, [alpnExt(["h2", "http/1.1"])]);
+    // Assert the premise here: a silently malformed fixture would otherwise look like a proxy bug.
+    assert.deepEqual(extractAlpnList(tlsHello), ["h2", "http/1.1"], "the client must really offer ALPN");
+
+    const payload = "alpn-demanding-payload";
+    const sent = stream.encrypt(Buffer.from(payload));
+    const clientDec = createAesCtr(encKey, encIv);
+
+    // Extract the ServerHello and require an ALPN answer before the client sends anything. Matched
+    // on the exact extension bytes rather than by hand-walking the extension list: the ServerHello
+    // carries nested lengths, and a test that re-implements that walk only tests itself.
+    const answer = await new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(tlsHello));
+      let raw = Buffer.alloc(0);
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error("no ServerHello before timeout"));
+      }, 3000);
+      socket.on("data", (d) => {
+        raw = Buffer.concat([raw, d]);
+        if (raw.length >= 5 && raw[0] === 0x16 && raw.length >= 5 + raw.readUInt16BE(3)) {
+          clearTimeout(timer);
+          const answered = raw.includes(buildAlpnExtension(["h2"]));
+          socket.write(wrapTlsRecord(obfsHandshake));
+          socket.write(wrapTlsRecord(sent));
+          resolve({ answered, socket });
+        }
+      });
+      socket.on("error", reject);
+    });
+
+    assert.equal(answer.answered, true, "the ServerHello must answer an ALPN offer");
+
+    const echoed = await new Promise((resolve, reject) => {
+      let appBuf = Buffer.alloc(0);
+      const tlsIn = createTlsRecordReader();
+      const timer = setTimeout(() => reject(new Error(`relay timeout, got ${appBuf.length} bytes`)), 3000);
+      answer.socket.on("data", (d) => {
+        for (const app of tlsIn.feed(d)) {
+          appBuf = Buffer.concat([appBuf, app]);
+          if (appBuf.length >= payload.length) {
+            clearTimeout(timer);
+            resolve(clientDec.decrypt(appBuf).toString());
+            return;
+          }
+        }
+      });
+    });
+    answer.socket.destroy();
+    assert.equal(echoed, payload);
   } finally {
     server.closeAllConnections?.();
     fakeDc.closeAllConnections?.();

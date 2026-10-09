@@ -1,5 +1,5 @@
 // FILE: tests/faketls.test.js
-// VERSION: 1.6.0
+// VERSION: 1.7.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-FAKETLS ClientHello validation, ServerHello build, TLS record framing
 //   SCOPE: HMAC digest round-trip, record reader/writer, wrong-secret rejection, ClientHello
@@ -18,7 +18,14 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.0 - walkClientHelloLayout is pinned on both shapes: the production one reports
+//   LAST_CHANGE: v1.7.0 - resolveReplayAlpn is pinned as a table plus both buildServerHello ends: a
+//                client that OFFERED ALPN is answered even when the profile recorded the origin
+//                negotiated none (the production failure — the proxy looked healthy while the client's
+//                stream died and the DC ignored everything we relayed), and a client that offered
+//                nothing still gets the bare origin-shaped flight, so origin fidelity survives.
+//                Also covers extractAlpnList, which resolves the whole offer so the resolver can pick
+//                between the configured protocol and the client's own first preference.
+//   PREVIOUS: v1.6.0 - walkClientHelloLayout is pinned on both shapes: the production one reports
 //                why=ext_beyond_buffer with extEnd beyond what arrived, the honest one reports ok,
 //                and short/unrelated buffers report where they stopped. A regression test then pins
 //                resolveClientHelloStructuralEnd to the exact extents it answered before the walk was
@@ -69,6 +76,8 @@ import {
   resolveFakeTlsClientHello,
   walkClientHelloLayout,
   extractAlpn,
+  extractAlpnList,
+  resolveReplayAlpn,
   resolveServerCipher,
 } from "../src/faketls.js";
 
@@ -383,6 +392,82 @@ test("buildServerHello: omits ALPN when the captured profile negotiated none (al
     false,
     "profile-absent ALPN must be mirrored (extension omitted)"
   );
+});
+
+test("buildServerHello: answers a client that OFFERED ALPN even when the origin negotiated none", () => {
+  const secret = randomBytes(16);
+  const profile = {
+    cipher: [0x13, 0x01],
+    alpn: null,
+    alpnKnown: true, // the fronted origin answered WITHOUT ALPN
+    ccsCount: 1,
+    appDataSizes: [1000],
+    certLen: 1000,
+    recordDelays: [],
+  };
+  // RFC 7301: a client that sent ALPN must get an answer. Replaying the origin's silence onto such
+  // a client made the fake-TLS handshake "succeed" at the proxy while the client's MTProto stream
+  // died, and the DC then ignored everything we relayed (bytes_out: 0, dc_replies: 0).
+  const response = buildServerHello(
+    secret,
+    randomBytes(32),
+    randomBytes(16),
+    "h2",
+    profile,
+    [Buffer.from([0x13, 0x01])],
+    0,
+    ["h2", "http/1.1"]
+  );
+  assert.ok(
+    response.includes(buildAlpnExtension(["h2"])),
+    "a client that offered ALPN must not be answered with silence"
+  );
+});
+
+// The mirroring behaviour is only wrong when somebody ASKED. A client that offered nothing must
+// still get the bare origin-shaped flight, or we reintroduce the fingerprint mismatch the profile
+// exists to avoid.
+test("buildServerHello: still omits ALPN for a client that offered none (origin fidelity kept)", () => {
+  const secret = randomBytes(16);
+  const profile = {
+    cipher: [0x13, 0x01],
+    alpn: null,
+    alpnKnown: true,
+    ccsCount: 1,
+    appDataSizes: [1000],
+    certLen: 1000,
+    recordDelays: [],
+  };
+  const response = buildServerHello(
+    secret,
+    randomBytes(32),
+    randomBytes(16),
+    "h2",
+    profile,
+    [Buffer.from([0x13, 0x01])],
+    0,
+    []
+  );
+  assert.equal(response.includes(buildAlpnExtension(["h2"])), false, "nobody asked, so nobody answers");
+});
+
+test("resolveReplayAlpn: origin fidelity only applies to clients that stayed silent", () => {
+  const none = { alpn: null, alpnKnown: true };
+  const h2 = { alpn: "h2", alpnKnown: true };
+  const unset = { alpn: null, alpnKnown: false };
+  assert.equal(resolveReplayAlpn({ profile: none, configuredAlpn: "h2", offeredAlpn: [] }), null);
+  assert.equal(
+    resolveReplayAlpn({ profile: none, configuredAlpn: "h2", offeredAlpn: ["h2"] }),
+    "h2",
+    "the client asked, so the configured protocol answers"
+  );
+  assert.equal(
+    resolveReplayAlpn({ profile: none, configuredAlpn: null, offeredAlpn: ["http/1.1"] }),
+    "http/1.1",
+    "with nothing configured, echo the client's own first offer"
+  );
+  assert.equal(resolveReplayAlpn({ profile: h2, configuredAlpn: null, offeredAlpn: ["h2"] }), "h2");
+  assert.equal(resolveReplayAlpn({ profile: unset, configuredAlpn: "h2", offeredAlpn: [] }), "h2");
 });
 
 test("buildServerHello: replays the profile's ALPN when it negotiated one", () => {
