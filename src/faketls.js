@@ -1,9 +1,10 @@
 // FILE: src/faketls.js
-// VERSION: 1.6.0
+// VERSION: 1.8.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Fake-TLS (ee-secret) handshake validation, ServerHello construction, TLS record framing
 //   SCOPE: ClientHello HMAC validation, fake ServerHello build, TLS 1.3 record read/write helpers,
-//          ClientHello extent resolution (declared lengths, else ClientHello structure)
+//          ClientHello extent resolution (declared lengths, else ClientHello structure), and
+//          HMAC-gated admission that picks the extent to answer from
 //   DEPENDS: node:crypto
 //   LINKS: M-FAKETLS
 //   ROLE: RUNTIME
@@ -24,6 +25,12 @@
 //                           ClientHello's own structure when both declared lengths overstate
 //   resolveClientHelloStructuralEnd - resolve the ClientHello end by walking its TLS structure,
 //                           ignoring the declared record/handshake length fields entirely
+//   walkClientHelloLayout - walk those length-prefixed fields and REPORT where the walk stopped and
+//                           the extensions offset the client declares, instead of collapsing every
+//                           failure to the same 0
+//   resolveFakeTlsClientHello - resolve AND authenticate a ClientHello: try the declared/structural
+//                           extent, then the whole record, then everything received, admitting only
+//                           the extent the client's HMAC confirms; reports resolved/foreign/incomplete
 //   resolveFakeCertLen - fake-certificate length for the server flight (captured size, capped)
 //   extractAlpn - first ALPN protocol the client offered (null when the extension is absent)
 //   resolveServerCipher - the cipher suite the ServerHello actually selects (profile.cipher only
@@ -31,7 +38,33 @@
 // END_MODULE_MAP
 
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.6.0 - two parsers the journal needed and the code did not have. extractAlpn
+//   LAST_CHANGE: v1.8.0 - walkClientHelloLayout: the structural walk returned 0 for every failure
+//                alike, which is correct for a decision and useless for a diagnosis. The journal
+//                could not tell "the extensions block has not landed yet" from "the extensions length
+//                is a lie too", and those two support opposite conclusions about whether more bytes
+//                would ever help — the exact ambiguity that left the 1298-byte client unexplained
+//                across two deployed fixes. The walk now returns where it stopped (`why`) plus the
+//                extensions offset the client DECLARES (`extEnd`); extEnd > bytes is the decisive
+//                pair. resolveClientHelloStructuralEnd became a thin caller, pinned by a test to the
+//                same extents it answered before, so a diagnostic refactor cannot quietly change
+//                admission.
+//   PREVIOUS: v1.7.0 - resolveFakeTlsClientHello: the 1298-byte client that survived v1.5.0's
+//                structural fallback. That fix trusted the ClientHello's own length-prefixed fields,
+//                but production showed a client inflating the INNERMOST one too — the extensions
+//                block total — so the walk had nothing left to trust, resolveClientHelloEnd
+//                correctly returned 0, and the client still got no ServerHello: bytes:1298,
+//                recordLen/hsLen ~1784/1780, flight_bytes: 0, closed: false (it was alive, holding
+//                the socket open, waiting). The remaining candidate with no declared length to
+//                overstate is "everything received so far", and the client's own HMAC is what makes
+//                it safe rather than a guess: a genuinely fragmented hello cannot produce a matching
+//                signature, so it keeps waiting. Resolution is now ONE function that both finds and
+//                authenticates the extent, instead of the server hand-rolling a second framing
+//                retry inline, so the "keep reading" vs "mask this crawler" decision has a single
+//                named owner — the mistake that first draft made was offering the received-extent
+//                candidate even when a declared framing already existed, which swallowed the app
+//                data a pipelining client sent in the same segment and turned every ordinary
+//                wrong-secret connection into one held to the handshake timeout.
+//   PREVIOUS: v1.6.0 - two parsers the journal needed and the code did not have. extractAlpn
 //                returns the first ALPN protocol a ClientHello offered: when a captured profile
 //                recorded no ALPN (alpnKnown=true) buildServerHello OMITS the extension to match the
 //                fronted origin, so "client offered ALPN and we sent none" was indistinguishable
@@ -242,6 +275,50 @@ export function resolveClientHelloEnd(buf) {
   // END_BLOCK_CLIENT_HELLO_EXTENT
 }
 
+// START_CONTRACT: walkClientHelloLayout
+//   PURPOSE: Walk a ClientHello's length-prefixed fields and REPORT where the walk stopped and why,
+//            instead of collapsing every failure to the same 0
+//   INPUTS: { buf: Buffer - bytes received so far, starting at 0x16 0x03 0x01 }
+//   OUTPUTS: { { why, sidLen, csLen, extLen, extEnd } - why is one of ok | short_header |
+//              not_client_hello | no_handshake_header | short_cipher_suites | odd_cipher_suites_len |
+//              short_compression | short_extensions_len | ext_beyond_buffer; extEnd is the offset the
+//              client DECLARES the extensions block to end at, which is what distinguishes "still
+//              arriving" (extEnd > bytes received) from "the extensions length also lies" }
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, fn-resolveClientHelloStructuralEnd, M-MTPROTO-SERVER
+// END_CONTRACT: walkClientHelloLayout
+export function walkClientHelloLayout(buf) {
+  // START_BLOCK_CLIENT_HELLO_LAYOUT
+  // Layout after the 9-byte prefix (record header + handshake type + 3-byte handshake length):
+  // client_version(2) random(32) session_id_len(1) session_id(N) cipher_suites_len(2) suites(2N)
+  // compression_len(1) compression(M) extensions_len(2) extensions(...). Every field is length-
+  // prefixed, so the true end is reachable without believing any declared total — which is the
+  // whole point: these clients inflate the totals and then send only what they really wrote.
+  // `resolveClientHelloStructuralEnd` returns 0 for every one of these failures alike, which is right
+  // for a decision but useless for a diagnosis: the journal could not tell "the extensions block has
+  // not landed yet" from "the extensions length is a lie too", and those two call for opposite
+  // conclusions about whether more bytes would ever help.
+  const bail = (why, partial = {}) => ({ why, sidLen: null, csLen: null, extLen: null, extEnd: null, ...partial });
+  if (buf.length < 5) return bail("short_header");
+  if (buf[0] !== 0x16 || buf[1] !== 0x03 || buf[2] !== 0x01) return bail("not_client_hello");
+  if (buf.length < 9 || buf[5] !== 0x01) return bail("no_handshake_header");
+  const sidLen = buf[SESSION_ID_LEN_POS];
+  let p = SESSION_ID_POS + sidLen;
+  if (p + 2 > buf.length) return bail("short_cipher_suites", { sidLen });
+  const csLen = buf.readUInt16BE(p);
+  if (csLen % 2 !== 0) return bail("odd_cipher_suites_len", { sidLen, csLen });
+  p += 2 + csLen;
+  if (p + 1 > buf.length) return bail("short_compression", { sidLen, csLen });
+  p += 1 + buf[p];
+  if (p + 2 > buf.length) return bail("short_extensions_len", { sidLen, csLen });
+  const extLen = buf.readUInt16BE(p);
+  const extEnd = p + 2 + extLen;
+  const info = { sidLen, csLen, extLen, extEnd };
+  // Still arriving: the extensions block has not fully landed.
+  return { ...info, why: extEnd > buf.length ? "ext_beyond_buffer" : "ok" };
+  // END_BLOCK_CLIENT_HELLO_LAYOUT
+}
+
 // START_CONTRACT: resolveClientHelloStructuralEnd
 //   PURPOSE: Resolve a ClientHello's true end by walking its own TLS structure instead of
 //            trusting the declared record/handshake length fields
@@ -249,33 +326,75 @@ export function resolveClientHelloEnd(buf) {
 //   OUTPUTS: { number - structural end offset, or 0 when the structure is unreadable, still
 //              arriving, or too short to be a real ClientHello }
 //   SIDE_EFFECTS: none
-//   LINKS: M-FAKETLS, fn-resolveClientHelloEnd, fn-validateClientHello
+//   LINKS: M-FAKETLS, fn-resolveClientHelloEnd, fn-validateClientHello, fn-walkClientHelloLayout
 // END_CONTRACT: resolveClientHelloStructuralEnd
 export function resolveClientHelloStructuralEnd(buf) {
   // START_BLOCK_CLIENT_HELLO_STRUCTURE
-  // Layout after the 9-byte prefix (record header + handshake type + 3-byte handshake length):
-  // client_version(2) random(32) session_id_len(1) session_id(N) cipher_suites_len(2) suites(2N)
-  // compression_len(1) compression(M) extensions_len(2) extensions(...). Every field is length-
-  // prefixed, so the true end is reachable without believing any declared total — which is the
-  // whole point: these clients inflate the totals and then send only what they really wrote.
-  if (buf.length < 5) return 0;
-  if (buf[0] !== 0x16 || buf[1] !== 0x03 || buf[2] !== 0x01) return 0;
-  if (buf.length < 9 || buf[5] !== 0x01) return 0;
-  let p = SESSION_ID_POS + buf[SESSION_ID_LEN_POS];
-  if (p + 2 > buf.length) return 0;
-  const csLen = buf.readUInt16BE(p);
-  if (csLen % 2 !== 0) return 0;
-  p += 2 + csLen;
-  if (p + 1 > buf.length) return 0;
-  p += 1 + buf[p];
-  if (p + 2 > buf.length) return 0;
-  const extLen = buf.readUInt16BE(p);
-  const end = p + 2 + extLen;
-  // Still arriving: the extensions block has not fully landed. Keep waiting.
-  if (end > buf.length) return 0;
-  if (end < 5 + CLIENT_HELLO_MIN_RECORD) return 0;
-  return end;
+  const layout = walkClientHelloLayout(buf);
+  if (layout.why !== "ok") return 0;
+  if (layout.extEnd < 5 + CLIENT_HELLO_MIN_RECORD) return 0;
+  return layout.extEnd;
   // END_BLOCK_CLIENT_HELLO_STRUCTURE
+}
+
+// START_CONTRACT: resolveFakeTlsClientHello
+//   PURPOSE: Resolve AND authenticate a fake-TLS ClientHello from the bytes received so far, trying
+//            every plausible extent framing in order and admitting only the one the client's own HMAC
+//            confirms
+//   INPUTS: { buf: Buffer - bytes received so far, starting at 0x16 0x03 0x01; secrets: Buffer[] }
+//   OUTPUTS: { { status: "resolved", helloEnd: number, validated: { secret, sessionId, digest,
+//                digestPrefix, ciphers } }
+//            | { status: "foreign", helloEnd: number } - a complete-looking hello no secret matched
+//            | { status: "incomplete" } }              - no positive evidence yet; keep reading
+//   SIDE_EFFECTS: none
+//   LINKS: M-FAKETLS, M-MTPROTO-SERVER, fn-resolveClientHelloEnd, fn-validateClientHello
+// END_CONTRACT: resolveFakeTlsClientHello
+export function resolveFakeTlsClientHello(buf, secrets) {
+  // START_BLOCK_CLIENT_HELLO_ADMISSION
+  const candidates = [];
+  // 1) whatever the declared or structural walk can prove. Zero means it could not: no declared
+  //    extent is reachable AND the extensions block is declared longer than has arrived, so not
+  //    even the structure agrees with what is on the wire.
+  const declared = resolveClientHelloEnd(buf);
+  if (declared !== 0) candidates.push(declared);
+  // 2) the whole TLS record, for clients that sign the padding their record length promises.
+  const recordEnd = buf.length >= 5 ? 5 + buf.readUInt16BE(3) : 0;
+  if (recordEnd > 0 && buf.length >= recordEnd && !candidates.includes(recordEnd)) {
+    candidates.push(recordEnd);
+  }
+  // 3) everything received so far — the only candidate with no declared length to overstate. This is
+  //    what rescues the client still stalling in production after v1.5.0: it inflates the extensions
+  //    block total too, so the structural walk has nothing left to trust and returns 0, yet the
+  //    client signed the bytes it really wrote. The HMAC below is what makes that safe — a genuinely
+  //    fragmented hello cannot produce a matching signature, so it keeps waiting rather than being
+  //    answered from partial data. It is only ever offered when NOTHING else is plausible: when a
+  //    declared framing did resolve, adding "everything received" would swallow the app data a
+  //    pipelining client sent in the same segment, fail the HMAC, and turn every ordinary
+  //    wrong-secret connection into an unanswered one held to the handshake timeout.
+  //    Residual: a client that both inflates every length AND pipelines its post-hello records into
+  //    the same segment still waits, because its signature covers only the hello. Production does
+  //    not do this (bytes:1298, closed:false — the client held the socket open waiting for the
+  //    ServerHello rather than sending on), and such a client was unanswered before v1.7.0 too.
+  const receivedEnd = buf.length;
+  const hasReceivedCandidate =
+    candidates.length === 0 && receivedEnd >= 5 + CLIENT_HELLO_MIN_RECORD;
+  if (hasReceivedCandidate) candidates.push(receivedEnd);
+
+  for (const helloEnd of candidates) {
+    const validated = validateClientHello(buf.subarray(0, helloEnd), secrets);
+    if (validated) return { status: "resolved", helloEnd, validated };
+  }
+  // Nothing confirmed a signature. If the declared/structural walk could not prove an extent, we
+  // never had a complete-looking ClientHello and there is no evidence of anything but a client that
+  // is still sending — hold the connection and read more. Offering the whole record does NOT count
+  // as such evidence: a client whose handshake and extensions lengths overstate still has a
+  // reachable record length, and masking it would turn a merely slow client into a dropped one.
+  if (declared === 0 || hasReceivedCandidate) return { status: "incomplete" };
+  // The walk proved a complete, self-consistent ClientHello and no secret matched it, so this is a
+  // crawler or a wrong key rather than a slow client: the caller masks it instead of holding the
+  // slot to the timeout.
+  return { status: "foreign", helloEnd: candidates[0] };
+  // END_BLOCK_CLIENT_HELLO_ADMISSION
 }
 
 // START_CONTRACT: resolveFakeCertLen

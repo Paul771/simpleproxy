@@ -1,5 +1,5 @@
 // FILE: src/config.js
-// VERSION: 1.8.0
+// VERSION: 1.9.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Read env and return a validated proxy configuration
 //   SCOPE: env parsing, defaults, allowlist rule construction, auth credentials, MTProto settings
@@ -15,7 +15,14 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.8.0 - new MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS (default 5000, 0 = per event):
+//   LAST_CHANGE: v1.9.0 - MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS default 5000 -> 30000. The window is
+//                only useful if it is wider than the client's retry cadence, and production measured
+//                that cadence at ~8s: against a 5s window every retry opened its own window and
+//                coalescing caught just 1-4 lines, so the flood that motivated the knob was barely
+//                dented (suppressed values of 4, 2, 1 next to a stream of 0s). At 30s the same client
+//                collapses to two lines a minute with the count preserved exactly in `suppressed`,
+//                and a genuinely new failure mode still surfaces within half a minute.
+//   PREVIOUS: v1.8.0 - new MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS (default 5000, 0 = per event):
 //                coalescing window for the [proxy][mtproto_handshake_timeout] line, matching the
 //                existing doppelganger window. A fake-TLS client that rejects our ServerHello
 //                retries in a tight loop (production: 424 connections in 60s, ~1000 journal lines on
@@ -268,9 +275,13 @@ export function loadConfig(env = process.env) {
   // rejects our ServerHello retries in a tight loop, and production showed one opening 424
   // connections in 60s and emitting ~1000 lines, which drowns every other signal on a 1 vCPU /
   // 512 MB host. The metrics counter is unaffected; `suppressed` is carried forward until emitted.
+  // The window must exceed the client's RETRY CADENCE or it buys nothing: a 5s window against the
+  // observed ~8s cadence only ever caught 1-4 lines per window while every retry still opened its
+  // own window, so the flood was barely dented. 30s collapses such a client to two lines a minute
+  // while still reporting a changed failure mode promptly, and the count stays exact in `suppressed`.
   const mtprotoHandshakeTimeoutLogMs = parsePortEnv(
     env.MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS,
-    5_000,
+    30_000,
     "MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS"
   );
   // Upper bound for the fake certificate inside the fake-TLS server flight. 0 = replay the

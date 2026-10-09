@@ -1,5 +1,5 @@
 // FILE: tests/mtproto.e2e.test.js
-// VERSION: 1.1.0
+// VERSION: 1.2.0
 // START_MODULE_CONTRACT
 //   PURPOSE: End-to-end MTProto flow: client handshake -> proxy -> fake DC, data round-trip
 //   SCOPE: full obfuscated2 handshake over real sockets, relay integrity, fake-TLS ClientHello
@@ -11,7 +11,16 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.1.0 - buildFakeTlsClientHello gained recordLenPad/hsLenPad so the fake-TLS
+//   LAST_CHANGE: v1.2.0 - buildFakeTlsClientHello gained extLenPad so the e2e can inflate the
+//                extensions block total too, and a new test drives that end to end: the proxy must
+//                answer with a ServerHello and relay the payload. This is the client that survived
+//                v1.1.0's structural fix — 1298 bytes against a ~1789-byte hello with every declared
+//                length, including the innermost one, inflated — and it reproduces the production line
+//                (bytes:1298, phase=tls-hello, flight_bytes:0, closed:false). The client also sends
+//                its ClientHello and WAITS for the ServerHello before writing the app records,
+//                because that is the behaviour the production signature actually shows and pipelining
+//                would model a client the evidence does not support.
+//   PREVIOUS: v1.1.0 - buildFakeTlsClientHello gained recordLenPad/hsLenPad so the fake-TLS
 //                ClientHello can overstate its declared lengths without writing those bytes, and a
 //                new e2e drives that end to end: the proxy must still answer with a ServerHello and
 //                relay the payload. RED reproduced the production line verbatim (bytes:702,
@@ -33,6 +42,7 @@ import {
   buildServerHello,
   createTlsRecordReader,
   wrapTlsRecord,
+  resolveClientHelloStructuralEnd,
 } from "../src/faketls.js";
 import { createHmac } from "node:crypto";
 import { createReplayGuard } from "../src/replay-guard.js";
@@ -252,7 +262,16 @@ function hmacSha256(key, msg) {
 
 // Build a fake-TLS ClientHello carrying the obfuscated2 handshake in the TLS random field's
 // successor: the 64-byte obfs handshake is sent as the first TLS application-data record.
-function buildFakeTlsClientHello(secret, obfsHandshake, recordLenPad = 0, hsLenPad = 0) {
+// extLenPad additionally inflates the extensions block total, which is what a client does when it
+// inflates every declared length including the innermost one (prod: 1298 bytes against a ~1789-byte
+// hello, resolved by neither the record, the handshake, nor the structural walk).
+function buildFakeTlsClientHello(
+  secret,
+  obfsHandshake,
+  recordLenPad = 0,
+  hsLenPad = 0,
+  extLenPad = 0
+) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
@@ -264,7 +283,7 @@ function buildFakeTlsClientHello(secret, obfsHandshake, recordLenPad = 0, hsLenP
   const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(padLen)]);
   padExt.writeUInt16BE(padLen, 2);
   const extTotal = Buffer.alloc(2);
-  extTotal.writeUInt16BE(padExt.length, 0);
+  extTotal.writeUInt16BE(padExt.length + extLenPad, 0);
   const extensions = Buffer.concat([extTotal, padExt]);
 
   const inner = Buffer.concat([
@@ -460,6 +479,93 @@ test("e2e: fake-TLS handshake completes when both declared lengths overstate the
     });
 
     assert.equal(result, payload);
+  } finally {
+    server.closeAllConnections?.();
+    fakeDc.closeAllConnections?.();
+    server.close();
+    fakeDc.close();
+  }
+});
+
+// Drive a fake-TLS client through a live proxy and return the echoed payload. The client sends its
+// ClientHello and then WAITS for the ServerHello before writing the obfuscated2 handshake — that is
+// what real TLS clients do, and it is what production does too: the stalled client's hello arrived
+// alone (bytes:1298, closed:false), holding the socket open for a ServerHello that never came. So the
+// app records go out only after the flight lands, not pipelined into the hello's segment.
+function fakeTlsRoundTrip(addr, secret, tlsHello) {
+  const { handshake: obfsHandshake, stream, encKey, encIv } = buildClientHandshake(
+    secret,
+    PROTO_TAG_ABRIDGED,
+    1
+  );
+  const payload = "extensions-inflated-payload";
+  const sent = stream.encrypt(Buffer.from(payload));
+  const clientDec = createAesCtr(encKey, encIv);
+
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(addr.port, "127.0.0.1", () => socket.write(tlsHello));
+    let rawBuf = Buffer.alloc(0);
+    let phase = "consume-response";
+    let tlsIn = null;
+    let appBuf = Buffer.alloc(0);
+    const timer = setTimeout(
+      () => reject(new Error(`extensions-inflated timeout, phase=${phase} got: ${appBuf.toString("hex")}`)),
+      3000
+    );
+    socket.on("data", (d) => {
+      rawBuf = Buffer.concat([rawBuf, d]);
+      if (phase === "consume-response") {
+        while (rawBuf.length >= 5) {
+          const recLen = rawBuf.readUInt16BE(3);
+          if (rawBuf.length < 5 + recLen) break;
+          const recType = rawBuf[0];
+          rawBuf = rawBuf.subarray(5 + recLen);
+          if (recType === 0x17) {
+            phase = "app-data";
+            tlsIn = createTlsRecordReader();
+            // ServerHello landed — now send what the hello did not cover.
+            socket.write(Buffer.concat([wrapTlsRecord(obfsHandshake), wrapTlsRecord(sent)]));
+            break;
+          }
+        }
+      }
+      if (phase === "app-data" && rawBuf.length > 0) {
+        for (const appData of tlsIn.feed(rawBuf)) {
+          appBuf = Buffer.concat([appBuf, appData]);
+          if (appBuf.length >= payload.length) {
+            clearTimeout(timer);
+            socket.destroy();
+            resolve(clientDec.decrypt(appBuf).toString());
+            return;
+          }
+        }
+        rawBuf = Buffer.alloc(0);
+      }
+    });
+    socket.on("error", reject);
+  });
+}
+
+// The stall that survived the structural fix: every declared length overstates, INCLUDING the
+// extensions block total, so the structural walk yields no extent either and the client waits for a
+// ServerHello that never comes (prod: bytes:1298, recordLen/hsLen ~1784/1780, flight_bytes: 0, and
+// closed: false — the client was alive, holding the connection open, waiting). The proxy must now
+// answer it, because the client's own HMAC confirms the extent it really signed.
+test("e2e: fake-TLS handshake completes when the extensions length overstates too", async () => {
+  const secret = randomBytes(16);
+  const fakeDc = await startFakeDc();
+  const dcAddr = fakeDc.address();
+  const { server, addr } = await startProxy(
+    { mtprotoSecrets: [secret.toString("hex")] },
+    () => ({ host: "127.0.0.1", port: dcAddr.port })
+  );
+
+  try {
+    const { hello: tlsHello } = buildFakeTlsClientHello(secret, Buffer.alloc(64), 480, 480, 480);
+    assert.ok(5 + tlsHello.readUInt16BE(3) > tlsHello.length, "record must promise more than arrived");
+    assert.equal(resolveClientHelloStructuralEnd(tlsHello), 0, "structure must yield no extent either");
+
+    assert.equal(await fakeTlsRoundTrip(addr, secret, tlsHello), "extensions-inflated-payload");
   } finally {
     server.closeAllConnections?.();
     fakeDc.closeAllConnections?.();

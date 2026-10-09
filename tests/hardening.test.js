@@ -1,5 +1,5 @@
 // FILE: tests/hardening.test.js
-// VERSION: 1.12.0
+// VERSION: 1.13.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Wave-1 hardening regression tests: pending-slot release, bounded handshake
 //            buffers, bounded masked sessions; Wave-2 multi-tenant enforcement: mid-stream
@@ -37,7 +37,13 @@
 // END_MODULE_CONTRACT
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.12.0 - fake-TLS handshake-death diagnostics + timeout coalescing. The tls-app
+//   LAST_CHANGE: v1.13.0 - config default for MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS pinned at 30000. The
+//                coalescing window only helps when it exceeds the client's retry cadence, which
+//                production measured at ~8s; against the previous 5s default every retry opened its
+//                own window and the suppression counter merely decorated the flood. An explicit
+//                env override is asserted to still win, so operators who want the old granularity
+//                keep it.
+//   PREVIOUS: v1.12.0 - fake-TLS handshake-death diagnostics + timeout coalescing. The tls-app
 //                timeout must report sni / sid_len / cipher (selected, not profile) / offered /
 //                alpn (offered) / alpn_sent, because production had one client relaying megabytes
 //                and another aborting an identical ServerHello in ~90ms with nothing in the journal
@@ -1443,6 +1449,25 @@ test("hardening: periodic [proxy][heartbeat] reports uptime and live counters (A
     server.close();
     fakeDc.close();
   }
+});
+
+test("config: MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS default must exceed the observed retry cadence", () => {
+  // Synthetic secret on purpose: the literal reused by the neighbouring config tests is also the
+  // value this project has been running in production, so new assertions must not propagate it.
+  const base = "000102030405060708090a0b0c0d0e0f";
+  // Production retried every ~8s, so a 5s window caught 1-4 lines per window while every retry still
+  // opened its own — barely denting the flood. 30s collapses the same client to two lines a minute.
+  assert.equal(
+    loadConfig({ MTPROTO_SECRET: base }).mtprotoHandshakeTimeoutLogMs,
+    30_000,
+    "the default window must cover several retries, not less than one"
+  );
+  assert.equal(
+    loadConfig({ MTPROTO_SECRET: base, MTPROTO_HANDSHAKE_TIMEOUT_LOG_MS: "5000" })
+      .mtprotoHandshakeTimeoutLogMs,
+    5000,
+    "an explicit override still wins"
+  );
 });
 
 test("config: MTPROTO_DOPPELGANGER_LOG_MS default/override/0/invalid", () => {

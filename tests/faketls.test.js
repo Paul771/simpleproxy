@@ -1,5 +1,5 @@
 // FILE: tests/faketls.test.js
-// VERSION: 1.4.0
+// VERSION: 1.6.0
 // START_MODULE_CONTRACT
 //   PURPOSE: Verify M-FAKETLS ClientHello validation, ServerHello build, TLS record framing
 //   SCOPE: HMAC digest round-trip, record reader/writer, wrong-secret rejection, ClientHello
@@ -18,7 +18,22 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.4.0 - extractAlpn (first offered protocol, absent -> null) and
+//   LAST_CHANGE: v1.6.0 - walkClientHelloLayout is pinned on both shapes: the production one reports
+//                why=ext_beyond_buffer with extEnd beyond what arrived, the honest one reports ok,
+//                and short/unrelated buffers report where they stopped. A regression test then pins
+//                resolveClientHelloStructuralEnd to the exact extents it answered before the walk was
+//                extracted out of it — pulling a parser apart to diagnose it must not be able to
+//                change what it admits.
+//   PREVIOUS: v1.5.0 - buildClientHello gained extLenPad, so the fixture can inflate the
+//                extensions block total as well as the two outer lengths: that is the one shape the
+//                v1.5.0 structural fallback still could not resolve, and it is what production kept
+//                doing (1298 bytes against a ~1789-byte hello). Six resolveFakeTlsClientHello tests
+//                pin the contract that makes the third framing safe: served from the HMAC-confirmed
+//                extent, a truncated or unknown-secret variant waits instead of being served, honest
+//                clients still resolve on the declared framing, a reachable record length alone does
+//                not make a slow client foreign, and a complete unknown-secret hello stays "foreign"
+//                so the anti-crawler masking path survives.
+//   PREVIOUS: v1.4.0 - extractAlpn (first offered protocol, absent -> null) and
 //                resolveServerCipher (profile cipher only when offered; Buffer / byte Array / hex
 //                string all accepted, unparseable -> default). The hex case is the load-bearing one:
 //                Buffer.from("1302") is 4 UTF-8 bytes and could never match a 2-byte suite, so a
@@ -51,6 +66,8 @@ import {
   splitTlsRecords,
   resolveClientHelloEnd,
   resolveClientHelloStructuralEnd,
+  resolveFakeTlsClientHello,
+  walkClientHelloLayout,
   extractAlpn,
   resolveServerCipher,
 } from "../src/faketls.js";
@@ -63,12 +80,20 @@ function hmacSha256(key, msg) {
 }
 
 // Emulate a client building a fake-TLS ClientHello with the HMAC digest.
-// recordLenPad / hsLenPad inflate the declared length fields WITHOUT writing those bytes: they model
-// a client whose length fields overstate the message it actually sends (the digest is computed
-// over the inflated buffer, exactly as such a client would sign what it wrote). Passing the SAME
-// pad to both reproduces the production signature, where the two declared extents agree with each
-// other (recordEnd == messageEnd) yet both promise ~460 bytes more than the client ever delivers.
-function buildClientHello(secret, offeredCiphers = [0x13, 0x01], recordLenPad = 0, hsLenPad = 0) {
+// recordLenPad / hsLenPad / extLenPad inflate the declared length fields WITHOUT writing those bytes:
+// they model a client whose length fields overstate the message it actually sends (the digest is
+// computed over the inflated buffer, exactly as such a client would sign what it wrote). Passing the
+// SAME pad reproduces the production signature, where the declared extents agree with each other
+// (recordEnd == messageEnd) yet promise ~460 bytes more than the client ever delivers. extLenPad
+// goes one level deeper — it inflates the extensions block total, which is the last length the
+// structural walk reads before it gives up and can no longer derive an extent from structure at all.
+function buildClientHello(
+  secret,
+  offeredCiphers = [0x13, 0x01],
+  recordLenPad = 0,
+  hsLenPad = 0,
+  extLenPad = 0
+) {
   const sessionId = randomBytes(16);
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBytes = Buffer.alloc(4);
@@ -83,7 +108,7 @@ function buildClientHello(secret, offeredCiphers = [0x13, 0x01], recordLenPad = 
   const padExt = Buffer.concat([Buffer.from([0x00, 0x15]), Buffer.alloc(2), Buffer.alloc(padLen)]);
   padExt.writeUInt16BE(padLen, 2);
   const extTotal = Buffer.alloc(2);
-  extTotal.writeUInt16BE(padExt.length, 0);
+  extTotal.writeUInt16BE(padExt.length + extLenPad, 0);
   const extensions = Buffer.concat([extTotal, padExt]);
 
   const sidLen = Buffer.from([sessionId.length]);
@@ -550,6 +575,125 @@ test("validateClientHello: the structural extent is exactly what the HMAC covers
     "a one-byte-short guess must not validate"
   );
   assert.equal(validateClientHello(hello, [randomBytes(16)]), null, "wrong secret still rejected");
+});
+
+// --- ClientHello extent: the EXTENSIONS length lies too (the 1298-byte prod stall that survived
+// the structural fix) ---
+// e1f113c recovered clients whose record and handshake lengths overstate while the inner structure
+// stays honest. The client still stalling in production inflates the extensions block total as well,
+// so the structural walk has nothing left to trust and resolveClientHelloEnd correctly returns 0 —
+// it must, because it has no secrets and therefore cannot confirm an extent. The only candidate with
+// no declared length at all is "everything received so far", and the client's own HMAC is what makes
+// that safe: a genuinely fragmented hello cannot produce a matching signature, so it keeps waiting.
+test("resolveFakeTlsClientHello: an extensions-inflated hello is served from the HMAC-confirmed extent", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 480, 480, 480);
+  assert.ok(5 + hello.readUInt16BE(3) > hello.length, "record must promise more than arrived");
+  assert.equal(
+    resolveClientHelloStructuralEnd(hello),
+    0,
+    "the extensions block is declared longer than arrived, so structure yields no extent"
+  );
+
+  const out = resolveFakeTlsClientHello(hello, [secret]);
+  assert.equal(out.status, "resolved");
+  assert.equal(out.helloEnd, hello.length, "the served extent is exactly what the client signed");
+  assert.ok(out.validated.secret.equals(secret));
+});
+
+test("resolveFakeTlsClientHello: a truncated extensions-inflated hello waits instead of being served", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 480, 480, 480);
+  // One byte short of the true extent: the signature no longer covers these bytes, so the client is
+  // still mid-flight and must keep waiting rather than be answered from partial data.
+  assert.equal(
+    resolveFakeTlsClientHello(hello.subarray(0, hello.length - 1), [secret]).status,
+    "incomplete"
+  );
+  assert.equal(resolveFakeTlsClientHello(hello, [randomBytes(16)]).status, "incomplete");
+});
+
+test("resolveFakeTlsClientHello: honest clients still resolve on the declared framing", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret);
+  const out = resolveFakeTlsClientHello(hello, [secret]);
+  assert.equal(out.status, "resolved");
+  assert.equal(out.helloEnd, 5 + hello.readUInt16BE(3), "the record framing stays the first choice");
+});
+
+// A complete-looking hello that no secret matches is a crawler or a wrong key, NOT a client still
+// sending: masking it (instead of holding the slot to the handshake timeout) is the anti-crawler
+// property the `faketls_auth_fail` branch depends on, so it must survive this change.
+test("resolveFakeTlsClientHello: a complete hello with an unknown secret is foreign, not incomplete", () => {
+  const { hello } = buildClientHello(randomBytes(16));
+  const out = resolveFakeTlsClientHello(hello, [randomBytes(16)]);
+  assert.equal(out.status, "foreign");
+  assert.equal(out.helloEnd, 5 + hello.readUInt16BE(3));
+});
+
+test("resolveFakeTlsClientHello: a genuinely fragmented hello still waits", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret);
+  for (const cut of [200, 400, hello.length - 1]) {
+    assert.equal(
+      resolveFakeTlsClientHello(hello.subarray(0, cut), [secret]).status,
+      "incomplete",
+      `${cut} bytes must still wait`
+    );
+  }
+});
+
+// The journal could not tell "the extensions block has not landed yet" from "the extensions length is
+// a lie too" — resolveClientHelloStructuralEnd returned 0 for both. Those call for opposite
+// conclusions about whether more bytes would ever help, so the walk has to report where it stopped.
+test("walkClientHelloLayout: names where the walk stopped and the declared extensions end", () => {
+  const secret = randomBytes(16);
+  // An honest hello walks all the way through.
+  const ok = walkClientHelloLayout(buildClientHello(secret).hello);
+  assert.equal(ok.why, "ok");
+  assert.equal(ok.extEnd, buildClientHello(secret).hello.length);
+
+  // The production client: every declared length inflated, so the extensions block claims to end past
+  // what arrived. This is the case that used to be indistinguishable from a slow client.
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 480, 480, 480);
+  const lying = walkClientHelloLayout(hello);
+  assert.equal(lying.why, "ext_beyond_buffer");
+  assert.ok(lying.extEnd > hello.length, "the declared extensions end must exceed what arrived");
+  assert.ok(lying.sidLen > 0 && lying.csLen % 2 === 0, "the honest inner fields still parsed");
+
+  // A genuinely half-delivered hello is reported by WHERE it stopped, not by the same 0.
+  assert.equal(walkClientHelloLayout(Buffer.alloc(4)).why, "short_header");
+  assert.equal(walkClientHelloLayout(randomBytes(600)).why, "not_client_hello");
+  const partial = walkClientHelloLayout(hello.subarray(0, 60));
+  assert.equal(partial.why, "short_cipher_suites");
+});
+
+// resolveClientHelloStructuralEnd is now a thin caller of the walk; pin that it still answers exactly
+// the same extents, so the diagnostic refactor did not silently change admission behaviour.
+test("resolveClientHelloStructuralEnd: unchanged behaviour after the walk was extracted", () => {
+  const secret = randomBytes(16);
+  assert.equal(resolveClientHelloStructuralEnd(buildClientHello(secret).hello), buildClientHello(secret).hello.length);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 480, 480);
+  assert.equal(resolveClientHelloStructuralEnd(hello), hello.length);
+  assert.equal(resolveClientHelloStructuralEnd(hello.subarray(0, hello.length - 1)), 0);
+  assert.equal(resolveClientHelloStructuralEnd(Buffer.alloc(4)), 0);
+  assert.equal(resolveClientHelloStructuralEnd(randomBytes(600)), 0);
+});
+
+// A reachable record length is NOT evidence that the hello is complete: this client inflates the
+// handshake and extensions lengths while keeping recordLen honest, so the record framing resolves
+// and the structural walk does not. Masking on that basis would drop a merely slow client instead of
+// waiting for its remaining bytes — the slowloris case the pending-handshake cap exists to survive.
+test("resolveFakeTlsClientHello: a reachable record length does not make a slow client foreign", () => {
+  const secret = randomBytes(16);
+  const { hello } = buildClientHello(secret, [0x13, 0x01], 0, 480, 480);
+  assert.equal(hello.length, 5 + hello.readUInt16BE(3), "fixture must keep the record length honest");
+  assert.equal(resolveClientHelloStructuralEnd(hello), 0, "structure must yield no extent");
+  assert.equal(
+    resolveFakeTlsClientHello(hello.subarray(0, hello.length - 50), [randomBytes(16)]).status,
+    "incomplete",
+    "a half-sent hello with an unknown secret is still a slow client, not a crawler"
+  );
 });
 
 // --- certLenCap: keep the server flight under a small path MTU ---

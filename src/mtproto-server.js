@@ -1,5 +1,5 @@
 // FILE: src/mtproto-server.js
-// VERSION: 1.16.0
+// VERSION: 1.18.0
 // START_MODULE_CONTRACT
 //   PURPOSE: MTProto connection handler: plain + fake-TLS handshake, DC connect, FAST_MODE relay,
 //            periodic [proxy][heartbeat] liveness line, handshake-death and close-death forensics
@@ -17,7 +17,23 @@
 // END_MODULE_MAP
 //
 // START_CHANGE_SUMMARY
-//   LAST_CHANGE: v1.16.0 - fake-TLS handshake-death diagnostics + log coalescing. Production had
+//   LAST_CHANGE: v1.18.0 - the tls-hello timeout line now reports where the ClientHello walk stopped:
+//                sid_len, cs_len, ext_len, ext_end and struct. `ext_end` against `bytes` is the
+//                decisive pair — ext_end > bytes means the extensions length is itself inflated, so
+//                no further bytes would ever resolve it, which is a different failure from a
+//                half-delivered hello. Without it every version of this stall looked identical, and
+//                two deployed fixes were aimed on inference rather than evidence.
+//   PREVIOUS: v1.17.0 - the tls-hello admission branch no longer hand-rolls its own extent
+//                retry. It now calls resolveFakeTlsClientHello, which owns all three framings and
+//                returns a three-way decision instead of a bare extent: "incomplete" (the client is
+//                still sending — keep reading, which is what the old `if (helloEnd === 0) return`
+//                did) versus "foreign" (every completed framing failed to validate — mask it, which
+//                is what the old `faketls_auth_fail` branch did). Both behaviours are preserved, but
+//                the third framing now exists: everything received so far, admitted only because the
+//                client's HMAC covers exactly those bytes. That is the 1298-byte client that no
+//                declared or structural extent could reach and that therefore never got a
+//                ServerHello at all (flight_bytes: 0 on every attempt).
+//   PREVIOUS: v1.16.0 - fake-TLS handshake-death diagnostics + log coalescing. Production had
 //                two clients on ONE proxy: one relaying megabytes, another receiving an identical
 //                ServerHello, sending nothing, and closing ~90ms later on every attempt. Capping
 //                certLen (4230 -> 1138 bytes) changed nothing about that signature, and nothing in
@@ -141,7 +157,6 @@ import {
   describeProtoTag,
 } from "./mtproto.js";
 import {
-  validateClientHello,
   buildServerHello,
   createTlsRecordReader,
   wrapTlsRecord,
@@ -150,7 +165,8 @@ import {
   extractAlpn,
   resolveServerCipher,
   splitTlsRecords,
-  resolveClientHelloEnd,
+  resolveFakeTlsClientHello,
+  walkClientHelloLayout,
   resolveFakeCertLen,
 } from "./faketls.js";
 import { maskConnection } from "./mask.js";
@@ -840,25 +856,19 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
           rejectWith("faketls_record_short", "faketls_reject", "DF-1", socket.remoteAddress, { recordLen });
           return;
         }
-        // The record length may overstate what the client actually wrote (prod: a client sent the
-        // same 1298 bytes on every attempt and stalled in phase="tls-hello" until the timeout).
-        // resolveClientHelloEnd handles that by trusting the handshake-message length, and — when
-        // the record AND handshake lengths overstate together — by falling back to the ClientHello's
-        // own structure. It returns 0 only while that structure is still arriving, so a genuinely
-        // fragmented hello keeps waiting instead of being answered from partial bytes. Either way
-        // the answer is gated on validateClientHello, so a wrong extent cannot get through.
-        const recordEnd = 5 + recordLen;
-        let helloEnd = resolveClientHelloEnd(buf);
-        if (helloEnd === 0) return;
-        let clientHello = buf.subarray(0, helloEnd);
-        let validated = validateClientHello(clientHello, secrets);
-        if (!validated && helloEnd !== recordEnd && buf.length >= recordEnd) {
-          // Other clients sign the whole TLS record, padding included, so their record length
-          // exceeds the handshake message. Try that framing before treating the hello as foreign.
-          helloEnd = recordEnd;
-          clientHello = buf.subarray(0, helloEnd);
-          validated = validateClientHello(clientHello, secrets);
-        }
+        // The declared lengths lie in three different ways and each needs its own extent, so
+        // resolveFakeTlsClientHello tries them in order and admits only the one the client's HMAC
+        // confirms: the declared/structural walk, then the whole record, then everything received so
+        // far (prod: a client inflating the record AND handshake AND extensions totals, sending 1298
+        // bytes, holding the socket open waiting — no declared or structural extent was reachable, so
+        // no ServerHello was ever built and flight_bytes stayed 0). "incomplete" means the client is
+        // still sending, so keep reading instead of masking it; "foreign" means every completed
+        // framing failed to validate, i.e. a crawler or a wrong secret.
+        const admission = resolveFakeTlsClientHello(buf, secrets);
+        if (admission.status === "incomplete") return;
+        const helloEnd = admission.helloEnd;
+        const clientHello = buf.subarray(0, helloEnd);
+        const validated = admission.status === "resolved" ? admission.validated : null;
         buf = buf.subarray(helloEnd);
         if (!validated) {
           // Non-keyed client (crawler / wrong secret): mask or reject instead of a bare RST,
@@ -1007,7 +1017,19 @@ export function createMtprotoHandler(cfg, log, resolveDc = getDcAddressCandidate
       };
       if (phase === "tls-hello" && detail.bytes >= 5) {
         detail.recordLen = buf.readUInt16BE(3);
-        if (detail.bytes >= 9 && buf[5] === 0x01) detail.hsLen = buf.readUIntBE(6, 3);
+        if (detail.bytes >= 9 && buf[5] === 0x01) {
+          detail.hsLen = buf.readUIntBE(6, 3);
+          // Where the length-prefixed walk stopped, and the extensions offset the client DECLARES.
+          // `extEnd` vs `bytes` is the decisive pair: extEnd > bytes means the extensions length is
+          // itself a lie, so no amount of extra bytes would ever resolve it — which is a different
+          // problem from a genuinely half-delivered hello, and the two used to look identical here.
+          const layout = walkClientHelloLayout(buf);
+          detail.sid_len = layout.sidLen;
+          detail.cs_len = layout.csLen;
+          detail.ext_len = layout.extLen;
+          detail.ext_end = layout.extEnd;
+          detail.struct = layout.why;
+        }
       }
       // Handshake-death DIAGNOSTICS, populated only once we actually built a ServerHello: what the
       // client asked for and what we put on the wire. Production had two clients on one proxy — one
